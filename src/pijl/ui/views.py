@@ -183,7 +183,11 @@ class ChipView:
         self.h = (n + 1) * T.PIN_SPACING  # multiple of GRID, see theme.py
 
         self.body = Box(self.w, self.h, T.CHIP_BORDER, *T.CHIP_BODY, batch, layers.bodies)
-        self.label = text.label(chip.kind, 0, 0, size=10 if io else 12, color=T.CHIP_TEXT)
+        self.kind_text = text.label(chip.kind, 0, 0, size=10 if io else 12, color=T.CHIP_TEXT)
+        # The user's label sits outside the body: left of IN switches, right of
+        # OUT LEDs (so it reads like a pin name at the board edge), below gates.
+        anchor = {"IN": "right", "OUT": "left"}.get(chip.kind, "center")
+        self.name = text.label(chip.label, 0, 0, size=T.LABEL_SIZE, color=T.LABEL_TEXT, anchor_x=anchor)
         self.pin_dots = [shapes.Circle(0, 0, T.PIN_RADIUS, segments=T.PIN_SEGMENTS, color=T.PIN_OFF,
                                        batch=batch, group=layers.pins)
                          for _ in chip.pins]
@@ -204,9 +208,21 @@ class ChipView:
     def move_to(self, x: float, y: float) -> None:
         self.x, self.y = x, y
         self.body.position = (x, y)
-        self.label.move_to(x + self.w / 2, y + self.h / 2)
+        self.kind_text.move_to(x + self.w / 2, y + self.h / 2)
+        self.name.move_to(*self.name_pos())
         for dot, pin in zip(self.pin_dots, self.chip.pins):
             dot.position = self.pin_pos(pin)
+
+    def name_pos(self) -> Point:
+        if self.chip.kind == "IN":
+            return self.x - T.LABEL_GAP, self.y + self.h / 2
+        if self.chip.kind == "OUT":
+            return self.x + self.w + T.LABEL_GAP, self.y + self.h / 2
+        return self.x + self.w / 2, self.y - T.LABEL_GAP - self.name.cap_height / 2
+
+    def refresh_name(self) -> None:
+        """Show chip.label (after it was edited)."""
+        self.name.set_text(self.chip.label)
 
     def contains(self, wx: float, wy: float) -> bool:
         return self.x <= wx <= self.x + self.w and self.y <= wy <= self.y + self.h
@@ -223,7 +239,8 @@ class ChipView:
         """Semi-transparent while being carried around before placement."""
         a = T.GHOST_OPACITY if ghost else 255
         self.body.opacity = a
-        self.label.opacity = a
+        self.kind_text.opacity = a
+        self.name.opacity = a
         for dot in self.pin_dots:
             dot.opacity = a
 
@@ -247,7 +264,8 @@ class ChipView:
 
     def delete(self) -> None:
         self.body.delete()
-        self.label.delete()
+        self.kind_text.delete()
+        self.name.delete()
         for dot in self.pin_dots:
             dot.delete()
 

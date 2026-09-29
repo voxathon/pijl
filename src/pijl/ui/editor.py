@@ -16,7 +16,8 @@ Controls
     right-click/Backspace  remove last bend point (or cancel if none)
     Esc / click start pin  cancel
   drag a chip              move it (hold-to-drag; a plain click toggles an IN switch)
-  right-click chip/wire    delete it
+  right-click chip/wire    context menu: Label... / Delete (click outside or Esc closes)
+    Label...               type in place; Enter commits, Esc reverts, clicking elsewhere commits
   right-drag empty space   pan (middle-drag pans in any mode)
   hold Ctrl                snap chips and wire bends to the grid
   scroll                   zoom
@@ -28,6 +29,7 @@ from __future__ import annotations
 from enum import Enum, auto
 
 import pyglet
+from pyglet import shapes
 from pyglet.math import Mat4
 from pyglet.window import key, mouse
 
@@ -35,6 +37,7 @@ from ..sim import Chip, Circuit, Pin, Wire
 from . import theme as T
 from .camera import Camera
 from .grid import Grid
+from .menu import ContextMenu, MenuItem
 from .sdf_text import SDFText
 from .toolbar import Toolbar
 from .views import ChipView, Layers, Point, Polyline, WireView
@@ -42,6 +45,7 @@ from .views import ChipView, Layers, Point, Polyline, WireView
 SIM_STEPS_PER_FRAME = 1
 PALETTE = ["IN", "OUT", "NAND", "AND", "OR", "NOT"]
 HOME = (400, 300)
+LABEL_MAX = 32
 
 
 class Mode(Enum):
@@ -50,6 +54,8 @@ class Mode(Enum):
     DRAGGING_CHIP = auto()
     PLACING_CHIP = auto()   # a new chip follows the cursor until a click places it
     WIRING = auto()         # a wire follows the cursor from its start pin until a click on a pin
+    MENU = auto()           # context menu open; the next click picks an item or closes it
+    EDITING_LABEL = auto()  # typing a chip's label in place
 
 
 def _make_config() -> pyglet.gl.Config | None:
@@ -75,9 +81,10 @@ class Editor(pyglet.window.Window):
         self.text = SDFText(self.world, self.layers.text_order)
         self.hud = pyglet.graphics.Batch()
         self.toolbar = Toolbar(PALETTE, self.hud)
+        self.menu = ContextMenu(self.hud)
         self.help = pyglet.text.Label(
             "click part: pick up/place | click pin: wire (click empty: bend) | drag: move | "
-            "click IN: toggle | right-click: delete/cancel | middle/right-drag: pan | scroll: zoom | hold Ctrl: snap",
+            "click IN: toggle | right-click: menu/cancel | middle/right-drag: pan | scroll: zoom | hold Ctrl: snap",
             font_name="Consolas", font_size=10, color=T.HELP_TEXT,
             x=8, y=self.height - 8, anchor_y="top", batch=self.hud)
 
@@ -94,6 +101,11 @@ class Editor(pyglet.window.Window):
         self.wire_start: Pin | None = None
         self.wire_bends: list[Point] = []
         self.preview: Polyline | None = None
+        # label editing
+        self.edit_view: ChipView | None = None
+        self.edit_text = ""
+        self.edit_caret = 0                  # insertion index into edit_text
+        self.caret: shapes.Rectangle | None = None
 
         self._build_demo()
         self.camera.center_on(*HOME, self.width, self.height)
@@ -187,6 +199,23 @@ class Editor(pyglet.window.Window):
         wx, wy = self.camera.screen_to_world(x, y)
         tool = self.toolbar.button_at(x, y)
 
+        if self.mode is Mode.MENU:
+            item = self.menu.item_at(x, y)
+            inside = self.menu.contains(x, y)
+            self._close_menu()
+            if button == mouse.LEFT and item is not None:
+                self.menu.activate_last(item)  # may start another mode (e.g. label editing)
+                return
+            if button == mouse.MIDDLE:
+                self.panning = True
+            if button != mouse.RIGHT or inside:
+                return  # a click outside the menu only closes it
+            # right-click elsewhere: fall through and open a menu there instead
+
+        if self.mode is Mode.EDITING_LABEL:
+            self._finish_edit(commit=True)  # clicking anywhere else commits
+            return
+
         if button == mouse.MIDDLE:
             self.panning = True
             return
@@ -243,9 +272,10 @@ class Editor(pyglet.window.Window):
 
         elif button == mouse.RIGHT:
             if view := self.chip_at(wx, wy):
-                self.remove_chip(view)
+                self._open_menu(x, y, [MenuItem("Label...", lambda: self._start_edit(view)),
+                                       MenuItem("Delete", lambda: self.remove_chip(view), danger=True)])
             elif wire := self.wire_at(wx, wy):
-                self.remove_wire(wire)
+                self._open_menu(x, y, [MenuItem("Delete", lambda: self.remove_wire(wire), danger=True)])
             else:
                 self.panning = True
 
@@ -262,6 +292,8 @@ class Editor(pyglet.window.Window):
     def on_mouse_motion(self, x, y, dx, dy):
         self.mouse = (x, y)
         self.toolbar.set_hover(self.toolbar.button_at(x, y))
+        if self.mode is Mode.MENU:
+            self.menu.hover(x, y)
         self._follow_cursor()
 
     def on_mouse_release(self, x, y, button, modifiers):
@@ -277,11 +309,21 @@ class Editor(pyglet.window.Window):
 
     def on_mouse_scroll(self, x, y, scroll_x, scroll_y):
         self.mouse = (x, y)
+        if self.mode is Mode.MENU:
+            self._close_menu()  # the menu belongs to what's under it; don't let the world slide away
         self.camera.scroll(x, y, scroll_y)
         self._follow_cursor()
 
     def on_key_press(self, symbol, modifiers):
         # Deliberately NOT calling super(): pyglet's default closes the window on Esc.
+        if self.mode is Mode.EDITING_LABEL:
+            # Text goes through on_text / on_text_motion; only Enter/Esc matter here.
+            # Everything else (Home, Backspace, Ctrl...) must not trigger editor shortcuts.
+            if symbol in (key.ENTER, key.NUM_ENTER):
+                self._finish_edit(commit=True)
+            elif symbol == key.ESCAPE:
+                self._finish_edit(commit=False)
+            return
         if symbol in (key.LCTRL, key.RCTRL):
             self._follow_cursor()  # snap whatever is on the cursor right away
         elif symbol == key.ESCAPE:
@@ -293,7 +335,83 @@ class Editor(pyglet.window.Window):
             self.camera.center_on(*HOME, self.width, self.height)
             self._follow_cursor()
 
+    def on_key_release(self, symbol, modifiers):
+        if symbol in (key.LCTRL, key.RCTRL):
+            self._follow_cursor()  # un-snap
+
+    def on_text(self, text):
+        if self.mode is not Mode.EDITING_LABEL:
+            return
+        text = "".join(c for c in text if c.isprintable())  # drops Enter's carriage return
+        text = text[:max(LABEL_MAX - len(self.edit_text), 0)]
+        if text:
+            t, i = self.edit_text, self.edit_caret
+            self.edit_text, self.edit_caret = t[:i] + text + t[i:], i + len(text)
+            self._update_edit()
+
+    def on_text_motion(self, motion):
+        if self.mode is not Mode.EDITING_LABEL:
+            return
+        t, i = self.edit_text, self.edit_caret
+        if motion == key.MOTION_BACKSPACE and i > 0:
+            self.edit_text, self.edit_caret = t[:i - 1] + t[i:], i - 1
+        elif motion == key.MOTION_DELETE:
+            self.edit_text = t[:i] + t[i + 1:]
+        elif motion == key.MOTION_LEFT:
+            self.edit_caret = max(0, i - 1)
+        elif motion == key.MOTION_RIGHT:
+            self.edit_caret = min(len(t), i + 1)
+        elif motion in (key.MOTION_BEGINNING_OF_LINE, key.MOTION_BEGINNING_OF_FILE):
+            self.edit_caret = 0
+        elif motion in (key.MOTION_END_OF_LINE, key.MOTION_END_OF_FILE):
+            self.edit_caret = len(t)
+        self._update_edit()
+
     # ---- helpers -----------------------------------------------------------
+
+    def _open_menu(self, x: float, y: float, items: list[MenuItem]) -> None:
+        self.menu.open(x, y, items, self.width, self.height)
+        self.menu.hover(x, y)
+        self.mode = Mode.MENU
+
+    def _close_menu(self) -> None:
+        self.menu.close()
+        self.mode = Mode.IDLE
+
+    def _start_edit(self, view: ChipView) -> None:
+        self.mode = Mode.EDITING_LABEL
+        self.edit_view = view
+        self.edit_text = view.chip.label
+        self.edit_caret = len(self.edit_text)
+        self.caret = shapes.Rectangle(0, 0, 1, 1, color=T.CARET, batch=self.world, group=self.layers.overlay)
+        pyglet.clock.schedule_interval(self._blink_caret, 0.5)
+        self._update_edit()
+
+    def _update_edit(self) -> None:
+        """Show the in-progress text and put the caret where the next character goes."""
+        name = self.edit_view.name
+        name.set_text(self.edit_text)
+        name.move_to(*self.edit_view.name_pos())
+        h = name.cap_height * 1.6
+        self.caret.position = (name.caret_x(self.edit_caret) - 0.6, name.y - h / 2)
+        self.caret.width, self.caret.height = 1.2, h
+        self.caret.visible = True  # restart the blink so the caret shows while typing
+
+    def _blink_caret(self, dt: float) -> None:
+        if self.caret is not None:
+            self.caret.visible = not self.caret.visible
+
+    def _finish_edit(self, commit: bool) -> None:
+        view = self.edit_view
+        if commit:
+            view.chip.label = self.edit_text.strip()
+        view.refresh_name()  # shows the committed label, or reverts to the old one
+        view.name.move_to(*view.name_pos())
+        pyglet.clock.unschedule(self._blink_caret)
+        self.caret.delete()
+        self.caret = None
+        self.edit_view = None
+        self.mode = Mode.IDLE
 
     def _start_placing(self, kind: str) -> None:
         view = self.add_chip(kind, 0, 0)
@@ -302,10 +420,6 @@ class Editor(pyglet.window.Window):
         self.grab = (-view.w / 2, -view.h / 2)  # carry it by its center
         self.mode = Mode.PLACING_CHIP
         self._follow_cursor()
-
-    def on_key_release(self, symbol, modifiers):
-        if symbol in (key.LCTRL, key.RCTRL):
-            self._follow_cursor()  # un-snap
 
     @property
     def snapping(self) -> bool:
@@ -344,6 +458,10 @@ class Editor(pyglet.window.Window):
 
     def _cancel(self) -> None:
         """Abort whatever is in progress and return to IDLE."""
+        if self.mode is Mode.MENU:
+            self._close_menu()
+        elif self.mode is Mode.EDITING_LABEL:
+            self._finish_edit(commit=False)
         if self.mode is Mode.PLACING_CHIP and self.active is not None:
             self.remove_chip(self.active)
         if self.preview is not None:

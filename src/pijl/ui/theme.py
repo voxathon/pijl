@@ -10,6 +10,7 @@ SWITCH_ON = ((220, 60, 60), (140, 30, 30))
 LED_OFF = ((45, 45, 52), (86, 86, 98))
 LED_ON = ((240, 70, 70), (155, 35, 35))
 CHIP_TEXT = (235, 235, 245, 255)
+LABEL_TEXT = (200, 200, 215, 255)  # user labels next to chips
 
 PIN_OFF = (18, 18, 22)
 PIN_ON = (240, 70, 70)
@@ -23,6 +24,11 @@ TOOLBAR_BG = ((40, 40, 48), (62, 62, 74))      # (fill, border), like chips
 TOOLBAR_HOVER = ((64, 64, 78), (110, 110, 130))
 TOOLBAR_BORDER = 1
 HELP_TEXT = (150, 150, 165, 255)
+
+MENU_PANEL = ((36, 36, 44), (84, 84, 100))  # (fill, border)
+MENU_HOVER = (60, 60, 76)
+MENU_DANGER = (240, 110, 110, 255)
+CARET = (235, 235, 245)
 GHOST_OPACITY = 150
 
 # Grid: (minor line, major line) colors. Brighter while Ctrl-snapping.
@@ -42,6 +48,8 @@ CHIP_WIDTH = 80
 IO_WIDTH = 40
 WIRE_THICKNESS = 3
 CHIP_BORDER = 2
+LABEL_SIZE = 10  # pt at zoom 1
+LABEL_GAP = 6    # between a chip and its label
 
 # pyglet picks circle smoothness from the radius at creation, which is far too
 # coarse once zoomed in. These stay smooth up to the max zoom (8x).

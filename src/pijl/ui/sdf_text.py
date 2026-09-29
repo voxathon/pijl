@@ -215,35 +215,67 @@ class SDFText:
         self.group = _SDFGroup(self.atlas, order)
 
     def label(self, text: str, x: float, y: float, size: float,
-              color: tuple[int, int, int, int]) -> SDFLabel:
-        return SDFLabel(self, text, x, y, size, color)
+              color: tuple[int, int, int, int], anchor_x: str = "center") -> SDFLabel:
+        return SDFLabel(self, text, x, y, size, color, anchor_x)
 
 
 class SDFLabel:
-    """Text centered on (x, y). `size` is in points at zoom 1, like pyglet's font_size."""
+    """One line of text anchored at (x, y): vertically centered on the capitals,
+    horizontally per `anchor_x` ("left", "center", "right"). `size` is in points
+    at zoom 1, like pyglet's font_size. Characters outside the atlas are dropped."""
 
     def __init__(self, owner: SDFText, text: str, x: float, y: float, size: float,
-                 color: tuple[int, int, int, int]) -> None:
+                 color: tuple[int, int, int, int], anchor_x: str = "center") -> None:
+        self.owner = owner
         self.atlas = owner.atlas
-        self.text = text
-        self.scale = size * 96 / 72 / EM_PX  # source px -> world units
+        self.scale = size * 96 / 72 / EM_PX  # atlas px -> world units
+        self.anchor_x = anchor_x
+        self.x, self.y = x, y
         self._color = tuple(color)
-        chars = [c for c in text if c in self.atlas.glyphs]
+        self.vlist = None
+        self.text = ""
+        self.set_text(text)
+
+    def set_text(self, text: str) -> None:
+        self.text = "".join(c for c in text if c == " " or c in self.atlas.glyphs)
+        if self.vlist is not None:
+            self.vlist.delete()
+            self.vlist = None
+        chars = [c for c in self.text if c != " "]
         n = len(chars)
-        self.vlist = self.atlas.program.vertex_list_indexed(
-            n * 4, gl.GL_TRIANGLES,
-            [i * 4 + k for i in range(n) for k in (0, 1, 2, 0, 2, 3)],
-            owner.batch, owner.group,
-            position=("f", [0.0] * n * 8),
-            tex_coords=("f", [c for ch in chars for c in _quad_uv(self.atlas.glyphs[ch].uv)]),
-            colors=("Bn", self._color * n * 4),
-        )
-        self.move_to(x, y)
+        if n:
+            self.vlist = self.atlas.program.vertex_list_indexed(
+                n * 4, gl.GL_TRIANGLES,
+                [i * 4 + k for i in range(n) for k in (0, 1, 2, 0, 2, 3)],
+                self.owner.batch, self.owner.group,
+                position=("f", [0.0] * n * 8),
+                tex_coords=("f", [c for ch in chars for c in _quad_uv(self.atlas.glyphs[ch].uv)]),
+                colors=("Bn", self._color * n * 4),
+            )
+        self.move_to(self.x, self.y)
+
+    @property
+    def width(self) -> float:
+        return len(self.text) * self.atlas.advance * self.scale
+
+    @property
+    def cap_height(self) -> float:
+        return self.atlas.cap_height * self.scale
+
+    def caret_x(self, index: int) -> float:
+        """World x of the gap before character `index` (monospace makes this trivial)."""
+        return self._left() + index * self.atlas.advance * self.scale
+
+    def _left(self) -> float:
+        return {"left": self.x, "center": self.x - self.width / 2, "right": self.x - self.width}[self.anchor_x]
 
     def move_to(self, x: float, y: float) -> None:
+        self.x, self.y = x, y
+        if self.vlist is None:
+            return
         a, s = self.atlas, self.scale
-        pen = x - len(self.text) * a.advance * s / 2    # center horizontally
-        base = y - a.cap_height * s / 2                 # center capitals vertically
+        pen = self._left()
+        base = y - a.cap_height * s / 2  # center capitals vertically
         pos: list[float] = []
         for ch in self.text:
             g = a.glyphs.get(ch)
@@ -260,10 +292,13 @@ class SDFLabel:
     @opacity.setter
     def opacity(self, value: int) -> None:
         self._color = (*self._color[:3], value)
-        self.vlist.colors[:] = self._color * (len(self.vlist.colors) // 4)
+        if self.vlist is not None:
+            self.vlist.colors[:] = self._color * (len(self.vlist.colors) // 4)
 
     def delete(self) -> None:
-        self.vlist.delete()
+        if self.vlist is not None:
+            self.vlist.delete()
+            self.vlist = None
 
 
 def _quad_uv(uv: tuple[float, float, float, float]) -> tuple[float, ...]:

@@ -45,6 +45,9 @@ class Chip:
     kind: str
     inputs: list[Pin] = field(default_factory=list)
     outputs: list[Pin] = field(default_factory=list)
+    # User-given name. Lives in the model (not the UI) because it's circuit data:
+    # when a board is packaged into a custom chip, IN/OUT labels become its pin names.
+    label: str = ""
 
     @property
     def pins(self) -> list[Pin]:
