@@ -18,12 +18,26 @@ Model:
     arrays (PartType.eval), which is what lets big boards go fast later.
   - Parts are *live* once placed. Ghosts (following the cursor before a click)
     aren't: they're never opened, and only pure parts among them are evaluated.
+  - A macro instance is never evaluated: its body is added as *hidden* parts and
+    wires (owned by the instance, not in `parts` / `wires`, which are only what's
+    on the board), recursively. Its pins are joined straight into the nets of the
+    body's IN / OUT ports, so the inside and outside of a macro are one net: no
+    delay at the boundary, and wrapping something in a macro can't change timing.
+  - Settling (`settle_ticks`): new parts are a little random for a while. For its
+    first ticks, each part only takes its newly computed outputs about half the
+    time. Without it, anything symmetric that appears all at once -- a latch
+    being opened, pasted or placed inside a macro -- flips between both of its
+    unstable states forever, since in a one-tick-per-gate world nothing ever
+    breaks the tie. Real hardware settles on noise; this is the noise. Seeded,
+    so the same actions give the same results. Off (0) unless asked for.
 """
 
 from __future__ import annotations
 
+import random
 import time
 import traceback
+import copy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Union
 
@@ -40,6 +54,9 @@ class Pin:
     index: int
     is_input: bool
     state: bool = False
+    # Pass-through: a macro instance's pins and its body's port pins. They join nets
+    # (see Part.links) but never drive them; they just show the net's value.
+    passive: bool = False
 
     def __repr__(self) -> str:
         side = "in" if self.is_input else "out"
@@ -62,6 +79,13 @@ class Part:
     props: dict[str, Any] = field(default_factory=dict)  # this instance's settings (see PartType.props)
     state: dict[str, Any] = field(default_factory=dict)  # scratch space for its PartType's hooks
     live: bool = False  # opened: placed for real, not a ghost
+    settle: int = 0     # ticks of settling jitter left (see the module docstring)
+    # Macro instances: the body's parts by their uid in the body, the body's wires,
+    # and which pins are joined (instance pin <-> port pin). Hidden parts: `owner`.
+    owner: Part | None = field(default=None, repr=False)
+    inner: dict[int, Part] = field(default_factory=dict, repr=False)
+    inner_wires: list[Wire] = field(default_factory=list, repr=False)
+    links: list[tuple[Pin, Pin]] = field(default_factory=list, repr=False)
 
     @property
     def pins(self) -> list[Pin]:
@@ -86,9 +110,16 @@ class Wire:
 
 
 class Circuit:
-    def __init__(self, registry: Registry | None = None) -> None:
+    def __init__(self, registry: Registry | None = None, settle_ticks: int = 0, seed: int = 0) -> None:
+        """`registry`: anything with get(kind) / `kind in` -- a Registry, or a
+        macros.Catalog to have macros too."""
         self.registry = registry or builtin_registry()
-        self.parts: list[Part] = []
+        self.parts: list[Part] = []   # what's on the board (macro insides are hidden_parts)
+        self.hidden_parts: list[Part] = []
+        self.hidden_wires: list[Wire] = []
+        self.settle_ticks = settle_ticks
+        self.rng = random.Random(seed)
+        self._settling: list[Part] = []
         self.tick = 0
         self.faults: dict[str, str] = {}  # kind -> why it's disabled (a hook raised)
         self.errors: list[str] = []       # new fault messages, for the UI to pick up
@@ -108,36 +139,89 @@ class Circuit:
 
     def add_part(self, kind: str, uid: int | None = None, live: bool = True) -> Part:
         """`uid` recreates a specific part (undo, loading); normally leave it None.
-        `live=False` makes a ghost: call open_part once it's placed for real."""
+        `live=False` makes a ghost: call open_part once it's placed for real.
+        KeyError if there's no such kind (or it's a macro that can't be loaded)."""
         t = self.registry.get(kind)
         if uid is None:
             uid = self._next_uid
         self._next_uid = max(self._next_uid, uid + 1)
-        part = Part(kind, uid=uid, type=t, props=fresh_props(t))
-        part.inputs = [Pin(part, i, True) for i in range(len(t.ins))]
-        part.outputs = [Pin(part, i, False) for i in range(len(t.outs))]
+        part = self._make(t, uid)
         self.parts.append(part)
-        self._kinds_dirty = True
         if live:
             self.open_part(part)
         return part
 
+    def _make(self, t: PartType, uid: int, owner: Part | None = None) -> Part:
+        part = Part(t.kind, uid=uid, type=t, props=fresh_props(t), owner=owner)
+        part.inputs = [Pin(part, i, True) for i in range(len(t.ins))]
+        part.outputs = [Pin(part, i, False) for i in range(len(t.outs))]
+        if getattr(t, "body", None) is not None:
+            self._expand(part)
+        self._kinds_dirty = self._nets_dirty = True
+        return part
+
+    def _expand(self, inst: Part) -> None:
+        """Build a macro instance's body as hidden parts + wires, and join its pins
+        to the body's ports (see the module docstring)."""
+        t = inst.type
+        body = t.body
+        for uid, (kind, label, _x, _y, props) in body.parts.items():
+            p = self._make(self.registry.get(kind), uid, owner=inst)
+            p.label, p.props = label, copy.deepcopy(props)
+            inst.inner[uid] = p
+            self.hidden_parts.append(p)
+        wires: dict[int, Wire] = {}
+        for uid in sorted(body.wires):  # parents first
+            src, dst = (self._end(ref, inst, wires) for ref in body.wires[uid][:2])
+            w = wires[uid] = Wire(src, dst, uid)
+            inst.inner_wires.append(w)
+            self.hidden_wires.append(w)
+        for pin, port_uid in zip(inst.inputs, t.in_ids):
+            inst.links.append((pin, inst.inner[port_uid].outputs[0]))
+        for pin, port_uid in zip(inst.outputs, t.out_ids):
+            inst.links.append((inst.inner[port_uid].inputs[0], pin))
+        for a, b in inst.links:
+            a.passive = b.passive = True
+
+    @staticmethod
+    def _end(ref: tuple, inst: Part, wires: dict[int, Wire]) -> Endpoint:
+        if ref[0] == "w":
+            return wires[ref[1]]
+        _, uid, is_input, index = ref
+        part = inst.inner[uid]
+        return (part.inputs if is_input else part.outputs)[index]
+
+    def _tree(self, part: Part) -> list[Part]:
+        """The part plus, for a macro instance, everything inside it (any depth)."""
+        out, todo = [], [part]
+        while todo:
+            p = todo.pop()
+            out.append(p)
+            todo += p.inner.values()
+        return out
+
     def open_part(self, part: Part) -> None:
-        """Make a ghost live (placed for real). Calls its type's open hook."""
-        if part.live:
-            return
-        part.live = True
-        t = part.type
-        if t.has("open") and t.kind not in self.faults:
-            self._guard(t, "open", lambda: t.open(part))
+        """Make a ghost live (placed for real): open hooks, and settling starts.
+        A macro instance opens everything inside it too."""
+        for p in self._tree(part):
+            if p.live:
+                continue
+            p.live = True
+            if self.settle_ticks:
+                p.settle = self.settle_ticks
+                self._settling.append(p)
+            t = p.type
+            if t.has("open") and t.kind not in self.faults:
+                self._guard(t, "open", lambda: t.open(p))
 
     def close_part(self, part: Part) -> None:
-        if not part.live:
-            return
-        part.live = False
-        t = part.type
-        if t.has("close"):
-            self._guard(t, "close", lambda: t.close(part))
+        for p in self._tree(part):
+            if not p.live:
+                continue
+            p.live = False
+            t = p.type
+            if t.has("close"):
+                self._guard(t, "close", lambda: t.close(p))
 
     def close_all(self) -> None:
         """The circuit is going away (app closing): close every live part."""
@@ -162,6 +246,11 @@ class Circuit:
             if w in self.wires:  # may already be gone as a branch of an earlier one
                 removed += self.remove_wire(w)
         self.parts.remove(part)
+        if part.inner:  # a macro instance: its insides go too
+            dead = set(self._tree(part))
+            dead_wires = {w for p in dead for w in p.inner_wires}
+            self.hidden_parts = [p for p in self.hidden_parts if p not in dead]
+            self.hidden_wires = [w for w in self.hidden_wires if w not in dead_wires]
         self._nets_dirty = self._kinds_dirty = True
         return removed
 
@@ -266,25 +355,35 @@ class Circuit:
                 x = parent[x]
             return x
 
-        for w in self.wires:
+        wires = self.wires + self.hidden_wires
+        parts = self.parts + self.hidden_parts
+        for w in wires:
             for end in w.ends:
                 parent[find(id(end))] = find(id(w))
+        for part in parts:
+            for a, b in part.links:  # macro pins <-> their ports: one net
+                parent[find(id(a))] = find(id(b))
 
         index: dict[int, int] = {}
         self._nets = []
-        for w in self.wires:
-            root = find(id(w))
-            if root not in index:
-                index[root] = len(self._nets)
+        for part in parts:
+            for pin in part.pins:
+                if id(pin) in parent and find(id(pin)) not in index:
+                    index[find(id(pin))] = len(self._nets)
+                    self._nets.append(([], []))
+        for w in wires:
+            if find(id(w)) not in index:
+                index[find(id(w))] = len(self._nets)
                 self._nets.append(([], []))
-        self._net_of_wire = {w: index[find(id(w))] for w in self.wires}
-        for part in self.parts:
+        self._net_of_wire = {w: index[find(id(w))] for w in wires}
+        for part in parts:
             for pin in part.pins:
                 if id(pin) in parent:
                     drivers, readers = self._nets[index[find(id(pin))]]
-                    (readers if pin.is_input else drivers).append(pin)
-                elif pin.is_input:
-                    pin.state = False  # unconnected input reads 0
+                    # passive (pass-through) pins only show the value
+                    (readers if pin.is_input or pin.passive else drivers).append(pin)
+                elif pin.is_input or pin.passive:
+                    pin.state = False  # unconnected: reads 0
         self.net_value = [False] * len(self._nets)
         self.net_conflict = [False] * len(self._nets)
         self._nets_dirty = False
@@ -319,10 +418,18 @@ class Circuit:
             outs = self._guard(t, "eval", lambda: _outputs(t, t.eval(ctx, *ins), n))
             if outs is not _FAILED:
                 results.append((group, outs))
+        rng = self.rng
         for group, outs in results:
-            for i, values in enumerate(outs):
-                for part, value in zip(group, values):
-                    part.outputs[i].state = value
+            if self._settling:  # settling parts take their new outputs only half the time
+                keep = [p.settle <= 0 or rng.random() < 0.5 for p in group]
+                for i, values in enumerate(outs):
+                    for part, value, k in zip(group, values, keep):
+                        if k:
+                            part.outputs[i].state = value
+            else:
+                for i, values in enumerate(outs):
+                    for part, value in zip(group, values):
+                        part.outputs[i].state = value
 
         # Phase 2: every net resolves its drivers and hands the value to its readers.
         for i, (drivers, readers) in enumerate(self._nets):
@@ -338,6 +445,10 @@ class Circuit:
             for pin in readers:
                 pin.state = value
         self.tick += 1
+        if self._settling:
+            for p in self._settling:
+                p.settle -= 1
+            self._settling = [p for p in self._settling if p.settle > 0]
 
     def frame(self) -> None:
         """Once per frame (not per step): the frame hook of every live part that has one."""
@@ -353,7 +464,7 @@ class Circuit:
     def _by_kind(self) -> dict[PartType, list[Part]]:
         if self._kinds_dirty:
             self._kinds = {}
-            for part in self.parts:
+            for part in self.parts + self.hidden_parts:
                 self._kinds.setdefault(part.type, []).append(part)
             self._kinds_dirty = False
         return self._kinds

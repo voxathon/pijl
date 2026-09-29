@@ -162,6 +162,11 @@ class Widget:
 
     def refresh(self) -> None:
         """Bring text + rename field up to date with the row's data."""
+        if self.what == "part":  # greyed out while it can't be placed (see PartPicker.disabled)
+            color = T.PICKER_DIM_TEXT if self.p.disabled(self.row.part) else T.PART_TEXT
+            if tuple(self.name.color) != tuple(color):
+                self.name.color = color
+                self.shown_alpha = -1  # the color reset the opacity: re-apply it
         if self.what != "section":
             return
         p, c = self.p, self.row.collection
@@ -259,8 +264,10 @@ class Widget:
 class PartPicker:
     def __init__(self, library: Library, batch: pyglet.graphics.Batch, win_h: int,
                  pixel_ratio: float = 1.0, swatch: Callable[[str], tuple] = lambda part: T.PART_BODY,
-                 name_of: Callable[[str], str] = lambda part: part) -> None:
+                 name_of: Callable[[str], str] = lambda part: part,
+                 disabled: Callable[[str], bool] = lambda part: False) -> None:
         self.lib = library
+        self.disabled = disabled  # part -> shown greyed out (can't be placed right now); refresh() re-asks
         self.swatch = swatch    # part -> (fill, border) of the little color chip in front of its name
         self.name_of = name_of  # part -> the text shown for it
         self.batch = batch

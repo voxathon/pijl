@@ -15,6 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+MACRO = "macro:"  # kind prefix of a placed macro ("macro:half adder"); part type kinds can't contain ':'
+
 Point = tuple[float, float]
 PartData = tuple[str, str, float, float, dict[str, Any]]  # kind, label, x, y, props
 # ("p", part uid, is_input, pin index) or ("w", wire uid)

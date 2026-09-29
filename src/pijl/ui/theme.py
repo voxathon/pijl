@@ -9,6 +9,7 @@ UI_SCALE = 1.2
 # dark fills a lighter one, so every block reads against the background.
 PART_BODY = ((62, 84, 150), (34, 47, 92))
 MACRO_SWATCH = ((128, 84, 160), (74, 46, 98))  # saved macros in the part picker
+MACRO_BODY = ((92, 66, 138), (52, 36, 82))      # placed macros
 SWITCH_OFF = ((70, 40, 40), (112, 62, 62))
 SWITCH_ON = ((220, 60, 60), (140, 30, 30))
 LED_OFF = ((45, 45, 52), (86, 86, 98))
@@ -76,6 +77,12 @@ JUNCTION_RADIUS = 4.5  # dot where a wire attaches to another wire
 PART_BORDER = 2
 LABEL_SIZE = 10  # pt at zoom 1
 LABEL_GAP = 6  # between a part and its label
+PIN_LABEL_SIZE = 9     # pt at zoom 1: pin name tags next to macro pins
+PIN_TAG_BG = (0, 0, 0, 170)  # the tag behind each name
+PIN_TAG_PAD = (4, 3)   # tag padding around the text (x, y), world units
+PIN_TAG_GAP = 4        # between the pin dot's edge and its tag
+TITLE_PAD = 12         # a part's title keeps this much room on each side
+TITLE_SIZE, IO_TITLE_SIZE = 12, 10
 
 # pyglet picks circle smoothness from the radius at creation, which is far too
 # coarse once zoomed in. These stay smooth up to the max zoom (8x).

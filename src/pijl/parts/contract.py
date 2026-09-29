@@ -51,11 +51,14 @@ class Look:
     label: str = "below"                # where the user's label goes: below, left, right
     lit: tuple[str, str] | None = None  # body (off, on) colors, following the part's first pin
     swatch: str = "PART_BODY"           # its color in the part picker
+    body: str = "PART_BODY"             # body (fill, border) colors, unless `lit` says otherwise
+    pin_labels: bool = False            # show pin names inside the body (Tab toggles them)
 
 
 class PartType:
     """One kind of part. Class attributes are the defaults; instances may set their own."""
     kind: str = ""                   # stable id: save files refer to parts by it
+    title: str = ""                  # what the body says, if not the kind
     ins: tuple[str, ...] = ()        # input pin names, top to bottom
     outs: tuple[str, ...] = ()       # output pin names, top to bottom
     props: dict[str, Any] = {}       # per-instance settings (JSON values); each instance gets a copy

@@ -6,7 +6,7 @@ finish". The press that starts an action never finishes it on release, so
 holding and dragging simply carries the thing along until the next click.
 
 Controls
-  part picker (left panel; Tab or its "«" button collapses it, see picker.py)
+  part picker (left panel; its "«" button collapses it, see picker.py)
     click a part           pick it up; it follows the cursor (dragging it out of the panel does too)
       click                place it (shift+click: place and keep another)
       click another part   swap to that part instead
@@ -50,6 +50,7 @@ Controls
   Ctrl+O                   open a macro: type to filter, arrows + Enter (or click); saved macros
                            are also in the picker's MACROS section: right-click -> Open
   Ctrl+N                   new, empty board
+  Tab                      pin names on placed macros: hidden -> on hover -> always -> hidden
                            (opening, new and closing the window ask first if there are unsaved changes)
   Ctrl+Z / Ctrl+Y          undo / redo (also Ctrl+Shift+Z). During an action, Ctrl+Z cancels it.
                            Every finished edit is recorded automatically; see document.py.
@@ -73,10 +74,12 @@ from pyglet import shapes
 from pyglet.math import Mat4
 from pyglet.window import key, mouse
 
+from ..macros import Catalog
 from ..parts import load as load_parts
 from ..project import Project, write_atomic
 from ..storage import NAME_MAX, FormatError, MacroStore, check_name
 from ..sim import Part, Circuit, Pin, Wire
+from ..snapshot import MACRO  # library entries (and part kinds) of saved macros: "macro:<name>"
 from . import theme as T
 from .camera import MIN_LEVEL, STEPS_PER_OCTAVE, Camera
 from .document import EMPTY, History, Snapshot, capture, instantiate, internal_wires, restore
@@ -95,7 +98,9 @@ from .wire_edit import WireEditSession
 SIM_STEPS_PER_FRAME = 1
 HOME = (400, 300)
 LABEL_MAX = 32
-MACRO = "macro:"  # library entries for saved macros; part kinds can't contain ':'
+PIN_LABELS_HIDDEN, PIN_LABELS_HOVER, PIN_LABELS_ALWAYS = 0, 1, 2
+PIN_LABEL_MODES = ("hidden", "on hover", "always shown")
+SETTLE_TICKS = 64  # settling noise for new parts, see sim/circuit.py
 MACROS = "MACROS"  # the picker collection new macros land in
 NOTICE_SECONDS = 4.0
 DOUBLE_CLICK = 0.4  # s: a second click on the same picker row within this is treated as mouse bounce
@@ -134,7 +139,14 @@ class Editor(pyglet.window.Window):
         self.project = Project.open()  # where saves go; created on first run (see project.py)
         self.parts = load_parts(self.project.parts_dir)  # the project's part scripts (see pijl.parts)
         self.store = MacroStore(self.project.macros_dir)
-        self.circuit = Circuit(self.parts)
+        # the open document: a macro, or an untitled board (set early: the picker asks about it)
+        self.doc: str | None = None          # its name; None = untitled
+        self.saved: Snapshot = EMPTY         # what's on disk (dirty = history.current differs)
+        # Part scripts plus macros. A macro's definition is read from its file when first needed.
+        self.catalog = Catalog(self.parts, lambda name: self.store.load(name, self.catalog).snapshot)
+        self.circuit = Circuit(self.catalog, settle_ticks=SETTLE_TICKS)
+        self.pin_label_mode = PIN_LABELS_HOVER  # Tab cycles it
+        self.hover_view: PartView | None = None  # the part whose pin names hover shows
         self.camera = Camera()
         self.grid = Grid()
         self.keys = key.KeyStateHandler()  # live "is this key down?" lookups
@@ -147,12 +159,13 @@ class Editor(pyglet.window.Window):
         self.startup_problems: list[str] = [f"part script {msg}" for msg in self.parts.errors]
         self.library = self._load_library()
         self.picker = PartPicker(self.library, self.hud, self.height, self._pixel_ratio(),
-                                 swatch=self._swatch, name_of=lambda entry: entry.removeprefix(MACRO))
+                                 swatch=self._swatch, name_of=lambda entry: entry.removeprefix(MACRO),
+                                 disabled=self._unplaceable)
         self.menu = ContextMenu(self.hud)
         self.help = pyglet.text.Label(
             "click pin: wire | click: select | drag empty: box select | Del: delete | Ctrl+C/X/V | "
-            "Ctrl+Z/Y | Ctrl+S/O/N: save/open/new | right-click: menu | middle-drag: pan | scroll: zoom | "
-            "hold Ctrl: snap",
+            "Ctrl+Z/Y | Ctrl+S/O/N: save/open/new | Tab: pin names | right-click: menu | middle-drag: pan | "
+            "scroll: zoom | hold Ctrl: snap",
             font_name="Consolas", font_size=10, color=T.HELP_TEXT,
             x=self.picker.width + 8, y=self.height - 8, anchor_y="top", batch=self.hud)
         # Problems (part scripts, files) in red; notices ("saved adder") in grey, for a few seconds
@@ -205,9 +218,6 @@ class Editor(pyglet.window.Window):
         self.prompt: Prompt | None = None
         self.prompt_enter = None  # what Enter (or clicking a list item) does: fn(prompt)
         self.prompt_key = None    # other keys: fn(symbol) -> handled
-        # the open document: a macro, or an untitled board
-        self.doc: str | None = None          # its name; None = untitled
-        self.saved: Snapshot = EMPTY         # what's on disk (dirty = history.current differs)
         self._caption_for: tuple = ()
 
         self._start_document()
@@ -220,11 +230,14 @@ class Editor(pyglet.window.Window):
     def add_part(self, kind: str, x: float, y: float, uid: int | None = None, live: bool = True) -> PartView:
         """`live=False`: a ghost, for carrying on the cursor (see _carry / _commit_placing)."""
         part = self.circuit.add_part(kind, uid, live)
-        view = PartView(part, x, y, self.world, self.layers, self.text)
+        view = PartView(part, x, y, self.world, self.layers, self.text,
+                        pin_labels=self.pin_label_mode == PIN_LABELS_ALWAYS)
         self.part_views[part] = view
         return view
 
     def remove_part(self, view: PartView) -> None:
+        if view is self.hover_view:
+            self.hover_view = None
         for wire in self.circuit.remove_part(view.part):
             self._drop_wire_view(wire)
         self.selection.discard(view)
@@ -587,6 +600,7 @@ class Editor(pyglet.window.Window):
             hand = self.get_system_mouse_cursor(self.CURSOR_HAND)
             self.set_mouse_cursor(hand if self.wire_edit.hover else None)
         self._follow_cursor()
+        self._update_pin_labels()
 
     def on_mouse_release(self, x, y, button, modifiers):
         # Releases never *finish* a click-to-place or click-to-wire action.
@@ -707,8 +721,10 @@ class Editor(pyglet.window.Window):
             self._start_paste()
         elif symbol == key.BACKSPACE and self.mode is Mode.WIRING:
             self._pop_bend_or_cancel()
-        elif symbol == key.TAB and self.mode not in (Mode.PICKER_PRESS, Mode.PICKER_DRAG):
-            self.picker.toggle()
+        elif symbol == key.TAB:
+            self.pin_label_mode = (self.pin_label_mode + 1) % len(PIN_LABEL_MODES)
+            self._update_pin_labels()
+            self._notice(f"pin names: {PIN_LABEL_MODES[self.pin_label_mode]}")
         elif symbol == key.HOME:
             self.camera.set_level(0, 0, 0)
             self.camera.center_on(*HOME, self.width, self.height)
@@ -878,8 +894,14 @@ class Editor(pyglet.window.Window):
         return fb_w / self.width if self.width else 1.0
 
     def _start_placing(self, kind: str) -> None:
-        if kind.startswith(MACRO):
-            self._notice("placing macros comes later; right-click it -> Open to edit it")
+        if self._unplaceable(kind):
+            self._notice(f"{kind.removeprefix(MACRO)} can't go in here: it contains {self.doc}"
+                         if kind != MACRO + self.doc else "a macro can't contain itself")
+            return
+        try:
+            self.catalog.get(kind)
+        except KeyError as e:
+            self._report(f"can't place {kind.removeprefix(MACRO)}: {e.args[0] if e.args else e}")
             return
         self._carry([self.add_part(kind, 0, 0, live=False)], [], again=lambda: self._start_placing(kind))
         self.placing_kind = kind
@@ -1187,6 +1209,7 @@ class Editor(pyglet.window.Window):
         self.history = History(capture(self))
         self.saved = self.history.current
         self.doc = doc
+        self.picker.refresh()  # what's greyed out depends on what's open
 
     def _clear_board(self) -> None:
         self._cancel()
@@ -1195,7 +1218,7 @@ class Editor(pyglet.window.Window):
 
     def _load(self, name: str) -> None:
         try:
-            loaded = self.store.load(name, self.parts)
+            loaded = self.store.load(name, self.catalog)
         except (OSError, FormatError) as e:
             self._report(f"can't open {name}: {e}")
             return
@@ -1253,11 +1276,18 @@ class Editor(pyglet.window.Window):
 
     def _write(self, name: str) -> bool:
         snap = self.history.current
+        name = check_name(name)
+        for kind in {d[0] for d in snap.parts.values() if d[0].startswith(MACRO)}:
+            inner = kind.removeprefix(MACRO)
+            if inner.casefold() == name.casefold() or self.catalog.book.contains(inner, name):
+                self._report(f"can't save as {name}: the board has {inner} on it, which would then contain itself")
+                return False
         try:
-            self.store.save(name, snap)
-        except (OSError, ValueError) as e:
+            self.store.save(name, snap, self.catalog)
+        except (OSError, ValueError, KeyError) as e:
             self._report(f"couldn't save {name}: {e}")
             return False
+        self.catalog.book.forget()  # definitions changed; boards opened later see the new version
         self.doc, self.saved = check_name(name), snap
         self.project.remember_open(self.doc)
         self._sync_library()
@@ -1374,6 +1404,30 @@ class Editor(pyglet.window.Window):
             self._library_saved = data
         except OSError as e:
             self._report(f"couldn't save library.json: {e}")
+
+    def _update_pin_labels(self) -> None:
+        """Pin name tags per the Tab mode. On hover: the part under the cursor (its body
+        or one of its pins) shows them; ghosts on the cursor don't count."""
+        mode = self.pin_label_mode
+        hovered = None
+        if mode == PIN_LABELS_HOVER and self.mode is not Mode.PROMPT and not self.picker.contains(*self.mouse):
+            wx, wy = self.camera.screen_to_world(*self.mouse)
+            pin = self.pin_at(wx, wy)
+            hovered = self.part_views[pin.part] if pin is not None else self.part_at(wx, wy)
+            if hovered in self.placing_views:
+                hovered = None
+        if mode == PIN_LABELS_HOVER and hovered is self.hover_view:
+            return  # nothing changed (the common case: called on every mouse move)
+        self.hover_view = hovered
+        for view in self.part_views.values():
+            view.set_pin_labels(mode == PIN_LABELS_ALWAYS or view is hovered)
+
+    def _unplaceable(self, entry: str) -> bool:
+        """Macros that can't go on the open board: itself, and anything containing it."""
+        if not entry.startswith(MACRO) or self.doc is None:
+            return False
+        name = entry.removeprefix(MACRO)
+        return name.casefold() == self.doc.casefold() or self.catalog.book.contains(name, self.doc)
 
     def _swatch(self, entry: str) -> tuple:
         if entry.startswith(MACRO):

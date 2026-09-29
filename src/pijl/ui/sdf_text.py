@@ -214,6 +214,10 @@ class SDFText:
         self.atlas = _get_atlas()
         self.group = _SDFGroup(self.atlas, order)
 
+    def measure(self, text: str, size: float) -> float:
+        """Width `text` would have at `size` (monospace: just the character count)."""
+        return len(text) * self.atlas.advance * size * 96 / 72 / EM_PX
+
     def label(self, text: str, x: float, y: float, size: float,
               color: tuple[int, int, int, int], anchor_x: str = "center") -> SDFLabel:
         return SDFLabel(self, text, x, y, size, color, anchor_x)

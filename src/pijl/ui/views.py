@@ -29,8 +29,9 @@ class Layers:
         self.selection = pyglet.graphics.Group(order=1)   # part outlines, just under the bodies
         self.bodies = pyglet.graphics.Group(order=2)
         self.pins = pyglet.graphics.Group(order=3)
-        self.text_order = 4  # SDFText makes its own group at this order
-        self.overlay = pyglet.graphics.Group(order=5)
+        self.tags = pyglet.graphics.Group(order=4)  # pin name tag backgrounds: over wires and parts
+        self.text_order = 5  # SDFText makes its own group at this order
+        self.overlay = pyglet.graphics.Group(order=6)
 
 
 class Polyline:
@@ -192,16 +193,25 @@ class Box:
 
 class PartView:
     def __init__(self, part: Part, x: float, y: float, batch: pyglet.graphics.Batch,
-                 layers: Layers, text: SDFText) -> None:
+                 layers: Layers, text: SDFText, pin_labels: bool = True) -> None:
         self.part = part
         self.x, self.y = x, y
+        self.text = text
         self.look = look = part.type.look
+        title = part.type.title or part.kind
+        title_size = T.IO_TITLE_SIZE if look.narrow else T.TITLE_SIZE
         n = max(len(part.inputs), len(part.outputs), 1)
         self.w = T.IO_WIDTH if look.narrow else T.PART_WIDTH
+        if not look.narrow:  # long titles (macro names) widen the body, in grid steps
+            need = text.measure(title, title_size) + 2 * T.TITLE_PAD
+            self.w = max(self.w, math.ceil(need / (2 * T.GRID)) * 2 * T.GRID)
         self.h = (n + 1) * T.PIN_SPACING  # multiple of GRID, see theme.py
 
-        self.body = Box(self.w, self.h, T.PART_BORDER, *T.PART_BODY, batch, layers.bodies)
-        self.kind_text = text.label(part.kind, 0, 0, size=10 if look.narrow else 12, color=T.PART_TEXT)
+        self.body = Box(self.w, self.h, T.PART_BORDER, *theme_color(look.body), batch, layers.bodies)
+        self.kind_text = text.label(title, 0, 0, size=title_size, color=T.PART_TEXT)
+        self.batch, self.layers = batch, layers
+        self.pin_tags: list = []  # (background, SDF label) per pin, while shown (see set_pin_labels)
+        self.opacity = 255
         # The user's label sits outside the body: left of IN switches, right of
         # OUT LEDs (so it reads like a pin name at the board edge), below gates.
         anchor = {"left": "right", "right": "left"}.get(look.label, "center")
@@ -215,8 +225,45 @@ class PartView:
                                   color=T.SELECT, batch=batch, group=layers.selection)
         self.outline.visible = False
         self._last_state: tuple[bool, ...] | None = None
+        self.set_pin_labels(pin_labels)
         self.move_to(x, y)
         self.sync()
+
+    @property
+    def pin_labels_shown(self) -> bool:
+        return bool(self.pin_tags)
+
+    def set_pin_labels(self, on: bool) -> None:
+        """Show / hide the pin name tags: outside the body, next to each pin, on a dark
+        backing so they read over wires and other parts. Only parts whose look asks."""
+        on = on and self.look.pin_labels
+        if on == self.pin_labels_shown:
+            return
+        for bg, label in self.pin_tags:
+            bg.delete()
+            label.delete()
+        self.pin_tags = []
+        if on:
+            t = self.part.type
+            for pin in self.part.pins:
+                name = (t.ins if pin.is_input else t.outs)[pin.index]
+                label = self.text.label(name, 0, 0, size=T.PIN_LABEL_SIZE, color=T.LABEL_TEXT,
+                                        anchor_x="right" if pin.is_input else "left")
+                label.opacity = self.opacity
+                bg = shapes.Rectangle(0, 0, 1, 1, color=T.PIN_TAG_BG, batch=self.batch, group=self.layers.tags)
+                self.pin_tags.append((bg, label))
+            self._place_pin_tags()
+
+    def _place_pin_tags(self) -> None:
+        pad_x, pad_y = T.PIN_TAG_PAD
+        off = T.PIN_RADIUS + T.PIN_TAG_GAP + pad_x
+        for (bg, label), pin in zip(self.pin_tags, self.part.pins):
+            px, py = self.pin_pos(pin)
+            x = px - off if pin.is_input else px + off  # inputs: tag to the left; outputs: right
+            label.move_to(x, py)
+            h = label.cap_height + 2 * pad_y
+            bg.width, bg.height = label.width + 2 * pad_x, h
+            bg.position = (x - label.width - pad_x if pin.is_input else x - pad_x, py - h / 2)
 
     @property
     def selected(self) -> bool:
@@ -247,6 +294,7 @@ class PartView:
         self.name.move_to(*self.name_pos())
         for dot, pin in zip(self.pin_dots, self.part.pins):
             dot.position = self.pin_pos(pin)
+        self._place_pin_tags()
 
     def name_pos(self) -> Point:
         if self.look.label == "left":
@@ -272,10 +320,13 @@ class PartView:
 
     def set_ghost(self, ghost: bool) -> None:
         """Semi-transparent while being carried around before placement."""
-        a = T.GHOST_OPACITY if ghost else 255
+        a = self.opacity = T.GHOST_OPACITY if ghost else 255
         self.body.opacity = a
         self.kind_text.opacity = a
         self.name.opacity = a
+        for bg, label in self.pin_tags:
+            label.opacity = a
+            bg.opacity = T.PIN_TAG_BG[3] * a // 255
         for dot in self.pin_dots:
             dot.opacity = a
 
@@ -302,6 +353,9 @@ class PartView:
         self.name.delete()
         for dot in self.pin_dots:
             dot.delete()
+        for bg, label in self.pin_tags:
+            bg.delete()
+            label.delete()
 
 
 class WireView:
