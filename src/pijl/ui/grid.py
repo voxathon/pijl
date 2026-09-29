@@ -65,15 +65,17 @@ class Grid:
             6, gl.GL_TRIANGLES,
             position=("f", (-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1)))
 
-    def draw(self, window: pyglet.window.Window, camera: Camera, emphasized: bool) -> None:
+    def draw(self, window: pyglet.window.Window, camera: Camera, emphasized: bool,
+             divisions: int = 1) -> None:
+        """`divisions` > 1 shows the finer subgrid (Ctrl+Shift); major lines stay put."""
         p = self.program
         p.use()
         tx, ty = camera.translation()
         p["translate"] = (tx, ty)
         p["zoom"] = camera.zoom
         p["px_ratio"] = window.get_framebuffer_size()[0] / window.width
-        p["spacing"] = float(T.GRID)
-        p["major_every"] = float(T.GRID_MAJOR_EVERY)
+        p["spacing"] = T.GRID / divisions
+        p["major_every"] = float(T.GRID_MAJOR_EVERY * divisions)
         p["background"] = _rgb(T.BACKGROUND)
         minor, major = T.GRID_SNAPPING if emphasized else T.GRID_COLORS
         p["minor_color"] = _rgb(minor)

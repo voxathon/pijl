@@ -1,13 +1,17 @@
 """Snapshots of the board: the basis for undo/redo and copy/paste (and later, save files).
 
 A Snapshot is plain data -- chip kinds, labels, positions, wire endpoints and
-bends -- keyed by the chips' stable uids. Simulation state (which switches are
-on) is deliberately NOT part of it: toggling is using the circuit, not editing it.
+bends -- keyed by stable uids (chips and wires both have one, since a wire can
+be attached to another wire). Simulation state (which switches are on) is
+deliberately NOT part of it: toggling is using the circuit, not editing it.
 
 Undo doesn't rebuild the board from scratch. `restore` diffs the target
 snapshot against what's on screen and only adds/removes/moves what changed,
 because creating pyglet shapes is the slow part (~0.8 ms per chip). A side
 effect: chips that survive an undo keep their switch states.
+
+Wire uids grow in creation order and a wire is always created after the wires
+it attaches to, so iterating wires by uid always visits parents first.
 """
 
 from __future__ import annotations
@@ -15,40 +19,63 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable
 
+from ..sim import Pin, Wire
 from .views import ChipView, Point, WireView
 
 if TYPE_CHECKING:
     from .editor import Editor
 
 ChipData = tuple[str, str, float, float]  # kind, label, x, y
-WireKey = tuple[int, int, int, int]       # src uid, output index, dst uid, input index
+# ("p", chip uid, is_input, pin index) or ("w", wire uid)
+EndRef = tuple
+# src ref, dst ref, bends (src to dst), src junction point, dst junction point
+# (junction points are None for pin ends: those follow from the chip's position)
+WireData = tuple[EndRef, EndRef, tuple[Point, ...], Point | None, Point | None]
 
 
 @dataclass(frozen=True)
 class Snapshot:
     chips: dict[int, ChipData]
-    wires: dict[WireKey, tuple[Point, ...]]  # -> bends, src to dst
+    wires: dict[int, WireData]
 
 
 def capture(editor: Editor, views: Iterable[ChipView] | None = None) -> Snapshot:
-    """The whole board, or just `views` plus every wire running between two of them."""
+    """The whole board, or just `views` plus every wire fully inside that set
+    (both ends on those chips, or on wires that are themselves inside)."""
     views = list(editor.chip_views.values() if views is None else views)
     uids = {v.chip.uid for v in views}
     chips = {v.chip.uid: (v.chip.kind, v.chip.label, v.x, v.y) for v in views}
-    wires = {_key(w.wire): tuple(w.bends) for w in editor.wire_views.values()
-             if w.wire.src.chip.uid in uids and w.wire.dst.chip.uid in uids}
+    inside = internal_wires(editor, uids)
+    wires = {}
+    for view in inside:
+        w = view.wire
+        wires[w.uid] = (_ref(w.src), _ref(w.dst), tuple(view.bends),
+                        None if isinstance(w.src, Pin) else view.src,
+                        None if isinstance(w.dst, Pin) else view.dst)
     return Snapshot(chips, wires)
+
+
+def internal_wires(editor: Editor, chip_uids: set[int]) -> list[WireView]:
+    """Wire views whose every end lands on those chips or on other internal wires."""
+    inside: set[Wire] = set()
+    result = []
+    for w in editor.circuit.wires:  # creation order: parents first
+        if all(e.chip.uid in chip_uids if isinstance(e, Pin) else e in inside for e in w.ends):
+            inside.add(w)
+            result.append(editor.wire_views[w])
+    return result
 
 
 def restore(editor: Editor, target: Snapshot) -> None:
     """Make the board match `target`, touching only what differs."""
     by_uid = {v.chip.uid: v for v in editor.chip_views.values()}
-    # 1. chips that shouldn't exist (their wires go with them)
+    # 1. chips that shouldn't exist (their wires and branches go with them)
     for uid in by_uid.keys() - target.chips.keys():
         editor.remove_chip(by_uid.pop(uid))
     # 2. wires that shouldn't exist
-    for view in [v for v in editor.wire_views.values() if _key(v.wire) not in target.wires]:
-        editor.remove_wire(view)
+    for view in [v for v in editor.wire_views.values() if v.wire.uid not in target.wires]:
+        if view.wire in editor.wire_views:  # may be gone already, as a branch of an earlier one
+            editor.remove_wire(view)
     # 3. chips: add missing, update moved/relabeled
     moved = set()
     for uid, (kind, label, x, y) in target.chips.items():
@@ -62,18 +89,27 @@ def restore(editor: Editor, target: Snapshot) -> None:
             view.chip.label = label
             view.refresh_name()
             view.name.move_to(*view.name_pos())
-    # 4. wires: add missing (created at the right pins already), update bends,
-    #    and re-attach the ends of wires on moved chips. Only those: touching every
-    #    wire made undoing one moved chip on a 2000-chip board take ~80 ms.
-    existing = {_key(v.wire): v for v in editor.wire_views.values()}
-    for (su, si, du, di), bends in target.wires.items():
-        view = existing.get((su, si, du, di))
-        if view is None:
-            editor.connect(by_uid[su].chip.outputs[si], by_uid[du].chip.inputs[di], list(bends))
-        elif tuple(view.bends) != bends:
+    # 4. wires, parents first: add missing, update bends / junction points
+    wire_by_uid = {v.wire.uid: v.wire for v in editor.wire_views.values()}
+    changed: list[WireView] = []
+    for uid in sorted(target.wires):
+        src_ref, dst_ref, bends, src_pt, dst_pt = target.wires[uid]
+        wire = wire_by_uid.get(uid)
+        if wire is None:
+            src = _resolve(src_ref, by_uid, wire_by_uid)
+            dst = _resolve(dst_ref, by_uid, wire_by_uid)
+            wire = editor.connect(src, dst, list(bends), src_pt, dst_pt, uid=uid)
+            wire_by_uid[uid] = wire
+            continue
+        view = editor.wire_views[wire]
+        if tuple(view.bends) != bends or (src_pt and view.src != src_pt) or (dst_pt and view.dst != dst_pt):
+            view.src, view.dst = src_pt or view.src, dst_pt or view.dst
             view.set_bends(list(bends))
-    if moved:
-        editor.refresh_wires_touching(moved)
+            changed.append(view)
+    # 5. re-attach ends: wires on moved chips, changed wires, and whatever hangs off them.
+    #    Only those: touching every wire made undoing one moved chip on a 2000-chip
+    #    board take ~80 ms.
+    editor.refresh_wires([*editor.wires_touching(moved), *changed])
 
 
 def instantiate(editor: Editor, clip: Snapshot) -> tuple[list[ChipView], list[WireView]]:
@@ -85,11 +121,13 @@ def instantiate(editor: Editor, clip: Snapshot) -> tuple[list[ChipView], list[Wi
             view.chip.label = label
             view.refresh_name()
             view.name.move_to(*view.name_pos())
-    wires = []
-    for (su, si, du, di), bends in clip.wires.items():
-        wire = editor.connect(new[su].chip.outputs[si], new[du].chip.inputs[di], list(bends))
-        wires.append(editor.wire_views[wire])
-    return list(new.values()), wires
+    new_wires: dict[int, Wire] = {}
+    for uid in sorted(clip.wires):
+        src_ref, dst_ref, bends, src_pt, dst_pt = clip.wires[uid]
+        src = _resolve(src_ref, new, new_wires)
+        dst = _resolve(dst_ref, new, new_wires)
+        new_wires[uid] = editor.connect(src, dst, list(bends), src_pt, dst_pt)
+    return list(new.values()), [editor.wire_views[w] for w in new_wires.values()]
 
 
 class History:
@@ -126,5 +164,15 @@ class History:
         return self.current
 
 
-def _key(wire) -> WireKey:
-    return wire.src.chip.uid, wire.src.index, wire.dst.chip.uid, wire.dst.index
+def _ref(end) -> EndRef:
+    if isinstance(end, Pin):
+        return "p", end.chip.uid, end.is_input, end.index
+    return "w", end.uid
+
+
+def _resolve(ref: EndRef, chips: dict[int, ChipView], wires: dict[int, Wire]):
+    if ref[0] == "p":
+        _, chip_uid, is_input, index = ref
+        chip = chips[chip_uid].chip
+        return (chip.inputs if is_input else chip.outputs)[index]
+    return wires[ref[1]]

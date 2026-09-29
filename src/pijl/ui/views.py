@@ -320,8 +320,13 @@ class WireView:
         self.batch, self.layers = batch, layers
         self.line = Polyline(self.points, T.WIRE_OFF, batch, layers.wires)
         self.highlight: Polyline | None = None  # selection glow, only while selected
-        self._last_state: bool | None = None
-        self.sync()
+        # A dot on each end that attaches to another wire (a junction), like on schematics.
+        self.dots = {end: shapes.Circle(0, 0, T.JUNCTION_RADIUS, segments=T.PIN_SEGMENTS, color=T.WIRE_OFF,
+                                        batch=batch, group=layers.pins)
+                     for end in ("src", "dst") if not isinstance(getattr(wire, end), Pin)}
+        self._last_state: tuple[bool, bool] | None = None
+        self._redraw()
+        self.sync((False, False))
 
     @property
     def points(self) -> list[Point]:
@@ -340,10 +345,15 @@ class WireView:
         self.line.set_points(self.points)
         if self.highlight is not None:
             self.highlight.set_points(self.points)
+        for end, dot in self.dots.items():
+            dot.position = getattr(self, end)
 
     def set_ghost(self, ghost: bool) -> None:
         """Semi-transparent while being carried around before placement (paste)."""
-        self.line.opacity = T.GHOST_OPACITY if ghost else 255
+        a = T.GHOST_OPACITY if ghost else 255
+        self.line.opacity = a
+        for dot in self.dots.values():
+            dot.opacity = a
 
     @property
     def selected(self) -> bool:
@@ -361,11 +371,16 @@ class WireView:
         """Is the whole wire within the world-space rectangle (x0, y0)-(x1, y1)?"""
         return all(x0 <= x <= x1 and y0 <= y <= y1 for x, y in self.points)
 
-    def sync(self) -> None:
-        on = self.wire.src.state
-        if on != self._last_state:
-            self._last_state = on
-            self.line.color = T.WIRE_ON if on else T.WIRE_OFF
+    def sync(self, state: tuple[bool, bool]) -> None:
+        """`state` is the net's (value, conflict), from Circuit.wire_state."""
+        if state == self._last_state:
+            return
+        self._last_state = state
+        on, conflict = state
+        color = T.WIRE_CONFLICT if conflict else T.WIRE_ON if on else T.WIRE_OFF
+        self.line.color = color
+        for dot in self.dots.values():
+            dot.color = color
 
     def distance_to(self, wx: float, wy: float) -> float:
         return self.line.distance_to(wx, wy)
@@ -373,3 +388,22 @@ class WireView:
     def delete(self) -> None:
         self.set_selected(False)
         self.line.delete()
+        for dot in self.dots.values():
+            dot.delete()
+
+
+def project_onto(points: list[Point], p: Point) -> Point:
+    """Nearest point to `p` on the polyline. Returns `p` itself (bit for bit) if it
+    already lies on the line: junctions get re-projected after every edit, and
+    float noise there would make identical boards compare unequal (see document.py)."""
+    best, best_d = p, math.inf
+    for a, b in zip(points, points[1:]):
+        (x1, y1), (x2, y2) = a, b
+        dx, dy = x2 - x1, y2 - y1
+        length_sq = dx * dx + dy * dy
+        t = 0.0 if length_sq == 0 else max(0.0, min(1.0, ((p[0] - x1) * dx + (p[1] - y1) * dy) / length_sq))
+        q = (x1 + t * dx, y1 + t * dy)
+        d = math.hypot(q[0] - p[0], q[1] - p[1])
+        if d < best_d:
+            best, best_d = q, d
+    return p if best_d < 1e-9 else best

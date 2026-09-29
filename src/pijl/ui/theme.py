@@ -17,6 +17,7 @@ PIN_ON = (240, 70, 70)
 
 WIRE_OFF = (85, 85, 98)
 WIRE_ON = (235, 60, 60)
+WIRE_CONFLICT = (240, 175, 40)  # net driven to different values at once (future: X)
 WIRE_PREVIEW = (200, 200, 210, 160)
 WIRE_PREVIEW_SNAP = (120, 220, 140, 220)
 
@@ -58,10 +59,12 @@ PIN_RADIUS = 6
 # snapped chip lands exactly on a grid point.
 GRID = 10
 GRID_MAJOR_EVERY = 4
+SUBGRID_DIVISIONS = 2  # Ctrl+Shift snaps to GRID / this (off the pin grid, on purpose)
 PIN_SPACING = 20
 CHIP_WIDTH = 80
 IO_WIDTH = 40
 WIRE_THICKNESS = 3
+JUNCTION_RADIUS = 4.5  # dot where a wire attaches to another wire
 CHIP_BORDER = 2
 LABEL_SIZE = 10  # pt at zoom 1
 LABEL_GAP = 6    # between a chip and its label

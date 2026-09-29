@@ -2,9 +2,16 @@
 
 Model:
   - A Chip has input pins and output pins.
-  - A Wire copies the state of one output pin onto one input pin.
+  - A Wire joins two endpoints. An endpoint is a Pin, or another Wire (a
+    junction / branch: "attached somewhere along that wire").
+  - Everything joined by wires forms a *net*. A net's output pins drive it,
+    its input pins read it:
+        no drivers        -> reads 0   (future Z: floating)
+        drivers agree     -> that value
+        drivers disagree  -> CONFLICT: reads 0 for now, flagged so the UI can
+                             show it (future X). See Circuit.step.
   - Circuit.step() advances time by one tick: every chip computes its outputs
-    from its *current* inputs, then every wire carries those outputs along.
+    from its *current* inputs, then every net carries its value to its readers.
     So each gate costs one tick of delay, and feedback loops (latches) work
     without infinite recursion.
 """
@@ -12,7 +19,7 @@ Model:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Union
 
 # kind -> (n_inputs, n_outputs, logic function or None)
 # A logic function takes a list of input bools and returns a list of output bools.
@@ -63,17 +70,35 @@ class Chip:
             self.outputs[0].state = not self.outputs[0].state
 
 
+Endpoint = Union[Pin, "Wire"]
+
+
 @dataclass(eq=False)
 class Wire:
-    src: Pin  # always an output pin
-    dst: Pin  # always an input pin
+    # Two ends, each a Pin or another Wire. Normalized by Circuit.connect: an
+    # output pin is always `src`, an input pin always `dst` -- so a plain
+    # pin-to-pin wire reads src=output, dst=input like before junctions existed.
+    src: Endpoint
+    dst: Endpoint
+    uid: int = 0  # stable identity, like Chip.uid (wires can be endpoints of wires)
+
+    @property
+    def ends(self) -> tuple[Endpoint, Endpoint]:
+        return self.src, self.dst
 
 
 class Circuit:
     def __init__(self) -> None:
         self.chips: list[Chip] = []
-        self.wires: list[Wire] = []
+        self.wires: list[Wire] = []  # creation order: a wire always comes after the wires it attaches to
         self._next_uid = 1
+        self._next_wire_uid = 1
+        # Nets are derived from the wiring and cached until the wiring changes.
+        self._nets_dirty = True
+        self._nets: list[tuple[list[Pin], list[Pin]]] = []  # (drivers, readers) per net
+        self._net_of_wire: dict[Wire, int] = {}
+        self.net_value: list[bool] = []
+        self.net_conflict: list[bool] = []
 
     # ---- editing -------------------------------------------------------
 
@@ -90,41 +115,128 @@ class Circuit:
         return chip
 
     def remove_chip(self, chip: Chip) -> list[Wire]:
-        """Removes the chip and every wire touching it. Returns removed wires."""
-        pins = set(map(id, chip.pins))
-        dead = [w for w in self.wires if id(w.src) in pins or id(w.dst) in pins]
-        for w in dead:
-            self.remove_wire(w)
+        """Removes the chip, every wire touching it, and every wire hanging off
+        those. Returns all removed wires."""
+        removed: list[Wire] = []
+        for w in [w for w in self.wires if any(isinstance(e, Pin) and e.chip is chip for e in w.ends)]:
+            if w in self.wires:  # may already be gone as a branch of an earlier one
+                removed += self.remove_wire(w)
         self.chips.remove(chip)
-        return dead
+        self._nets_dirty = True
+        return removed
 
-    def connect(self, a: Pin, b: Pin) -> tuple[Wire | None, Wire | None]:
-        """Connect two pins in either order. Returns (new_wire, replaced_wire).
+    def can_connect(self, a: Endpoint, b: Endpoint) -> bool:
+        if a is b:
+            return False
+        if isinstance(a, Pin) and isinstance(b, Pin):
+            return a.is_input != b.is_input and a.chip is not b.chip
+        if isinstance(b, Pin):
+            a, b = b, a
+        if isinstance(a, Pin):  # pin + wire
+            if a in b.ends:
+                return False  # already attached right there
+            if a.is_input:
+                # Wiring into an input replaces its current wire (and that wire's
+                # branches). Attaching to one of those would saw off our own branch.
+                doomed = set()
+                for w in self.wires_at(a):
+                    doomed |= {w, *self.descendants(w)}
+                return b not in doomed
+        return True  # wire + wire: joins two nets
 
-        new_wire is None if the connection is invalid (in->in, out->out,
-        same chip). An input pin can only have one driver, so wiring into an
-        already-driven input replaces the old wire.
+    def connect(self, a: Endpoint, b: Endpoint, uid: int | None = None) -> tuple[Wire | None, list[Wire]]:
+        """Connect two endpoints in either order. Returns (new_wire, replaced_wires).
+
+        new_wire is None if the connection is invalid (see can_connect). An input
+        pin takes one wire, so wiring into an already-wired input replaces the old
+        wire, along with any branches hanging off it.
         """
-        if a.is_input == b.is_input or a.chip is b.chip:
-            return None, None
-        src, dst = (b, a) if a.is_input else (a, b)
-        replaced = self.wire_into(dst)
-        if replaced is not None:
-            self.remove_wire(replaced)
-        wire = Wire(src, dst)
+        if not self.can_connect(a, b):
+            return None, []
+        # outputs are src, inputs are dst (see Wire)
+        if (isinstance(b, Pin) and not b.is_input) or (isinstance(a, Pin) and a.is_input):
+            a, b = b, a
+        replaced: list[Wire] = []
+        for end in (a, b):
+            if isinstance(end, Pin) and end.is_input:
+                for old in self.wires_at(end):
+                    replaced += self.remove_wire(old)
+        if uid is None:
+            uid = self._next_wire_uid
+        self._next_wire_uid = max(self._next_wire_uid, uid + 1)
+        wire = Wire(a, b, uid)
         self.wires.append(wire)
+        self._nets_dirty = True
         return wire, replaced
 
-    def remove_wire(self, wire: Wire) -> None:
-        self.wires.remove(wire)
-        wire.dst.state = False
+    def remove_wire(self, wire: Wire) -> list[Wire]:
+        """Removes the wire and everything attached to it. Returns them, parents first."""
+        removed = [wire, *self.descendants(wire)]
+        dead = set(removed)
+        self.wires = [w for w in self.wires if w not in dead]
+        self._nets_dirty = True
+        return removed
 
-    def wire_into(self, pin: Pin) -> Wire | None:
-        return next((w for w in self.wires if w.dst is pin), None)
+    def wires_at(self, pin: Pin) -> list[Wire]:
+        return [w for w in self.wires if pin in w.ends]
+
+    def descendants(self, wire: Wire) -> list[Wire]:
+        """Wires attached to `wire`, wires attached to those, and so on (in creation order)."""
+        found = {wire}
+        for w in self.wires:  # creation order means parents are seen before children
+            if w.src in found or w.dst in found:
+                found.add(w)
+        found.discard(wire)
+        return [w for w in self.wires if w in found]
+
+    # ---- nets -------------------------------------------------------------
+
+    def _rebuild_nets(self) -> None:
+        """Group pins and wires into nets (union-find over identities)."""
+        parent: dict[int, int] = {}
+
+        def find(x: int) -> int:
+            while parent.setdefault(x, x) != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for w in self.wires:
+            for end in w.ends:
+                parent[find(id(end))] = find(id(w))
+
+        index: dict[int, int] = {}
+        self._nets = []
+        for w in self.wires:
+            root = find(id(w))
+            if root not in index:
+                index[root] = len(self._nets)
+                self._nets.append(([], []))
+        self._net_of_wire = {w: index[find(id(w))] for w in self.wires}
+        for chip in self.chips:
+            for pin in chip.pins:
+                if id(pin) in parent:
+                    drivers, readers = self._nets[index[find(id(pin))]]
+                    (readers if pin.is_input else drivers).append(pin)
+                elif pin.is_input:
+                    pin.state = False  # unconnected input reads 0
+        self.net_value = [False] * len(self._nets)
+        self.net_conflict = [False] * len(self._nets)
+        self._nets_dirty = False
+
+    def wire_state(self, wire: Wire) -> tuple[bool, bool]:
+        """(value, conflict) of the net this wire belongs to, as of the last step."""
+        if self._nets_dirty:
+            self._rebuild_nets()
+        i = self._net_of_wire[wire]
+        return self.net_value[i], self.net_conflict[i]
 
     # ---- simulation ----------------------------------------------------
 
     def step(self) -> None:
+        if self._nets_dirty:
+            self._rebuild_nets()
+
         # Phase 1: every chip computes outputs from current inputs.
         # Compute all first, then write, so evaluation order doesn't matter.
         results: list[tuple[Chip, list[bool]]] = []
@@ -136,6 +248,16 @@ class Circuit:
             for pin, value in zip(chip.outputs, outs):
                 pin.state = value
 
-        # Phase 2: wires carry output states onto input pins.
-        for w in self.wires:
-            w.dst.state = w.src.state
+        # Phase 2: every net resolves its drivers and hands the value to its readers.
+        for i, (drivers, readers) in enumerate(self._nets):
+            if not drivers:
+                value, conflict = False, False  # floating (future: Z)
+            else:
+                value = drivers[0].state
+                conflict = any(d.state != value for d in drivers[1:])
+                if conflict:
+                    value = False  # placeholder until 4-state logic: X reads as 0
+            self.net_value[i] = value
+            self.net_conflict[i] = conflict
+            for pin in readers:
+                pin.state = value
