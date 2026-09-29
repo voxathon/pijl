@@ -12,7 +12,7 @@ it attaches to, so iterating wires by uid always visits parents first.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 MACRO = "macro:"  # kind prefix of a placed macro ("macro:half adder"); part type kinds can't contain ':'
@@ -30,6 +30,7 @@ WireData = tuple[EndRef, EndRef, tuple[Point, ...], Point | None, Point | None]
 class Snapshot:
     parts: dict[int, PartData]
     wires: dict[int, WireData]
+    wire_colors: dict[int, str] = field(default_factory=dict)  # wire uid -> color name; absent = default
 
 
 EMPTY = Snapshot({}, {})

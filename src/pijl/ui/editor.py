@@ -39,9 +39,12 @@ Controls
     Delete (wires)         cuts the wire like Digital Logic Sim: from the nearest junction
                            before the spot you clicked, onward. See cut_wire.
     Label...               type in place; Enter commits, Esc reverts, clicking elsewhere commits
+    Recolor (wires)        a submenu of 8 colors; new branches take their wire's color
     Edit (wires)           hold+drag square handles to move bends, "+" handles or the wire
-                           itself to add one; right-click a square to remove it. Enter or a
-                           click elsewhere finishes, Esc reverts. See wire_edit.py.
+                           itself to add one; right-click a square to remove it. Round handles
+                           are junctions (its own ends and branches off it): drag to slide
+                           them along their wire (Alt: grab a junction hidden under a bend).
+                           Enter or a click elsewhere finishes, Esc reverts. See wire_edit.py.
   Ctrl+C / Ctrl+X         copy / cut the selected parts (+ wires running between them)
   Ctrl+V                   paste: the copy follows the cursor like a new part; click to place
                            (shift+click: place and keep another copy), Esc/right-click cancels
@@ -50,7 +53,7 @@ Controls
   Ctrl+O                   open a macro: type to filter, arrows + Enter (or click); saved macros
                            are also in the picker's MACROS section: right-click -> Open
   Ctrl+N                   new, empty board
-  Tab                      pin names on placed macros: hidden -> on hover -> always -> hidden
+  Tab                      pin names on placed parts: hidden -> on hover -> always -> hidden
                            (opening, new and closing the window ask first if there are unsaved changes)
   Ctrl+Z / Ctrl+Y          undo / redo (also Ctrl+Shift+Z). During an action, Ctrl+Z cancels it.
                            Every finished edit is recorded automatically; see document.py.
@@ -250,7 +253,8 @@ class Editor(pyglet.window.Window):
         view.delete()
 
     def connect(self, a: Pin | Wire, b: Pin | Wire, bends: list[Point] = (),
-                a_pos: Point | None = None, b_pos: Point | None = None, uid: int | None = None) -> Wire | None:
+                a_pos: Point | None = None, b_pos: Point | None = None, uid: int | None = None,
+                color: str | None = None) -> Wire | None:
         """Connect two endpoints (pins or wires); `bends` are ordered from a to b.
         `a_pos` / `b_pos` say where on a wire endpoint the junction sits."""
         wire, replaced = self.circuit.connect(a, b, uid)
@@ -261,7 +265,7 @@ class Editor(pyglet.window.Window):
                 bends, a_pos, b_pos = list(reversed(bends)), b_pos, a_pos
             src = self.pin_pos(wire.src) if isinstance(wire.src, Pin) else a_pos
             dst = self.pin_pos(wire.dst) if isinstance(wire.dst, Pin) else b_pos
-            self.wire_views[wire] = WireView(wire, src, list(bends), dst, self.world, self.layers)
+            self.wire_views[wire] = WireView(wire, src, list(bends), dst, self.world, self.layers, color)
         return wire
 
     def remove_wire(self, view: WireView) -> None:
@@ -306,12 +310,13 @@ class Editor(pyglet.window.Window):
         sv = self.wire_views[splice]
         tail, far_pos = (sv.bends, sv.dst) if splice.src is w else (list(reversed(sv.bends)), sv.src)
         bends = [*points_before(pts, s_j)[1:], j, *tail]
-        src_pos = view.src
+        src_pos, color = view.src, view.color
 
         self.circuit.merge(w, splice)  # w keeps its identity (uid); splice's branches move to w
         for gone in (w, splice):
             self._drop_wire_view(gone)
-        self.wire_views[w] = WireView(w, src_pos, bends, self.end_pos(w.dst, far_pos), self.world, self.layers)
+        self.wire_views[w] = WireView(w, src_pos, bends, self.end_pos(w.dst, far_pos), self.world, self.layers,
+                                      color)
         self.refresh_wires([self.wire_views[w]])
 
     def _attach_point(self, x: Wire, parent: Wire) -> Point:
@@ -429,10 +434,13 @@ class Editor(pyglet.window.Window):
 
         if self.mode is Mode.MENU:
             item = self.menu.item_at(x, y)
+            if button == mouse.LEFT and item is not None and item.submenu:
+                self.menu.hover(x, y)  # opens on hover already; a click just makes sure
+                return
             inside = self.menu.contains(x, y)
             self._close_menu()
             if button == mouse.LEFT and item is not None:
-                self.menu.activate_last(item)  # may start another mode (e.g. label editing)
+                item.action()  # after closing: may start another mode (e.g. label editing)
                 return
             if button == mouse.MIDDLE:
                 self.panning = True
@@ -490,8 +498,11 @@ class Editor(pyglet.window.Window):
                     self._cancel()
                 elif self.can_wire_to(end):
                     start_pos = None if isinstance(self.wire_start, Pin) else self.wire_start_pos
+                    # a branch takes the color of the wire it comes off (or joins)
+                    color = next((self.wire_views[e].color for e in (self.wire_start, end)
+                                  if isinstance(e, Wire) and self.wire_views[e].color), None)
                     self.connect(self.wire_start, end, self.wire_bends, start_pos,
-                                 None if isinstance(end, Pin) else end_pos)
+                                 None if isinstance(end, Pin) else end_pos, color=color)
                     self._cancel()              # clears the preview; the wire now exists
                 elif end is None:
                     self.wire_bends.append(self.snapped(wx, wy))
@@ -552,6 +563,7 @@ class Editor(pyglet.window.Window):
                 at = project_onto(wire.points, (wx, wy))
                 self._open_menu(x, y, [MenuItem("Edit", lambda: self._start_wire_edit(wire)),
                                        MenuItem("Branch", lambda: self._start_wiring(wire.wire, at)),
+                                       MenuItem("Recolor", submenu=self._recolor_items(wire)),
                                        MenuItem("Delete", lambda: self.cut_wire(wire, at), danger=True)])
             else:
                 self.panning = True
@@ -596,7 +608,7 @@ class Editor(pyglet.window.Window):
         self.picker.set_hover(self.picker.hit(x, y) if hover_ok else None)
         if self.mode is Mode.MENU:
             self.menu.hover(x, y)
-        elif self.mode is Mode.EDITING_WIRE and self.wire_edit.set_hover(self.wire_edit.target_at(x, y)):
+        elif self.mode is Mode.EDITING_WIRE and self.wire_edit.set_hover(self._wire_edit_target(x, y)):
             hand = self.get_system_mouse_cursor(self.CURSOR_HAND)
             self.set_mouse_cursor(hand if self.wire_edit.hover else None)
         self._follow_cursor()
@@ -759,6 +771,11 @@ class Editor(pyglet.window.Window):
         self.menu.hover(x, y)
         self.mode = Mode.MENU
 
+    def _recolor_items(self, view: WireView) -> list[MenuItem]:
+        return [MenuItem((name or "default").capitalize(), lambda c=name: view.set_color(c),
+                         swatch=on, checked=view.color == name)
+                for name, (_, on) in T.WIRE_COLORS.items()]
+
     def _close_menu(self) -> None:
         self.menu.close()
         self.mode = Mode.IDLE
@@ -766,24 +783,33 @@ class Editor(pyglet.window.Window):
     def _start_wire_edit(self, view: WireView) -> None:
         self.selection.discard(view)  # one glow at a time
         self.mode = Mode.EDITING_WIRE
-        self.wire_edit = WireEditSession(view, self.camera, self.world, self.layers)
-        self.wire_edit.set_hover(self.wire_edit.target_at(*self.mouse))
+        parents = {end: self.wire_views[e] for end, e in zip(("src", "dst"), view.wire.ends)
+                   if isinstance(e, Wire)}
+        branches = [(self.wire_views[w], end) for w in self.circuit.wires
+                    for end, e in zip(("src", "dst"), w.ends) if e is view.wire]
+        self.wire_edit = WireEditSession(view, self.camera, self.world, self.layers, parents, branches)
+        self.wire_edit.set_hover(self._wire_edit_target(*self.mouse))
+
+    def _wire_edit_target(self, x: float, y: float):
+        return self.wire_edit.target_at(x, y, prefer_junction=self.keys[key.LALT] or self.keys[key.RALT])
 
     def _wire_edit_press(self, x: float, y: float, wx: float, wy: float, button: int) -> None:
         s = self.wire_edit
-        target = s.target_at(x, y)
+        target = self._wire_edit_target(x, y)
         if button == mouse.LEFT:
-            if target and target[0] == "bend":
-                s.begin_drag(target[1], wx, wy)
+            if target and target[0] in ("bend", "junction"):
+                s.begin_drag(target, wx, wy)
             elif target:  # "+" handle: new bend at the midpoint
-                s.begin_drag(s.insert(target[1], s.add_handle_pos(target[1])), wx, wy)
+                s.begin_drag(("bend", s.insert(target[1], s.add_handle_pos(target[1]))), wx, wy)
             elif hit := s.segment_at(wx, wy):  # on the wire itself: split right there
-                s.begin_drag(s.insert(*hit), wx, wy)
+                s.begin_drag(("bend", s.insert(*hit)), wx, wy)
             else:
                 self._finish_wire_edit(commit=True)  # click elsewhere finishes
         elif button == mouse.RIGHT:
             if target and target[0] == "bend":
                 s.remove(target[1])
+            elif target and target[0] == "junction":
+                pass  # nothing to remove; don't end the edit over a near miss
             else:
                 self._finish_wire_edit(commit=True)
 

@@ -26,6 +26,27 @@ WIRE_CONFLICT = (240, 175, 40)  # net driven to different values at once (future
 WIRE_PREVIEW = (200, 200, 210, 160)
 WIRE_PREVIEW_SNAP = (120, 220, 140, 220)
 
+
+def _dim(on: tuple[int, int, int]) -> tuple[int, int, int]:
+    """A colored wire when off: WIRE_OFF with a hint of its color, so it's still recognizable."""
+    return tuple(round(0.65 * g + 0.35 * c) for g, c in zip(WIRE_OFF, on))
+
+
+# Wire colors (Recolor menu): name -> (off, on). Names are what save files store; None
+# (no color set) is the default look. A conflict still shows WIRE_CONFLICT whatever the color.
+WIRE_COLORS: dict[str | None, tuple[tuple[int, int, int], tuple[int, int, int]]] = {
+    None: (WIRE_OFF, WIRE_ON),
+    **{name: (_dim(on), on) for name, on in (
+        ("orange", (245, 130, 40)),
+        ("yellow", (235, 225, 70)),
+        ("green", (80, 210, 100)),
+        ("cyan", (60, 210, 225)),
+        ("blue", (70, 130, 245)),
+        ("purple", (170, 100, 240)),
+        ("pink", (240, 110, 190)),
+    )},
+}
+
 PICKER_BG = (34, 34, 41)
 PICKER_HEADER = (40, 40, 48)  # the panel's title bar, and its collapsed strip's button
 PICKER_SECTION = (38, 38, 46)  # collection rows
@@ -54,6 +75,7 @@ HANDLE_BORDER = (20, 20, 26)
 HANDLE_HOVER = (120, 220, 140)  # same green as a valid wire target
 ADD_HANDLE_FILL = (28, 28, 34)  # hollow look: background-colored center
 ADD_HANDLE_BORDER = (200, 200, 215)
+JUNCTION_HANDLE_FILL = (120, 170, 255)  # junctions: slide along the wire they sit on
 GHOST_OPACITY = 150
 
 # Grid: (minor line, major line) colors. Brighter while Ctrl-snapping.

@@ -35,13 +35,15 @@ def capture(editor: Editor, views: Iterable[PartView] | None = None) -> Snapshot
     uids = {v.part.uid for v in views}
     parts = {v.part.uid: (v.part.kind, v.part.label, v.x, v.y, copy.deepcopy(v.part.props)) for v in views}
     inside = internal_wires(editor, uids)
-    wires = {}
+    wires, colors = {}, {}
     for view in inside:
         w = view.wire
         wires[w.uid] = (_ref(w.src), _ref(w.dst), tuple(view.bends),
                         None if isinstance(w.src, Pin) else view.src,
                         None if isinstance(w.dst, Pin) else view.dst)
-    return Snapshot(parts, wires)
+        if view.color:
+            colors[w.uid] = view.color
+    return Snapshot(parts, wires, colors)
 
 
 def internal_wires(editor: Editor, part_uids: set[int]) -> list[WireView]:
@@ -95,10 +97,13 @@ def restore(editor: Editor, target: Snapshot) -> None:
         if wire is None:
             src = _resolve(src_ref, by_uid, wire_by_uid)
             dst = _resolve(dst_ref, by_uid, wire_by_uid)
-            wire = editor.connect(src, dst, list(bends), src_pt, dst_pt, uid=uid)
+            wire = editor.connect(src, dst, list(bends), src_pt, dst_pt, uid=uid,
+                                  color=target.wire_colors.get(uid))
             wire_by_uid[uid] = wire
             continue
         view = editor.wire_views[wire]
+        if view.color != target.wire_colors.get(uid):
+            view.set_color(target.wire_colors.get(uid))
         if tuple(view.bends) != bends or (src_pt and view.src != src_pt) or (dst_pt and view.dst != dst_pt):
             view.src, view.dst = src_pt or view.src, dst_pt or view.dst
             view.set_bends(list(bends))
@@ -125,7 +130,7 @@ def instantiate(editor: Editor, clip: Snapshot, live: bool = True) -> tuple[list
         src_ref, dst_ref, bends, src_pt, dst_pt = clip.wires[uid]
         src = _resolve(src_ref, new, new_wires)
         dst = _resolve(dst_ref, new, new_wires)
-        new_wires[uid] = editor.connect(src, dst, list(bends), src_pt, dst_pt)
+        new_wires[uid] = editor.connect(src, dst, list(bends), src_pt, dst_pt, color=clip.wire_colors.get(uid))
     return list(new.values()), [editor.wire_views[w] for w in new_wires.values()]
 
 

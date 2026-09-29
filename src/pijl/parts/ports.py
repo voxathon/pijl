@@ -15,7 +15,8 @@ class Switch(PartType):
     outs = ("out",)
     port = "in"
     category = "I/O"
-    look = Look(narrow=True, label="left", lit=("SWITCH_OFF", "SWITCH_ON"), swatch="SWITCH_ON")
+    look = Look(narrow=True, label="left", lit=("SWITCH_OFF", "SWITCH_ON"), swatch="SWITCH_ON",
+                pin_labels=False)  # one pin: a tag would only say "out"
 
     def click(self, part) -> None:
         # No eval: the output keeps whatever the user last set it to.
@@ -28,7 +29,7 @@ class Led(PartType):
     ins = ("in",)
     port = "out"
     category = "I/O"
-    look = Look(narrow=True, label="right", lit=("LED_OFF", "LED_ON"), swatch="LED_ON")
+    look = Look(narrow=True, label="right", lit=("LED_OFF", "LED_ON"), swatch="LED_ON", pin_labels=False)
 
 
 PORTS: tuple[PartType, ...] = (Switch(), Led())

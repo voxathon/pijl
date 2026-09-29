@@ -49,6 +49,13 @@ def test_props_roundtrip():
     assert roundtrip(snap) == snap
 
 
+def test_wire_colors_roundtrip():
+    b = board()
+    snap = Snapshot(b.parts, b.wires, {1: "blue", 4: "blue", 3: "pink"})
+    assert roundtrip(snap) == snap
+    assert '"color"' not in dumps(encode(board()))  # default color: not written at all
+
+
 def test_text_is_stable_and_one_line_per_item():
     text = dumps(encode(board()))
     assert text == dumps(encode(roundtrip(board())))

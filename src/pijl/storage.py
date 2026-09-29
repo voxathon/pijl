@@ -20,7 +20,8 @@ nicely in git:
 
   - "kind" names a part type (pijl.parts); a placed macro has "macro": its name
     instead, so the two can never collide.
-  - "label", "props" and "bends" are left out when empty.
+  - "label", "props", "bends" and a wire's "color" (a name, see ui/theme.py
+    WIRE_COLORS) are left out when empty / default.
   - A wire end is a pin ({"part", "in"/"out": index}), a macro's pin
     ({"part", "pin": uid of the IN/OUT inside the macro that it comes from}, so
     it survives the macro's ports being moved around), or a point along another
@@ -109,6 +110,8 @@ def encode(snap: Snapshot, types: Registry | None = None) -> dict[str, Any]:
              "to": _encode_end(dst, dst_pt, snap, types)}
         if bends:
             d["bends"] = [_point(p) for p in bends]
+        if uid in snap.wire_colors:
+            d["color"] = snap.wire_colors[uid]
         wires.append(d)
     return {"pijl": FORMAT, "parts": parts, "wires": wires}
 
@@ -171,7 +174,12 @@ def decode(data: Any, types: Registry) -> Loaded:
                 raise ValueError("a second wire into an input pin")
             wired_inputs |= inputs
             bends = tuple(_pair(p) for p in d.get("bends", ()))
+            color = d.get("color")
+            if color is not None and not isinstance(color, str):
+                raise ValueError("bad color")
             out.snapshot.wires[uid] = (src, dst, bends, src_pt, dst_pt)
+            if color:
+                out.snapshot.wire_colors[uid] = color  # names the UI doesn't know draw as default
         except (KeyError, TypeError, ValueError) as e:
             warn(f"a wire was unreadable ({_why(e)}), dropped")
     if lost:

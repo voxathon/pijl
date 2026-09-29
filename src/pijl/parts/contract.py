@@ -52,7 +52,7 @@ class Look:
     lit: tuple[str, str] | None = None  # body (off, on) colors, following the part's first pin
     swatch: str = "PART_BODY"           # its color in the part picker
     body: str = "PART_BODY"             # body (fill, border) colors, unless `lit` says otherwise
-    pin_labels: bool = False            # show pin names inside the body (Tab toggles them)
+    pin_labels: bool = True             # name tags next to the pins (Tab picks hidden / hover / always)
 
 
 class PartType:

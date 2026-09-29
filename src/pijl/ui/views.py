@@ -365,10 +365,11 @@ class WireView:
     """
 
     def __init__(self, wire: Wire, src: Point, bends: list[Point], dst: Point,
-                 batch: pyglet.graphics.Batch, layers: Layers) -> None:
+                 batch: pyglet.graphics.Batch, layers: Layers, color: str | None = None) -> None:
         self.wire = wire
         self.src, self.dst = src, dst
         self.bends = list(bends)
+        self.color = color  # a T.WIRE_COLORS name; None = the default look
         self.batch, self.layers = batch, layers
         self.line = Polyline(self.points, T.WIRE_OFF, batch, layers.wires)
         self.highlight: Polyline | None = None  # selection glow, only while selected
@@ -429,10 +430,16 @@ class WireView:
             return
         self._last_state = state
         on, conflict = state
-        color = T.WIRE_CONFLICT if conflict else T.WIRE_ON if on else T.WIRE_OFF
+        off_color, on_color = T.WIRE_COLORS.get(self.color, T.WIRE_COLORS[None])  # unknown name: default
+        color = T.WIRE_CONFLICT if conflict else on_color if on else off_color
         self.line.color = color
         for dot in self.dots.values():
             dot.color = color
+
+    def set_color(self, color: str | None) -> None:
+        self.color = color
+        state, self._last_state = self._last_state, None
+        self.sync(state or (False, False))
 
     def distance_to(self, wx: float, wy: float) -> float:
         return self.line.distance_to(wx, wy)
