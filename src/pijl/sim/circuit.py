@@ -48,6 +48,10 @@ class Chip:
     # User-given name. Lives in the model (not the UI) because it's circuit data:
     # when a board is packaged into a custom chip, IN/OUT labels become its pin names.
     label: str = ""
+    # Stable identity within a circuit. Survives undo/redo (a chip deleted and
+    # restored comes back with the same uid) and is what snapshots/save files use
+    # to refer to chips, since Python object identity doesn't survive either.
+    uid: int = 0
 
     @property
     def pins(self) -> list[Pin]:
@@ -69,12 +73,17 @@ class Circuit:
     def __init__(self) -> None:
         self.chips: list[Chip] = []
         self.wires: list[Wire] = []
+        self._next_uid = 1
 
     # ---- editing -------------------------------------------------------
 
-    def add_chip(self, kind: str) -> Chip:
+    def add_chip(self, kind: str, uid: int | None = None) -> Chip:
+        """`uid` recreates a specific chip (undo, loading); normally leave it None."""
         n_in, n_out, _ = BUILTINS[kind]
-        chip = Chip(kind)
+        if uid is None:
+            uid = self._next_uid
+        self._next_uid = max(self._next_uid, uid + 1)
+        chip = Chip(kind, uid=uid)
         chip.inputs = [Pin(chip, i, True) for i in range(n_in)]
         chip.outputs = [Pin(chip, i, False) for i in range(n_out)]
         self.chips.append(chip)

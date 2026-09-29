@@ -25,6 +25,11 @@ Controls
     Edit (wires)           hold+drag square handles to move bends, "+" handles or the wire
                            itself to add one; right-click a square to remove it. Enter or a
                            click elsewhere finishes, Esc reverts. See wire_edit.py.
+  Ctrl+C / Ctrl+X         copy / cut the selected chips (+ wires running between them)
+  Ctrl+V                   paste: the copy follows the cursor like a new part; click to place
+                           (shift+click: place and keep another copy), Esc/right-click cancels
+  Ctrl+Z / Ctrl+Y          undo / redo (also Ctrl+Shift+Z). During an action, Ctrl+Z cancels it.
+                           Every finished edit is recorded automatically; see document.py.
   right-drag empty space   pan (middle-drag pans in any mode)
   hold Ctrl                snap chips and wire bends to the grid
   scroll                   zoom
@@ -43,6 +48,7 @@ from pyglet.window import key, mouse
 from ..sim import Chip, Circuit, Pin, Wire
 from . import theme as T
 from .camera import Camera
+from .document import History, Snapshot, capture, instantiate, restore
 from .grid import Grid
 from .menu import ContextMenu, MenuItem
 from .sdf_text import SDFText
@@ -80,6 +86,7 @@ def _make_config() -> pyglet.gl.Config | None:
 
 class Editor(pyglet.window.Window):
     def __init__(self) -> None:
+        self.history: History | None = None  # set up after the demo; checked by dispatch_event
         super().__init__(1280, 720, caption="pijl", resizable=True, vsync=True, config=_make_config())
         self.circuit = Circuit()
         self.camera = Camera()
@@ -94,8 +101,8 @@ class Editor(pyglet.window.Window):
         self.toolbar = Toolbar(PALETTE, self.hud)
         self.menu = ContextMenu(self.hud)
         self.help = pyglet.text.Label(
-            "click part: pick up/place | click pin: wire | click: select | drag empty: box select | "
-            "Del: delete | right-click: menu | middle/right-drag: pan | scroll: zoom | hold Ctrl: snap",
+            "click pin: wire | click: select | drag empty: box select | Del: delete | Ctrl+C/X/V | "
+            "Ctrl+Z/Y | right-click: menu | middle-drag: pan | scroll: zoom | hold Ctrl: snap",
             font_name="Consolas", font_size=10, color=T.HELP_TEXT,
             x=8, y=self.height - 8, anchor_y="top", batch=self.hud)
 
@@ -106,7 +113,7 @@ class Editor(pyglet.window.Window):
         self.mode = Mode.IDLE
         self.panning = False                 # orthogonal to mode: you can pan while carrying things
         self.mouse = (0, 0)                  # last known cursor position, screen space
-        self.active: ChipView | None = None  # chip being pressed / dragged / placed
+        self.active: ChipView | None = None  # chip being pressed / dragged
         self.grab = (0.0, 0.0)               # chip origin minus cursor, world units
         self.press_at = (0, 0)               # screen pos of the press on a chip
         self.wire_start: Pin | None = None
@@ -118,6 +125,11 @@ class Editor(pyglet.window.Window):
         self.edit_caret = 0                  # insertion index into edit_text
         self.caret: shapes.Rectangle | None = None
         self.wire_edit: WireEditSession | None = None
+        # placing (new part or paste): ghosts that follow the cursor until a click
+        self.placing_views: list[ChipView] = []
+        self.placing_wires: list[WireView] = []
+        self.place_again = None               # shift+click: start another of the same
+        self.clipboard: Snapshot | None = None
         # selection
         self.selection = Selection()
         self.drag_group: list[tuple[ChipView, float, float]] = []  # chips moving + their start origins
@@ -129,6 +141,7 @@ class Editor(pyglet.window.Window):
         self.hud_box_group = pyglet.graphics.Group(order=8)  # above toolbar, below menus
 
         self._build_demo()
+        self.history = History(capture(self))
         self.camera.center_on(*HOME, self.width, self.height)
         pyglet.clock.schedule_interval(self.update, 1 / 60)
 
@@ -136,8 +149,8 @@ class Editor(pyglet.window.Window):
     # model + view bookkeeping
     # ======================================================================
 
-    def add_chip(self, kind: str, x: float, y: float) -> ChipView:
-        chip = self.circuit.add_chip(kind)
+    def add_chip(self, kind: str, x: float, y: float, uid: int | None = None) -> ChipView:
+        chip = self.circuit.add_chip(kind, uid)
         view = ChipView(chip, x, y, self.world, self.layers, self.text)
         self.chip_views[chip] = view
         return view
@@ -207,8 +220,8 @@ class Editor(pyglet.window.Window):
 
     def pin_at(self, wx: float, wy: float) -> Pin | None:
         for view in reversed(self.chip_views.values()):
-            if view is self.active and self.mode is Mode.PLACING_CHIP:
-                continue  # the chip on the cursor isn't a target
+            if self.mode is Mode.PLACING_CHIP and view in self.placing_views:
+                continue  # chips on the cursor aren't targets
             if pin := view.pin_at(wx, wy, self.slop):
                 return pin
         return None
@@ -264,12 +277,7 @@ class Editor(pyglet.window.Window):
                 self._cancel()
                 self._start_placing(tool)       # swap to a different part
             elif button == mouse.LEFT:
-                kind = self.active.chip.kind
-                self.active.set_ghost(False)    # commit
-                self.active = None
-                self.mode = Mode.IDLE
-                if modifiers & key.MOD_SHIFT:
-                    self._start_placing(kind)   # keep placing more of the same
+                self._commit_placing(again=bool(modifiers & key.MOD_SHIFT))
             elif button == mouse.RIGHT:
                 self._cancel()
             return
@@ -410,6 +418,20 @@ class Editor(pyglet.window.Window):
             self.delete_selection()
         elif symbol == key.A and modifiers & key.MOD_CTRL and self.mode is Mode.IDLE:
             self.selection.set(self.chip_views.values(), self.wire_views.values())
+        elif modifiers & key.MOD_CTRL and symbol in (key.Z, key.Y):
+            if self.mode is not Mode.IDLE:
+                self._cancel()  # mid-action: undo means "never mind", not "and the step before"
+            elif symbol == key.Y or modifiers & key.MOD_SHIFT:
+                self._apply(self.history.redo())
+            else:
+                self._apply(self.history.undo())
+        elif modifiers & key.MOD_CTRL and symbol in (key.C, key.X) and self.mode is Mode.IDLE:
+            if self.selection.chips:
+                self.clipboard = capture(self, self.selection.chips)
+                if symbol == key.X:
+                    self.delete_selection()
+        elif modifiers & key.MOD_CTRL and symbol == key.V and self.mode is Mode.IDLE and self.clipboard:
+            self._start_paste()
         elif symbol == key.BACKSPACE and self.mode is Mode.WIRING:
             self._pop_bend_or_cancel()
         elif symbol == key.HOME:
@@ -528,14 +550,52 @@ class Editor(pyglet.window.Window):
         self.mode = Mode.IDLE
 
     def _start_placing(self, kind: str) -> None:
+        self._carry([self.add_chip(kind, 0, 0)], [], again=lambda: self._start_placing(kind))
+
+    def _start_paste(self) -> None:
+        views, wires = instantiate(self, self.clipboard)
+        self._carry(views, wires, again=self._start_paste)
+
+    def _carry(self, views: list[ChipView], wires: list[WireView], again) -> None:
+        """Attach new (ghost) chips + wires to the cursor, centered on it, until a click."""
         self.selection.clear()
-        view = self.add_chip(kind, 0, 0)
-        view.set_ghost(True)
-        self.active = view
-        self.grab = (-view.w / 2, -view.h / 2)  # carry it by its center
-        self.drag_group, self.drag_wires, self.drag_origin = [(view, 0.0, 0.0)], [], (0.0, 0.0)
+        for v in views:
+            v.set_ghost(True)
+        for w in wires:
+            w.set_ghost(True)
+        x0 = min(v.x for v in views)
+        y0 = min(v.y for v in views)
+        x1 = max(v.x + v.w for v in views)
+        y1 = max(v.y + v.h for v in views)
+        # The first chip is the anchor: Ctrl snaps *its* origin, so a pasted layout
+        # that was on the grid lands on the grid again.
+        anchor = views[0]
+        self.grab = (anchor.x - (x0 + x1) / 2, anchor.y - (y0 + y1) / 2)
+        self.drag_group = [(v, v.x, v.y) for v in views]
+        self.drag_wires = [(w, list(w.bends)) for w in wires]
+        self.drag_origin = (anchor.x, anchor.y)
+        self.placing_views, self.placing_wires, self.place_again = views, wires, again
         self.mode = Mode.PLACING_CHIP
         self._follow_cursor()
+
+    def _commit_placing(self, again: bool) -> None:
+        views, wires, place_again = self.placing_views, self.placing_wires, self.place_again
+        for v in views:
+            v.set_ghost(False)
+        for w in wires:
+            w.set_ghost(False)
+        self.placing_views, self.placing_wires, self.place_again = [], [], None
+        self.mode = Mode.IDLE
+        if again:
+            place_again()
+        elif wires or len(views) > 1:
+            self.selection.set(views, wires)  # a paste stays selected, ready to move/delete
+
+    def _apply(self, snap: Snapshot | None) -> None:
+        """Show an undo/redo state."""
+        if snap is not None:
+            self.selection.clear()
+            restore(self, snap)
 
     def _begin_group_drag(self, grabbed: ChipView) -> None:
         """Start moving the selection, or just `grabbed` if it isn't part of it."""
@@ -642,8 +702,10 @@ class Editor(pyglet.window.Window):
             self._finish_wire_edit(commit=False)
         elif self.mode is Mode.BOX_SELECTING:
             self._end_box()
-        if self.mode is Mode.PLACING_CHIP and self.active is not None:
-            self.remove_chip(self.active)
+        if self.mode is Mode.PLACING_CHIP:
+            for view in self.placing_views:
+                self.remove_chip(view)  # takes the ghost wires with it
+            self.placing_views, self.placing_wires, self.place_again = [], [], None
         if self.preview is not None:
             self.preview.delete()
             self.preview = None
@@ -651,6 +713,22 @@ class Editor(pyglet.window.Window):
         self.active = None
         self.wire_start = None
         self.wire_bends = []
+
+    # ======================================================================
+    # history: every finished edit is recorded, automatically
+    # ======================================================================
+
+    _EDIT_EVENTS = frozenset({"on_mouse_press", "on_mouse_release", "on_key_press"})
+
+    def dispatch_event(self, event_type, *args):
+        """After any click/release/key that leaves the editor idle, snapshot the board
+        and record it if it changed. So every action -- including ones added later --
+        is undoable without writing inverse operations, and no-ops (a click on
+        empty space, a switch toggle) don't clutter the history."""
+        result = super().dispatch_event(event_type, *args)
+        if event_type in self._EDIT_EVENTS and self.history is not None and self.mode is Mode.IDLE:
+            self.history.commit(capture(self))
+        return result
 
     # ======================================================================
     # tick + draw

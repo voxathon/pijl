@@ -40,6 +40,7 @@ class Polyline:
                  group: pyglet.graphics.Group, thickness: float = T.WIRE_THICKNESS) -> None:
         self.batch, self.group, self.thickness = batch, group, thickness
         self._color = color
+        self._opacity: int | None = None  # None: whatever alpha the color carries
         self.segments: list[shapes.Line] = []
         self.joints: list[shapes.Circle] = []
         self.points: list[Point] = []
@@ -49,13 +50,13 @@ class Polyline:
         n_seg = max(len(points) - 1, 0)
         n_joint = max(len(points) - 2, 0)
         while len(self.segments) < n_seg:
-            self.segments.append(shapes.Line(0, 0, 0, 0, thickness=self.thickness, color=self._color,
-                                             batch=self.batch, group=self.group))
+            self.segments.append(self._styled(shapes.Line(0, 0, 0, 0, thickness=self.thickness, color=self._color,
+                                                          batch=self.batch, group=self.group)))
         while len(self.segments) > n_seg:
             self.segments.pop().delete()
         while len(self.joints) < n_joint:
-            self.joints.append(shapes.Circle(0, 0, self.thickness / 2, segments=T.JOINT_SEGMENTS,
-                                             color=self._color, batch=self.batch, group=self.group))
+            self.joints.append(self._styled(shapes.Circle(0, 0, self.thickness / 2, segments=T.JOINT_SEGMENTS,
+                                                          color=self._color, batch=self.batch, group=self.group)))
         while len(self.joints) > n_joint:
             self.joints.pop().delete()
 
@@ -77,6 +78,21 @@ class Polyline:
             s.color = value
         for j in self.joints:
             j.color = value
+
+    @property
+    def opacity(self) -> int:
+        return 255 if self._opacity is None else self._opacity
+
+    @opacity.setter
+    def opacity(self, value: int) -> None:
+        self._opacity = value
+        for shape in self.segments + self.joints:
+            shape.opacity = value
+
+    def _styled(self, shape):
+        if self._opacity is not None:
+            shape.opacity = self._opacity  # new segments match existing ones (e.g. ghosts)
+        return shape
 
     def distance_to(self, wx: float, wy: float) -> float:
         return min((_segment_distance(wx, wy, a, b) for a, b in zip(self.points, self.points[1:])),
@@ -324,6 +340,10 @@ class WireView:
         self.line.set_points(self.points)
         if self.highlight is not None:
             self.highlight.set_points(self.points)
+
+    def set_ghost(self, ghost: bool) -> None:
+        """Semi-transparent while being carried around before placement (paste)."""
+        self.line.opacity = T.GHOST_OPACITY if ghost else 255
 
     @property
     def selected(self) -> bool:
