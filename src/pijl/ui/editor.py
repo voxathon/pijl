@@ -64,6 +64,7 @@ from pyglet import shapes
 from pyglet.math import Mat4
 from pyglet.window import key, mouse
 
+from ..project import Project
 from ..sim import Part, Circuit, Pin, Wire
 from . import theme as T
 from .camera import Camera
@@ -113,6 +114,7 @@ class Editor(pyglet.window.Window):
     def __init__(self) -> None:
         self.history: History | None = None  # set up after the demo; checked by dispatch_event
         super().__init__(1280, 720, caption="pijl", resizable=True, vsync=True, config=_make_config())
+        self.project = Project.open()  # where saves go; created on first run (see project.py)
         self.circuit = Circuit()
         self.camera = Camera()
         self.grid = Grid()
