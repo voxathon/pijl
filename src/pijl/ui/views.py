@@ -392,6 +392,31 @@ class WireView:
             dot.delete()
 
 
+def arc_length_at(points: list[Point], p: Point) -> float:
+    """How far along the polyline (from points[0]) the point nearest to `p` is."""
+    best_s, best_d, walked = 0.0, math.inf, 0.0
+    for (x1, y1), (x2, y2) in zip(points, points[1:]):
+        dx, dy = x2 - x1, y2 - y1
+        seg = math.hypot(dx, dy)
+        t = 0.0 if seg == 0 else max(0.0, min(1.0, ((p[0] - x1) * dx + (p[1] - y1) * dy) / (seg * seg)))
+        d = math.hypot(x1 + t * dx - p[0], y1 + t * dy - p[1])
+        if d < best_d:
+            best_s, best_d = walked + t * seg, d
+        walked += seg
+    return best_s
+
+
+def points_before(points: list[Point], s: float) -> list[Point]:
+    """The vertices strictly before arc length `s` (points[0] included)."""
+    kept, walked = [points[0]], 0.0
+    for a, b in zip(points, points[1:]):
+        walked += math.dist(a, b)
+        if walked >= s - 1e-9:
+            break
+        kept.append(b)
+    return kept
+
+
 def project_onto(points: list[Point], p: Point) -> Point:
     """Nearest point to `p` on the polyline. Returns `p` itself (bit for bit) if it
     already lies on the line: junctions get re-projected after every edit, and

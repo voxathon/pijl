@@ -150,6 +150,21 @@ def test_replacing_input_wire_cannot_saw_off_own_branch():
     assert not c.can_connect(n1.inputs[0], trunk)
 
 
+def test_merge_splices_branch_onto_trunk():
+    c = Circuit()
+    a, n1, n2, n3 = c.add_chip("IN"), c.add_chip("NOT"), c.add_chip("NOT"), c.add_chip("NOT")
+    trunk, _ = c.connect(a.outputs[0], n1.inputs[0])
+    branch, _ = c.connect(trunk, n2.inputs[0])
+    twig, _ = c.connect(branch, n3.inputs[0])  # hangs off the branch
+    c.merge(trunk, branch)
+    assert trunk.src is a.outputs[0] and trunk.dst is n2.inputs[0]
+    assert twig.src is trunk and branch not in c.wires
+    assert c.wires == [trunk, twig]  # parents still before children
+    a.outputs[0].state = True
+    settle(c)
+    assert n2.inputs[0].state and n3.inputs[0].state and not n1.inputs[0].state  # n1 was cut off
+
+
 def test_wire_uids_are_stable():
     c = Circuit()
     a, g = c.add_chip("IN"), c.add_chip("NOT")

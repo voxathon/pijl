@@ -177,6 +177,31 @@ class Circuit:
         self._nets_dirty = True
         return removed
 
+    def merge(self, keep: Wire, absorb: Wire) -> None:
+        """Splice `absorb` (a wire attached to `keep`) onto keep's far end.
+
+        keep.dst becomes absorb's other end, everything attached to absorb
+        re-attaches to keep, and absorb disappears. keep's old dst is simply
+        dropped -- the caller cut it off. Used by cut-deletion (see the editor):
+        "delete from the junction onward" turns trunk + branch into one wire.
+
+        Order invariants survive: keep was created before absorb (absorb attaches
+        to it), so everything that now attaches to keep still comes after it.
+        """
+        far = absorb.dst if absorb.src is keep else absorb.src
+        keep.dst = far
+        for w in self.wires:
+            if w.src is absorb:
+                w.src = keep
+            if w.dst is absorb:
+                w.dst = keep
+        self.wires.remove(absorb)
+        self._nets_dirty = True
+
+    def attachments(self, wire: Wire) -> list[Wire]:
+        """Wires with an end on `wire` (branches, stubs, extra drivers)."""
+        return [w for w in self.wires if wire in w.ends]
+
     def wires_at(self, pin: Pin) -> list[Wire]:
         return [w for w in self.wires if pin in w.ends]
 

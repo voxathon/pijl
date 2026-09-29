@@ -11,7 +11,8 @@ because creating pyglet shapes is the slow part (~0.8 ms per chip). A side
 effect: chips that survive an undo keep their switch states.
 
 Wire uids grow in creation order and a wire is always created after the wires
-it attaches to, so iterating wires by uid always visits parents first.
+it attaches to, so iterating wires by uid always visits parents first. (Splicing
+keeps that true: the surviving wire is the older one.)
 """
 
 from __future__ import annotations
@@ -72,8 +73,14 @@ def restore(editor: Editor, target: Snapshot) -> None:
     # 1. chips that shouldn't exist (their wires and branches go with them)
     for uid in by_uid.keys() - target.chips.keys():
         editor.remove_chip(by_uid.pop(uid))
-    # 2. wires that shouldn't exist
-    for view in [v for v in editor.wire_views.values() if v.wire.uid not in target.wires]:
+    # 2. wires that shouldn't exist -- or exist with different endpoints (cut-deletion
+    #    splices a branch onto its trunk, re-pointing the trunk's far end). Those are
+    #    rebuilt in step 4; branches that get removed along with them are too.
+    def stale(view: WireView) -> bool:
+        data = target.wires.get(view.wire.uid)
+        return data is None or (_ref(view.wire.src), _ref(view.wire.dst)) != data[:2]
+
+    for view in [v for v in editor.wire_views.values() if stale(v)]:
         if view.wire in editor.wire_views:  # may be gone already, as a branch of an earlier one
             editor.remove_wire(view)
     # 3. chips: add missing, update moved/relabeled

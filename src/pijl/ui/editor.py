@@ -11,7 +11,8 @@ Controls
     toolbar click          swap to that chip instead
     right-click / Esc      cancel
   click a pin              start a wire; it follows the cursor
-  Alt+click a wire         start a branch from that spot (also: right-click wire -> Branch)
+  press+drag on a wire     start a branch from that spot, like from a pin (a plain click
+                           selects the wire; Alt+click or right-click -> Branch also work)
     click empty space      add a bend point
     click a pin or wire    connect (green preview = valid target); ending on a wire
                            makes a junction. Wires joined this way form one net; if its
@@ -24,6 +25,8 @@ Controls
   click empty space / Esc  clear the selection;  Ctrl+A select all;  Del/Backspace delete it
   drag a chip              move it; dragging a selected chip moves the whole selection
   right-click chip/wire    select just it + context menu (click outside or Esc closes)
+    Delete (wires)         cuts the wire like Digital Logic Sim: from the nearest junction
+                           before the spot you clicked, onward. See cut_wire.
     Label...               type in place; Enter commits, Esc reverts, clicking elsewhere commits
     Edit (wires)           hold+drag square handles to move bends, "+" handles or the wire
                            itself to add one; right-click a square to remove it. Enter or a
@@ -58,7 +61,7 @@ from .menu import ContextMenu, MenuItem
 from .sdf_text import SDFText
 from .selection import Selection
 from .toolbar import Toolbar
-from .views import ChipView, Layers, Point, Polyline, WireView, project_onto
+from .views import ChipView, Layers, Point, Polyline, WireView, arc_length_at, points_before, project_onto
 from .wire_edit import WireEditSession
 
 SIM_STEPS_PER_FRAME = 1
@@ -71,6 +74,7 @@ class Mode(Enum):
     IDLE = auto()
     PRESSING_CHIP = auto()  # mouse down on a chip, not moved yet: could become a click or a drag
     DRAGGING_CHIP = auto()  # moving the selection (or one chip) with the mouse held
+    PRESSING_WIRE = auto()  # mouse down on a wire: a click selects it, a drag starts a branch
     BOX_SELECTING = auto()  # dragging a selection rectangle over empty space
     PLACING_CHIP = auto()   # a new chip follows the cursor until a click places it
     WIRING = auto()         # a wire follows the cursor from its start pin until a click on a pin
@@ -119,7 +123,9 @@ class Editor(pyglet.window.Window):
         self.mouse = (0, 0)                  # last known cursor position, screen space
         self.active: ChipView | None = None  # chip being pressed / dragged
         self.grab = (0.0, 0.0)               # chip origin minus cursor, world units
-        self.press_at = (0, 0)               # screen pos of the press on a chip
+        self.press_at = (0, 0)               # screen pos of the press on a chip / wire
+        self.pressed_wire: WireView | None = None
+        self.press_world: Point = (0.0, 0.0)
         self.wire_start: Pin | Wire | None = None  # where the wire being drawn starts
         self.wire_start_pos: Point = (0.0, 0.0)
         self.wire_bends: list[Point] = []
@@ -190,6 +196,61 @@ class Editor(pyglet.window.Window):
     def remove_wire(self, view: WireView) -> None:
         for wire in self.circuit.remove_wire(view.wire):  # plus its branches
             self._drop_wire_view(wire)
+
+    def cut_wire(self, view: WireView, at: Point) -> None:
+        """Delete a wire the way Digital Logic Sim does, from the spot `at` onward.
+
+        Walk back from `at` toward the wire's source to the nearest junction J
+        (a point where another wire attaches). Everything from J onward goes:
+        the rest of this wire and whatever hangs off that part. What's left
+        before J doesn't dangle -- it's spliced together with the wire attached
+        at J into one wire: source -> ... -> J -> that wire's far end.
+        No junction before `at` means the whole wire (and its branches) goes.
+        """
+        w, pts = view.wire, view.points
+        eps = 1e-6
+        s_cut = arc_length_at(pts, at)
+        attached = [(arc_length_at(pts, self._attach_point(x, w)), x) for x in self.circuit.attachments(w)]
+        before = [s for s, _ in attached if s <= s_cut + eps]
+        if not before:
+            self.remove_wire(view)
+            return
+        s_j = max(before)
+        after = [x for s, x in attached if s > s_j + eps]
+        doomed = set(after)
+        for x in after:
+            doomed.update(self.circuit.descendants(x))
+        # The wire at J to splice on. Its far end must survive the cut, of course.
+        at_j = [x for s, x in attached if abs(s - s_j) <= eps]
+        splice = next((x for x in at_j if self._far_end(x, w) not in doomed), None)
+        if splice is None:
+            self.remove_wire(view)
+            return
+
+        for x in after:
+            if x in self.wire_views:
+                self.remove_wire(self.wire_views[x])
+        # geometry of the merged wire: our points up to J, then the spliced wire's from J outward
+        j = self._attach_point(splice, w)
+        sv = self.wire_views[splice]
+        tail, far_pos = (sv.bends, sv.dst) if splice.src is w else (list(reversed(sv.bends)), sv.src)
+        bends = [*points_before(pts, s_j)[1:], j, *tail]
+        src_pos = view.src
+
+        self.circuit.merge(w, splice)  # w keeps its identity (uid); splice's branches move to w
+        for gone in (w, splice):
+            self._drop_wire_view(gone)
+        self.wire_views[w] = WireView(w, src_pos, bends, self.end_pos(w.dst, far_pos), self.world, self.layers)
+        self.refresh_wires([self.wire_views[w]])
+
+    def _attach_point(self, x: Wire, parent: Wire) -> Point:
+        """Where wire `x` touches `parent`."""
+        xv = self.wire_views[x]
+        return xv.src if x.src is parent else xv.dst
+
+    @staticmethod
+    def _far_end(x: Wire, parent: Wire):
+        return x.dst if x.src is parent else x.src
 
     def delete_selection(self) -> None:
         for view in list(self.selection.wires):
@@ -344,7 +405,7 @@ class Editor(pyglet.window.Window):
                 self._pop_bend_or_cancel()
             return
 
-        if self.mode in (Mode.PRESSING_CHIP, Mode.DRAGGING_CHIP, Mode.BOX_SELECTING):
+        if self.mode in (Mode.PRESSING_CHIP, Mode.DRAGGING_CHIP, Mode.BOX_SELECTING, Mode.PRESSING_WIRE):
             return  # another button while the left one is held down: ignore (middle already panned)
 
         # IDLE
@@ -367,7 +428,8 @@ class Editor(pyglet.window.Window):
                 if modifiers & key.MOD_SHIFT:
                     self.selection.toggle(wire)
                 else:
-                    self.selection.set(wires=[wire])
+                    self.pressed_wire, self.press_world, self.press_at = wire, (wx, wy), (x, y)
+                    self.mode = Mode.PRESSING_WIRE
             else:
                 shift = modifiers & key.MOD_SHIFT
                 self.box_base = (set(self.selection.chips), set(self.selection.wires)) if shift else (set(), set())
@@ -389,7 +451,7 @@ class Editor(pyglet.window.Window):
                 at = project_onto(wire.points, (wx, wy))
                 self._open_menu(x, y, [MenuItem("Edit", lambda: self._start_wire_edit(wire)),
                                        MenuItem("Branch", lambda: self._start_wiring(wire.wire, at)),
-                                       MenuItem("Delete", lambda: self.remove_wire(wire), danger=True)])
+                                       MenuItem("Delete", lambda: self.cut_wire(wire, at), danger=True)])
             else:
                 self.panning = True
 
@@ -401,6 +463,13 @@ class Editor(pyglet.window.Window):
             px, py = self.press_at
             if abs(x - px) + abs(y - py) >= T.DRAG_THRESHOLD_PX:
                 self._begin_group_drag(self.active)
+        elif self.mode is Mode.PRESSING_WIRE:
+            px, py = self.press_at
+            if abs(x - px) + abs(y - py) >= T.DRAG_THRESHOLD_PX:
+                # Branch from where the press happened, not where the drag got to.
+                view = self.pressed_wire
+                self.pressed_wire = None
+                self._start_wiring(view.wire, project_onto(view.points, self.snapped(*self.press_world)))
         self._follow_cursor()
 
     def on_mouse_motion(self, x, y, dx, dy):
@@ -427,6 +496,9 @@ class Editor(pyglet.window.Window):
             self.mode, self.active = Mode.IDLE, None
         elif button == mouse.LEFT and self.mode is Mode.BOX_SELECTING:
             self._end_box()
+        elif button == mouse.LEFT and self.mode is Mode.PRESSING_WIRE:
+            self.selection.set(wires=[self.pressed_wire])  # a click, not a drag: select
+            self.pressed_wire, self.mode = None, Mode.IDLE
         elif button == mouse.LEFT and self.mode is Mode.DRAGGING_CHIP:
             self.mode, self.active = Mode.IDLE, None
         elif button == mouse.LEFT and self.mode is Mode.EDITING_WIRE:
@@ -769,6 +841,7 @@ class Editor(pyglet.window.Window):
             self._finish_wire_edit(commit=False)
         elif self.mode is Mode.BOX_SELECTING:
             self._end_box()
+        self.pressed_wire = None
         if self.mode is Mode.PLACING_CHIP:
             for view in self.placing_views:
                 self.remove_chip(view)  # takes the ghost wires with it
