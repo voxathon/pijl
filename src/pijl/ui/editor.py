@@ -18,6 +18,7 @@ Controls
   drag a chip              move it (hold-to-drag; a plain click toggles an IN switch)
   right-click chip/wire    delete it
   right-drag empty space   pan (middle-drag pans in any mode)
+  hold Ctrl                snap chips and wire bends to the grid
   scroll                   zoom
   Home                     reset the camera
 """
@@ -33,6 +34,7 @@ from pyglet.window import key, mouse
 from ..sim import Chip, Circuit, Pin, Wire
 from . import theme as T
 from .camera import Camera
+from .grid import Grid
 from .sdf_text import SDFText
 from .toolbar import Toolbar
 from .views import ChipView, Layers, Point, Polyline, WireView
@@ -64,6 +66,9 @@ class Editor(pyglet.window.Window):
         super().__init__(1280, 720, caption="pijl", resizable=True, vsync=True, config=_make_config())
         self.circuit = Circuit()
         self.camera = Camera()
+        self.grid = Grid()
+        self.keys = key.KeyStateHandler()  # live "is this key down?" lookups
+        self.push_handlers(self.keys)
 
         self.world = pyglet.graphics.Batch()
         self.layers = Layers()
@@ -72,7 +77,7 @@ class Editor(pyglet.window.Window):
         self.toolbar = Toolbar(PALETTE, self.hud)
         self.help = pyglet.text.Label(
             "click part: pick up/place | click pin: wire (click empty: bend) | drag: move | "
-            "click IN: toggle | right-click: delete/cancel | middle/right-drag: pan | scroll: zoom",
+            "click IN: toggle | right-click: delete/cancel | middle/right-drag: pan | scroll: zoom | hold Ctrl: snap",
             font_name="Consolas", font_size=10, color=T.HELP_TEXT,
             x=8, y=self.height - 8, anchor_y="top", batch=self.hud)
 
@@ -135,12 +140,13 @@ class Editor(pyglet.window.Window):
                 view.set_ends(self.pin_pos(wire.src), self.pin_pos(wire.dst))
 
     def _build_demo(self) -> None:
-        a = self.add_chip("IN", 200, 360)
-        b = self.add_chip("IN", 200, 240)
-        g = self.add_chip("NAND", 380, 290)
-        out = self.add_chip("OUT", 580, 305)
-        self.connect(a.chip.outputs[0], g.chip.inputs[0])
-        self.connect(b.chip.outputs[0], g.chip.inputs[1])
+        # Everything on grid points, so the wires come out straight.
+        a = self.add_chip("IN", 200, 360)     # output pin at (240, 380)
+        b = self.add_chip("IN", 200, 220)     # output pin at (240, 240)
+        g = self.add_chip("NAND", 380, 280)   # inputs at y=320 / y=300, output at (460, 310)
+        out = self.add_chip("OUT", 580, 290)  # input pin at (580, 310)
+        self.connect(a.chip.outputs[0], g.chip.inputs[0], [(320, 380), (320, 320)])
+        self.connect(b.chip.outputs[0], g.chip.inputs[1], [(320, 240), (320, 300)])
         self.connect(g.chip.outputs[0], out.chip.inputs[0])
 
     # ======================================================================
@@ -212,7 +218,7 @@ class Editor(pyglet.window.Window):
                     self.connect(self.wire_start, pin, self.wire_bends)
                     self._cancel()              # clears the preview; the wire now exists
                 elif pin is None:
-                    self.wire_bends.append((wx, wy))
+                    self.wire_bends.append(self.snapped(wx, wy))
                     self._update_preview()
                 # clicking an invalid pin (in->in, same chip) does nothing
             elif button == mouse.RIGHT:
@@ -276,7 +282,9 @@ class Editor(pyglet.window.Window):
 
     def on_key_press(self, symbol, modifiers):
         # Deliberately NOT calling super(): pyglet's default closes the window on Esc.
-        if symbol == key.ESCAPE:
+        if symbol in (key.LCTRL, key.RCTRL):
+            self._follow_cursor()  # snap whatever is on the cursor right away
+        elif symbol == key.ESCAPE:
             self._cancel()
         elif symbol == key.BACKSPACE and self.mode is Mode.WIRING:
             self._pop_bend_or_cancel()
@@ -295,11 +303,26 @@ class Editor(pyglet.window.Window):
         self.mode = Mode.PLACING_CHIP
         self._follow_cursor()
 
+    def on_key_release(self, symbol, modifiers):
+        if symbol in (key.LCTRL, key.RCTRL):
+            self._follow_cursor()  # un-snap
+
+    @property
+    def snapping(self) -> bool:
+        return self.keys[key.LCTRL] or self.keys[key.RCTRL]
+
+    def snapped(self, wx: float, wy: float) -> Point:
+        """Round to the nearest grid point while Ctrl is held."""
+        if not self.snapping:
+            return wx, wy
+        return round(wx / T.GRID) * T.GRID, round(wy / T.GRID) * T.GRID
+
     def _follow_cursor(self) -> None:
         """Keep whatever is attached to the cursor under the cursor (also after pan/zoom)."""
         if self.mode in (Mode.DRAGGING_CHIP, Mode.PLACING_CHIP):
             wx, wy = self.camera.screen_to_world(*self.mouse)
-            self.active.move_to(wx + self.grab[0], wy + self.grab[1])
+            # Snap the chip's origin: chip sizes are grid multiples, so its pins land on grid points.
+            self.active.move_to(*self.snapped(wx + self.grab[0], wy + self.grab[1]))
             self.refresh_wires_of(self.active.chip)
         elif self.mode is Mode.WIRING:
             self._update_preview()
@@ -308,7 +331,7 @@ class Editor(pyglet.window.Window):
         wx, wy = self.camera.screen_to_world(*self.mouse)
         target = self.pin_at(wx, wy)
         valid = self.can_wire_to(target)
-        end = self.pin_pos(target) if valid else (wx, wy)  # snap to valid pins
+        end = self.pin_pos(target) if valid else self.snapped(wx, wy)  # valid pins always win
         self.preview.set_points([self.pin_pos(self.wire_start), *self.wire_bends, end])
         self.preview.color = T.WIRE_PREVIEW_SNAP if valid else T.WIRE_PREVIEW
 
@@ -348,8 +371,8 @@ class Editor(pyglet.window.Window):
         self.help.y = height - 8
 
     def on_draw(self):
-        pyglet.gl.glClearColor(*(c / 255 for c in T.BACKGROUND))
         self.clear()
+        self.grid.draw(self, self.camera, emphasized=self.snapping)  # also paints the background
         self.view = self.camera.matrix()
         self.world.draw()
         self.view = Mat4()  # identity: HUD is in screen pixels

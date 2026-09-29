@@ -180,7 +180,7 @@ class ChipView:
         io = chip.kind in ("IN", "OUT")
         n = max(len(chip.inputs), len(chip.outputs), 1)
         self.w = T.IO_WIDTH if io else T.CHIP_WIDTH
-        self.h = n * T.PIN_SPACING + 12
+        self.h = (n + 1) * T.PIN_SPACING  # multiple of GRID, see theme.py
 
         self.body = Box(self.w, self.h, T.CHIP_BORDER, *T.CHIP_BODY, batch, layers.bodies)
         self.label = text.label(chip.kind, 0, 0, size=10 if io else 12, color=T.CHIP_TEXT)

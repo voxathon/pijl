@@ -65,10 +65,14 @@ class Camera:
         self.x = wx - width / 2 / self.zoom
         self.y = wy - height / 2 / self.zoom
 
+    def translation(self) -> tuple[int, int]:
+        """Screen-space translation, in whole pixels: keeps text and 1px details
+        from shimmering while panning. Shared with the grid shader so they agree."""
+        return round(-self.x * self.zoom), round(-self.y * self.zoom)
+
     def matrix(self) -> Mat4:
         z = self.zoom
-        # Whole-pixel translation: keeps text and 1px details from shimmering while panning.
-        tx, ty = round(-self.x * z), round(-self.y * z)
+        tx, ty = self.translation()
         # Column-major: scale on the diagonal, translation in the last column.
         return Mat4(z, 0, 0, 0,
                     0, z, 0, 0,

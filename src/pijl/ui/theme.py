@@ -25,10 +25,20 @@ TOOLBAR_BORDER = 1
 HELP_TEXT = (150, 150, 165, 255)
 GHOST_OPACITY = 150
 
+# Grid: (minor line, major line) colors. Brighter while Ctrl-snapping.
+GRID_COLORS = ((34, 34, 42), (44, 44, 54))
+GRID_SNAPPING = ((42, 42, 52), (62, 62, 78))
+
 # World-space sizes
 PIN_RADIUS = 6
-PIN_SPACING = 22
-CHIP_WIDTH = 72
+# Snapping grid. Pins are PIN_SPACING apart and centered on each chip side, so a
+# side with an odd pin count is offset by half a spacing from an even one. With
+# GRID = PIN_SPACING / 2 and chip sizes in multiples of GRID, every pin of a
+# snapped chip lands exactly on a grid point.
+GRID = 10
+GRID_MAJOR_EVERY = 4
+PIN_SPACING = 20
+CHIP_WIDTH = 80
 IO_WIDTH = 40
 WIRE_THICKNESS = 3
 CHIP_BORDER = 2
