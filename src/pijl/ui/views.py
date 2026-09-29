@@ -97,6 +97,81 @@ def _segment_distance(px: float, py: float, a: Point, b: Point) -> float:
     return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
 
 
+class Box:
+    """Sharp-edged box with a solid border.
+
+    Built from a fill rectangle plus four non-overlapping border strips.
+    (pyglet's BorderedRectangle interpolates color between its inner and outer
+    vertices, so its border smears into a gradient once you zoom in.)
+    """
+
+    def __init__(self, w: float, h: float, border: float, fill, border_color,
+                 batch: pyglet.graphics.Batch, group: pyglet.graphics.Group) -> None:
+        self.w, self.h, self.b = w, h, border
+        self.fill = shapes.Rectangle(0, 0, w - 2 * border, h - 2 * border, color=fill,
+                                     batch=batch, group=group)
+        # bottom, top, left, right (left/right sit between top and bottom)
+        self.edges = [shapes.Rectangle(0, 0, w, border, color=border_color, batch=batch, group=group),
+                      shapes.Rectangle(0, 0, w, border, color=border_color, batch=batch, group=group),
+                      shapes.Rectangle(0, 0, border, h - 2 * border, color=border_color, batch=batch, group=group),
+                      shapes.Rectangle(0, 0, border, h - 2 * border, color=border_color, batch=batch, group=group)]
+
+    @property
+    def position(self) -> Point:
+        return self.edges[0].position
+
+    @property
+    def x(self) -> float:
+        return self.edges[0].x
+
+    @property
+    def y(self) -> float:
+        return self.edges[0].y
+
+    def contains(self, px: float, py: float) -> bool:
+        return self.x <= px <= self.x + self.w and self.y <= py <= self.y + self.h
+
+    @position.setter
+    def position(self, xy: Point) -> None:
+        x, y = xy
+        w, h, b = self.w, self.h, self.b
+        self.fill.position = (x + b, y + b)
+        for edge, pos in zip(self.edges, ((x, y), (x, y + h - b), (x, y + b), (x + w - b, y + b))):
+            edge.position = pos
+
+    @property
+    def color(self):
+        return self.fill.color
+
+    @color.setter
+    def color(self, value) -> None:
+        self.fill.color = value
+
+    @property
+    def border_color(self):
+        return self.edges[0].color
+
+    @border_color.setter
+    def border_color(self, value) -> None:
+        for edge in self.edges:
+            edge.color = value
+
+    @property
+    def opacity(self) -> int:
+        return self.fill.opacity
+
+    @opacity.setter
+    def opacity(self, value: int) -> None:
+        self.fill.opacity = value
+        for edge in self.edges:
+            edge.opacity = value
+
+    def delete(self) -> None:
+        self.fill.delete()
+        for edge in self.edges:
+            edge.delete()
+
+
 class ChipView:
     def __init__(self, chip: Chip, x: float, y: float, batch: pyglet.graphics.Batch,
                  layers: Layers, text: SDFText) -> None:
@@ -107,8 +182,7 @@ class ChipView:
         self.w = T.IO_WIDTH if io else T.CHIP_WIDTH
         self.h = n * T.PIN_SPACING + 12
 
-        self.body = shapes.RoundedRectangle(x, y, self.w, self.h, radius=6, segments=T.CORNER_SEGMENTS,
-                                            color=T.CHIP_BODY, batch=batch, group=layers.bodies)
+        self.body = Box(self.w, self.h, T.CHIP_BORDER, *T.CHIP_BODY, batch, layers.bodies)
         self.label = text.label(chip.kind, 0, 0, size=10 if io else 12, color=T.CHIP_TEXT)
         self.pin_dots = [shapes.Circle(0, 0, T.PIN_RADIUS, segments=T.PIN_SEGMENTS, color=T.PIN_OFF,
                                        batch=batch, group=layers.pins)
@@ -164,9 +238,12 @@ class ChipView:
         for dot, on in zip(self.pin_dots, state):
             dot.color = T.PIN_ON if on else T.PIN_OFF
         if self.chip.kind == "IN":
-            self.body.color = T.SWITCH_ON if state[0] else T.SWITCH_OFF
+            self._set_body(T.SWITCH_ON if state[0] else T.SWITCH_OFF)
         elif self.chip.kind == "OUT":
-            self.body.color = T.LED_ON if state[0] else T.LED_OFF
+            self._set_body(T.LED_ON if state[0] else T.LED_OFF)
+
+    def _set_body(self, colors: tuple[tuple[int, int, int], tuple[int, int, int]]) -> None:
+        self.body.color, self.body.border_color = colors
 
     def delete(self) -> None:
         self.body.delete()
