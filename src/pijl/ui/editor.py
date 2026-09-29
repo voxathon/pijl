@@ -45,6 +45,12 @@ Controls
   Ctrl+C / Ctrl+X         copy / cut the selected parts (+ wires running between them)
   Ctrl+V                   paste: the copy follows the cursor like a new part; click to place
                            (shift+click: place and keep another copy), Esc/right-click cancels
+  Ctrl+S                   save the board as a macro (the first save asks for a name)
+  Ctrl+Shift+S             save under another name
+  Ctrl+O                   open a macro: type to filter, arrows + Enter (or click); saved macros
+                           are also in the picker's MACROS section: right-click -> Open
+  Ctrl+N                   new, empty board
+                           (opening, new and closing the window ask first if there are unsaved changes)
   Ctrl+Z / Ctrl+Y          undo / redo (also Ctrl+Shift+Z). During an action, Ctrl+Z cancels it.
                            Every finished edit is recorded automatically; see document.py.
   right-drag empty space   pan (middle-drag pans in any mode)
@@ -56,6 +62,8 @@ Controls
 
 from __future__ import annotations
 
+import json
+import math
 import sys
 import time
 from enum import Enum, auto
@@ -66,16 +74,18 @@ from pyglet.math import Mat4
 from pyglet.window import key, mouse
 
 from ..parts import load as load_parts
-from ..project import Project
+from ..project import Project, write_atomic
+from ..storage import NAME_MAX, FormatError, MacroStore, check_name
 from ..sim import Part, Circuit, Pin, Wire
 from . import theme as T
-from .camera import Camera
-from .document import History, Snapshot, capture, instantiate, internal_wires, restore
+from .camera import MIN_LEVEL, STEPS_PER_OCTAVE, Camera
+from .document import EMPTY, History, Snapshot, capture, instantiate, internal_wires, restore
 from .grid import Grid
 from .library import Library
 from .line_edit import LineEdit
 from .menu import ContextMenu, MenuItem
 from .picker import PartPicker, Row
+from .prompt import Prompt
 from .sdf_text import SDFText
 from .selection import Selection
 from .views import (PartView, Layers, Point, Polyline, WireView, arc_length_at, points_before, project_onto,
@@ -85,6 +95,9 @@ from .wire_edit import WireEditSession
 SIM_STEPS_PER_FRAME = 1
 HOME = (400, 300)
 LABEL_MAX = 32
+MACRO = "macro:"  # library entries for saved macros; part kinds can't contain ':'
+MACROS = "MACROS"  # the picker collection new macros land in
+NOTICE_SECONDS = 4.0
 DOUBLE_CLICK = 0.4  # s: a second click on the same picker row within this is treated as mouse bounce
 
 
@@ -102,6 +115,7 @@ class Mode(Enum):
     PICKER_PRESS = auto()   # mouse down on a picker row: a click picks / toggles it, a drag moves it
     PICKER_DRAG = auto()    # carrying a picker row to another spot in the list
     RENAMING = auto()       # typing a collection's name in the picker
+    PROMPT = auto()         # a Prompt box is up (save as / open / unsaved changes); see _open_prompt
 
 
 def _make_config() -> pyglet.gl.Config | None:
@@ -115,10 +129,11 @@ def _make_config() -> pyglet.gl.Config | None:
 
 class Editor(pyglet.window.Window):
     def __init__(self) -> None:
-        self.history: History | None = None  # set up after the demo; checked by dispatch_event
+        self.history: History | None = None  # set up by _start_document; checked by dispatch_event
         super().__init__(1280, 720, caption="pijl", resizable=True, vsync=True, config=_make_config())
         self.project = Project.open()  # where saves go; created on first run (see project.py)
         self.parts = load_parts(self.project.parts_dir)  # the project's part scripts (see pijl.parts)
+        self.store = MacroStore(self.project.macros_dir)
         self.circuit = Circuit(self.parts)
         self.camera = Camera()
         self.grid = Grid()
@@ -129,21 +144,23 @@ class Editor(pyglet.window.Window):
         self.layers = Layers()
         self.text = SDFText(self.world, self.layers.text_order)
         self.hud = pyglet.graphics.Batch()
-        self.library = Library([(t.kind, t.category) for t in self.parts])
+        self.startup_problems: list[str] = [f"part script {msg}" for msg in self.parts.errors]
+        self.library = self._load_library()
         self.picker = PartPicker(self.library, self.hud, self.height, self._pixel_ratio(),
-                                 swatch=lambda kind: theme_color(self.parts.get(kind).look.swatch))
+                                 swatch=self._swatch, name_of=lambda entry: entry.removeprefix(MACRO))
         self.menu = ContextMenu(self.hud)
         self.help = pyglet.text.Label(
             "click pin: wire | click: select | drag empty: box select | Del: delete | Ctrl+C/X/V | "
-            "Ctrl+Z/Y | right-click: menu | middle-drag: pan | scroll: zoom | hold Ctrl: snap",
+            "Ctrl+Z/Y | Ctrl+S/O/N: save/open/new | right-click: menu | middle-drag: pan | scroll: zoom | "
+            "hold Ctrl: snap",
             font_name="Consolas", font_size=10, color=T.HELP_TEXT,
             x=self.picker.width + 8, y=self.height - 8, anchor_y="top", batch=self.hud)
-        # Part script problems: scripts that didn't load, hooks that raised (see pijl.parts)
+        # Problems (part scripts, files) in red; notices ("saved adder") in grey, for a few seconds
         self.status = pyglet.text.Label(
             "", font_name="Consolas", font_size=10, color=T.MENU_DANGER,
             x=self.picker.width + 8, y=self.height - 24, anchor_y="top", batch=self.hud)
-        for msg in self.parts.errors:
-            self._report(f"part script {msg}")
+        for msg in self.startup_problems:
+            self._report(msg)
 
         self.part_views: dict[Part, PartView] = {}
         self.wire_views: dict[Wire, WireView] = {}
@@ -184,10 +201,16 @@ class Editor(pyglet.window.Window):
         self.box_base: tuple[set, set] = (set(), set())  # selection to add to (shift) or empty
         self.box_shapes: tuple[shapes.Rectangle, shapes.Box] | None = None
         self.hud_box_group = pyglet.graphics.Group(order=8)  # above the picker, below menus
+        # prompt box (Mode.PROMPT)
+        self.prompt: Prompt | None = None
+        self.prompt_enter = None  # what Enter (or clicking a list item) does: fn(prompt)
+        self.prompt_key = None    # other keys: fn(symbol) -> handled
+        # the open document: a macro, or an untitled board
+        self.doc: str | None = None          # its name; None = untitled
+        self.saved: Snapshot = EMPTY         # what's on disk (dirty = history.current differs)
+        self._caption_for: tuple = ()
 
-        self._build_demo()
-        self.history = History(capture(self))
-        self.camera.center_on(*HOME, self.width, self.height)
+        self._start_document()
         pyglet.clock.schedule_interval(self.update, 1 / 60)
 
     # ======================================================================
@@ -382,6 +405,15 @@ class Editor(pyglet.window.Window):
         in_picker = self.picker.hit(x, y)  # None unless the cursor is over the picker
         tool = in_picker.part if isinstance(in_picker, Row) and in_picker.what == "part" else None
 
+        if self.mode is Mode.PROMPT:
+            item = self.prompt.item_at(x, y)
+            if button == mouse.LEFT and item is not None:
+                self.prompt.selected = item
+                self.prompt_enter(self.prompt)
+            elif not self.prompt.contains(x, y):
+                self._close_prompt()  # a click outside is "never mind"
+            return
+
         if self.mode is Mode.MENU:
             item = self.menu.item_at(x, y)
             inside = self.menu.contains(x, y)
@@ -544,6 +576,9 @@ class Editor(pyglet.window.Window):
 
     def on_mouse_motion(self, x, y, dx, dy):
         self.mouse = (x, y)
+        if self.mode is Mode.PROMPT:
+            self.prompt.hover(x, y)
+            return
         hover_ok = self.mode in (Mode.IDLE, Mode.PLACING_PART, Mode.WIRING)
         self.picker.set_hover(self.picker.hit(x, y) if hover_ok else None)
         if self.mode is Mode.MENU:
@@ -589,6 +624,10 @@ class Editor(pyglet.window.Window):
 
     def on_mouse_scroll(self, x, y, scroll_x, scroll_y):
         self.mouse = (x, y)
+        if self.mode is Mode.PROMPT:
+            if scroll_y:
+                self.prompt.move(-1 if scroll_y > 0 else 1)
+            return
         if self.mode is Mode.MENU:
             self._close_menu()  # the menu belongs to what's under it; don't let the world slide away
         if self.picker.contains(x, y):
@@ -601,6 +640,17 @@ class Editor(pyglet.window.Window):
 
     def on_key_press(self, symbol, modifiers):
         # Deliberately NOT calling super(): pyglet's default closes the window on Esc.
+        if self.mode is Mode.PROMPT:
+            # Typing goes through on_text / on_text_motion. No editor shortcuts while it's up.
+            if symbol in (key.ENTER, key.NUM_ENTER):
+                self.prompt_enter(self.prompt)
+            elif symbol == key.ESCAPE:
+                self._close_prompt()
+            elif symbol in (key.UP, key.DOWN):
+                self.prompt.move(-1 if symbol == key.UP else 1)
+            elif self.prompt_key is not None and not modifiers & (key.MOD_CTRL | key.MOD_ALT):
+                self.prompt_key(symbol)
+            return
         if self.mode is Mode.EDITING_LABEL:
             # Text goes through on_text / on_text_motion; only Enter/Esc matter here.
             # Everything else (Home, Backspace, Ctrl...) must not trigger editor shortcuts.
@@ -632,6 +682,15 @@ class Editor(pyglet.window.Window):
             self.delete_selection()
         elif symbol == key.A and modifiers & key.MOD_CTRL and self.mode is Mode.IDLE:
             self.selection.set(self.part_views.values(), self.wire_views.values())
+        elif symbol == key.S and modifiers & key.MOD_CTRL and self.mode is Mode.IDLE:
+            if modifiers & key.MOD_SHIFT:
+                self._save_as()
+            else:
+                self._save()
+        elif symbol == key.O and modifiers & key.MOD_CTRL and self.mode is Mode.IDLE:
+            self._open_dialog()
+        elif symbol == key.N and modifiers & key.MOD_CTRL and self.mode is Mode.IDLE:
+            self._unsaved_then(self._new)
         elif modifiers & key.MOD_CTRL and symbol in (key.Z, key.Y):
             if self.mode is not Mode.IDLE:
                 self._cancel()  # mid-action: undo means "never mind", not "and the step before"
@@ -660,14 +719,18 @@ class Editor(pyglet.window.Window):
             self._follow_cursor()  # un-snap / back to the normal grid
 
     def on_text(self, text):
-        if self.mode is Mode.EDITING_LABEL:
+        if self.mode is Mode.PROMPT:
+            self.prompt.type_text(text)
+        elif self.mode is Mode.EDITING_LABEL:
             self.edit.insert(text)
             self._update_edit()
         elif self.mode is Mode.RENAMING:
             self.picker.rename_text(text)
 
     def on_text_motion(self, motion):
-        if self.mode is Mode.EDITING_LABEL:
+        if self.mode is Mode.PROMPT:
+            self.prompt.motion(motion)
+        elif self.mode is Mode.EDITING_LABEL:
             self.edit.motion(motion)
             self._update_edit()
         elif self.mode is Mode.RENAMING:
@@ -793,6 +856,8 @@ class Editor(pyglet.window.Window):
         elif isinstance(hit, Row) and hit.what == "part":
             p, at = hit.part, (lib.collections.index(hit.collection) + 1 if hit.collection else None)
             items = [MenuItem("Move to new collection", lambda: into_new_collection(p, at))]
+            if p.startswith(MACRO):
+                items.insert(0, MenuItem("Open", lambda: self._request_open(p.removeprefix(MACRO))))
             if hit.collection is not None:
                 items.append(MenuItem("Remove from collection", lambda: move(p, None)))
         else:
@@ -813,6 +878,9 @@ class Editor(pyglet.window.Window):
         return fb_w / self.width if self.width else 1.0
 
     def _start_placing(self, kind: str) -> None:
+        if kind.startswith(MACRO):
+            self._notice("placing macros comes later; right-click it -> Open to edit it")
+            return
         self._carry([self.add_part(kind, 0, 0, live=False)], [], again=lambda: self._start_placing(kind))
         self.placing_kind = kind
 
@@ -991,6 +1059,8 @@ class Editor(pyglet.window.Window):
             self.picker.cancel_drag()
         elif self.mode is Mode.RENAMING:
             self._finish_rename(commit=False)
+        elif self.mode is Mode.PROMPT:
+            self._close_prompt()
         self.pressed_wire = None
         self.picker_row = None
         if self.mode is Mode.PLACING_PART:
@@ -1020,6 +1090,8 @@ class Editor(pyglet.window.Window):
         result = super().dispatch_event(event_type, *args)
         if event_type in self._EDIT_EVENTS and self.history is not None and self.mode is Mode.IDLE:
             self.history.commit(capture(self))
+        if event_type in self._EDIT_EVENTS and self.history is not None:
+            self._save_library()  # picker rearrangements are saved as they happen (no-op if unchanged)
         return result
 
     # ======================================================================
@@ -1028,6 +1100,9 @@ class Editor(pyglet.window.Window):
 
     def update(self, dt: float) -> None:
         self.picker.update(dt)
+        if self.prompt is not None:
+            self.prompt.tick(dt)
+        self._update_caption()
         self.help.x = self.status.x = self.picker.width + 8  # follows the panel sliding in / out
         self.circuit.frame()
         for _ in range(SIM_STEPS_PER_FRAME):
@@ -1043,6 +1118,8 @@ class Editor(pyglet.window.Window):
         super().on_resize(width, height)  # keeps the projection matrix in sync
         self.help.y = height - 8
         self.status.y = height - 24
+        if self.prompt is not None:
+            self.prompt.layout(width, height)
         self.picker.resize(height, self._pixel_ratio())
 
     def on_draw(self):
@@ -1055,13 +1132,253 @@ class Editor(pyglet.window.Window):
         self.hud.draw()
 
     def on_close(self):
+        # Not calling super() (it closes right away): unsaved changes get asked about first.
+        if self.mode is Mode.PROMPT:
+            return  # already asking something; answer that first
+        self._cancel()
+        self._unsaved_then(self._quit)
+
+    def _quit(self) -> None:
+        self._save_library()
         self.circuit.close_all()  # every opened part gets its close()
-        super().on_close()
+        self.close()
 
     def _report(self, msg: str) -> None:
         """Show a problem at the top of the window (the newest one) and on stderr."""
         print(msg, file=sys.stderr)
-        self.status.text = msg
+        pyglet.clock.unschedule(self._clear_status)
+        self.status.text, self.status.color = msg, T.MENU_DANGER
+
+    def _notice(self, msg: str) -> None:
+        """Show something worth knowing (not a problem) for a few seconds."""
+        pyglet.clock.unschedule(self._clear_status)
+        self.status.text, self.status.color = msg, T.HELP_TEXT
+        pyglet.clock.schedule_once(self._clear_status, NOTICE_SECONDS)
+
+    def _clear_status(self, dt: float = 0.0) -> None:
+        self.status.text = ""
+
+    # ======================================================================
+    # documents: every board is a macro (see storage.py)
+    # ======================================================================
+
+    @property
+    def dirty(self) -> bool:
+        """Unsaved changes: the board differs from what was last saved or opened."""
+        return self.history.current != self.saved
+
+    def _start_document(self) -> None:
+        """Reopen what was open last time. With nothing to reopen: an untitled board,
+        with the demo on it if there are no macros at all yet (a first run)."""
+        self.history = History(EMPTY)
+        name = self.project.last_open()
+        name = name and self.store.find(name)
+        if name:
+            self._load(name)
+            if self.doc is not None:
+                return
+        if not self.store.names():
+            self._build_demo()
+        self._reset_history(None)
+        self.camera.center_on(*HOME, self.width, self.height)
+
+    def _reset_history(self, doc: str | None) -> None:
+        """A fresh undo timeline for what's on the board now, which counts as saved."""
+        self.history = History(capture(self))
+        self.saved = self.history.current
+        self.doc = doc
+
+    def _clear_board(self) -> None:
+        self._cancel()
+        self.selection.clear()
+        restore(self, EMPTY)  # removes (and closes) everything
+
+    def _load(self, name: str) -> None:
+        try:
+            loaded = self.store.load(name, self.parts)
+        except (OSError, FormatError) as e:
+            self._report(f"can't open {name}: {e}")
+            return
+        self._clear_board()
+        restore(self, loaded.snapshot)
+        # Undo starts at what was actually built, which is also what counts as saved:
+        # if the file needed repairs, the board shows them and saving writes them.
+        self._reset_history(name)
+        self.project.remember_open(name)
+        self._fit_camera()
+        if loaded.warnings:
+            for w in loaded.warnings:
+                print(f"{name}: {w}", file=sys.stderr)
+            more = f" (+{len(loaded.warnings) - 1} more, see the console)" if len(loaded.warnings) > 1 else ""
+            self._report(f"{name}: {loaded.warnings[0]}{more}")
+        else:
+            self._notice(f"opened {name}")
+
+    def _new(self) -> None:
+        self._clear_board()
+        self._reset_history(None)
+        self.project.remember_open(None)
+        self.camera.set_level(0, 0, 0)
+        self.camera.center_on(*HOME, self.width, self.height)
+
+    def _save(self, then=None) -> None:
+        """Save under the current name (asking for one if untitled), then call `then`."""
+        if self.doc is None:
+            self._save_as(then)
+        elif self._write(self.doc) and then is not None:
+            then()
+
+    def _save_as(self, then=None) -> None:
+        p = Prompt(self.hud, self.width, self.height, "Save macro as", text=self.doc or "", max_len=NAME_MAX,
+                   hint="Enter: save   Esc: cancel")
+        confirmed = [None]  # the existing name the user already agreed to overwrite
+
+        def enter(p: Prompt) -> None:
+            try:
+                name = check_name(p.text)
+            except ValueError as e:
+                p.set_hint(str(e), danger=True)
+                return
+            existing = self.store.find(name)
+            mine = self.doc is not None and existing is not None and existing.casefold() == self.doc.casefold()
+            if existing is not None and not mine and confirmed[0] != name:
+                confirmed[0] = name
+                p.set_hint(f"{existing} already exists. Enter again to overwrite it.", danger=True)
+                return
+            self._close_prompt()
+            if self._write(name) and then is not None:
+                then()
+
+        self._open_prompt(p, enter)
+
+    def _write(self, name: str) -> bool:
+        snap = self.history.current
+        try:
+            self.store.save(name, snap)
+        except (OSError, ValueError) as e:
+            self._report(f"couldn't save {name}: {e}")
+            return False
+        self.doc, self.saved = check_name(name), snap
+        self.project.remember_open(self.doc)
+        self._sync_library()
+        self._notice(f"saved {self.doc}")
+        return True
+
+    def _open_dialog(self) -> None:
+        names = self.store.names()
+        p = Prompt(self.hud, self.width, self.height, "Open macro", text="", max_len=NAME_MAX, items=names,
+                   hint="Enter: open   Up/Down: choose   Esc: cancel",
+                   empty="no match" if names else "no saved macros yet (Ctrl+S saves this board)")
+
+        def enter(p: Prompt) -> None:
+            if p.choice is not None:
+                self._close_prompt()
+                self._request_open(p.choice)
+
+        self._open_prompt(p, enter)
+
+    def _request_open(self, name: str) -> None:
+        if self.doc is not None and name.casefold() == self.doc.casefold() and not self.dirty:
+            self._notice(f"{name} is already open")
+            return
+        self._unsaved_then(lambda: self._load(name))
+
+    def _unsaved_then(self, then) -> None:
+        """Run `then` -- right away, or once unsaved changes are saved or discarded."""
+        if not self.dirty:
+            then()
+            return
+
+        def discard(symbol: int) -> None:
+            if symbol == key.D:
+                self._close_prompt()
+                then()
+
+        def save(p: Prompt) -> None:
+            self._close_prompt()
+            self._save(then)
+
+        p = Prompt(self.hud, self.width, self.height, f"Unsaved changes to {self.doc or 'the untitled board'}",
+                   hint="Enter: save them   D: discard them   Esc: cancel")
+        self._open_prompt(p, save, discard)
+
+    def _open_prompt(self, prompt: Prompt, enter, on_key=None) -> None:
+        self._cancel()  # also closes a prompt that's already up
+        self.prompt, self.prompt_enter, self.prompt_key = prompt, enter, on_key
+        self.picker.set_hover(None)
+        self.mode = Mode.PROMPT
+
+    def _close_prompt(self) -> None:
+        if self.prompt is not None:
+            self.prompt.delete()
+        self.prompt = self.prompt_enter = self.prompt_key = None
+        self.mode = Mode.IDLE
+
+    def _update_caption(self) -> None:
+        state = (self.history.current, self.saved, self.doc)
+        if len(self._caption_for) == 3 and all(a is b for a, b in zip(state, self._caption_for)):
+            return  # nothing changed since last frame (compared by identity: cheap)
+        self._caption_for = state
+        self.set_caption(f"pijl - {self.doc or 'untitled'}{' *' if self.dirty else ''}")
+
+    def _fit_camera(self) -> None:
+        """Show everything on the board, centered in the space right of the picker.
+        Zooms out if it doesn't fit, never in past 1:1."""
+        views = list(self.part_views.values())
+        if not views:
+            self.camera.set_level(0, 0, 0)
+            self.camera.center_on(*HOME, self.width, self.height)
+            return
+        margin = 60
+        x0 = min(v.x for v in views) - margin
+        y0 = min(v.y for v in views) - margin
+        x1 = max(v.x + v.w for v in views) + margin
+        y1 = max(v.y + v.h for v in views) + margin
+        avail = max(1, self.width - self.picker.width)
+        fit = min(avail / (x1 - x0), self.height / (y1 - y0))
+        self.camera.level = max(MIN_LEVEL, min(0, math.floor(STEPS_PER_OCTAVE * math.log2(fit))))
+        self.camera.center_on((x0 + x1) / 2, (y0 + y1) / 2, self.width, self.height)
+        self.camera.x -= self.picker.width / 2 / self.camera.zoom  # center in the free space, not the window
+
+    # ---- the picker's library ----------------------------------------------------
+
+    def _library_entries(self) -> list[tuple[str, str]]:
+        return ([(t.kind, t.category) for t in self.parts]
+                + [(MACRO + name, MACROS) for name in self.store.names()])
+
+    def _load_library(self) -> Library:
+        entries = self._library_entries()
+        lib = Library(entries)
+        try:
+            lib = Library.from_dict(json.loads(self.project.library_file.read_text(encoding="utf-8")), entries)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as e:
+            # (too early to _report: the status line doesn't exist yet; __init__ shows it)
+            self.startup_problems.append(f"library.json unreadable ({e}); using the default layout")
+        self._library_saved = lib.to_dict()
+        return lib
+
+    def _sync_library(self) -> None:
+        """After macros were added / renamed: bring the picker up to date."""
+        self.library.sync(self._library_entries())
+        self.picker.refresh()
+        self._save_library()
+
+    def _save_library(self) -> None:
+        data = self.library.to_dict()
+        if data == self._library_saved:
+            return
+        try:
+            write_atomic(self.project.library_file, json.dumps(data, indent=2) + "\n")
+            self._library_saved = data
+        except OSError as e:
+            self._report(f"couldn't save library.json: {e}")
+
+    def _swatch(self, entry: str) -> tuple:
+        if entry.startswith(MACRO):
+            return T.MACRO_SWATCH
+        return theme_color(self.parts.get(entry).look.swatch)
 
 
 def run() -> None:

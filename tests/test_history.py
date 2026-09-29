@@ -3,7 +3,7 @@ from pijl.ui.document import History, Snapshot
 
 
 def snap(n: int) -> Snapshot:
-    return Snapshot({i: ("NOT", "", float(i), 0.0) for i in range(n)}, {})
+    return Snapshot({i: ("NOT", "", float(i), 0.0, {}) for i in range(n)}, {})
 
 
 def test_uids_are_unique_and_restorable():

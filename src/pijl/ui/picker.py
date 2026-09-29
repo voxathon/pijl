@@ -133,7 +133,7 @@ class Widget:
             self.chip_border = shapes.Rectangle(0, 0, SWATCH, SWATCH, color=border, batch=b, group=layer.fg)
             self.chip = shapes.Rectangle(0, 0, SWATCH - 2 * S, SWATCH - 2 * S, color=fill, batch=b, group=layer.fg)
             self.shapes += [self.chip_border, self.chip]
-            self.name = label(row.part)
+            self.name = label(picker.name_of(row.part))
         elif self.what == "section":
             self.angle = self.target_angle = 90.0 if row.collection.open else 0.0
             self.tri = shapes.Triangle(0, 0, 0, 0, 0, 0, color=T.HELP_TEXT[:3], batch=b, group=layer.fg)
@@ -258,9 +258,11 @@ class Widget:
 
 class PartPicker:
     def __init__(self, library: Library, batch: pyglet.graphics.Batch, win_h: int,
-                 pixel_ratio: float = 1.0, swatch: Callable[[str], tuple] = lambda part: T.PART_BODY) -> None:
+                 pixel_ratio: float = 1.0, swatch: Callable[[str], tuple] = lambda part: T.PART_BODY,
+                 name_of: Callable[[str], str] = lambda part: part) -> None:
         self.lib = library
-        self.swatch = swatch  # part -> (fill, border) of the little color chip in front of its name
+        self.swatch = swatch    # part -> (fill, border) of the little color chip in front of its name
+        self.name_of = name_of  # part -> the text shown for it
         self.batch = batch
         self.open = True
         self.open_t = 1.0               # animated: 1 = fully out, 0 = tucked away

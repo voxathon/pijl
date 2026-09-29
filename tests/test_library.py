@@ -56,3 +56,37 @@ def test_move_collection_and_rename():
     assert io.name == "I/O"
     lib.rename(io, " PINS ")
     assert io.name == "PINS"
+
+
+# ---- saving / syncing --------------------------------------------------------------
+
+
+def test_sync_drops_what_is_gone_and_adds_what_is_new_where_the_user_left_things():
+    lib = Library(PARTS)
+    io, gates = lib.collections
+    lib.move_part("NAND", io)
+    lib.sync([p for p in PARTS if p[0] != "OR"] + [("macro:adder", "MACROS")])
+    assert "OR" not in gates.parts
+    assert lib.where("NAND") is io  # stays where the user put it, not back in GATES
+    assert [c.name for c in lib.collections] == ["I/O", "GATES", "MACROS"]
+    assert lib.collections[2].parts == ["macro:adder"] and lib.collections[2].builtin
+
+
+def test_to_dict_from_dict_roundtrip():
+    lib = Library(PARTS)
+    c = lib.new_collection()
+    lib.rename(c, "MINE")
+    lib.move_part("XOR", c)
+    lib.collections[0].open = False
+    again = Library.from_dict(lib.to_dict(), PARTS)
+    assert again.to_dict() == lib.to_dict()
+
+
+def test_from_dict_forgives_junk_and_duplicates():
+    data = {"collections": [{"name": "A", "parts": ["NAND", "NAND", 5, "GHOST"]}, "junk", {"parts": []},
+                            {"name": "A", "parts": ["OR"]}],
+            "loose": "not a list"}
+    lib = Library.from_dict(data, PARTS)
+    assert lib.collections[0].name == "A" and lib.collections[0].parts == ["NAND"]
+    assert sorted(everything(lib)) == sorted(KINDS)  # every part exactly once
+    assert lib.where("OR").name == "GATES"  # the duplicate "A" was skipped, so OR got its default

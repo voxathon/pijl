@@ -64,6 +64,8 @@ class Registry:
         if not isinstance(t.kind, str) or not t.kind.strip():
             raise ValueError(f"{type(t).__name__} has no kind")
         name = t.kind
+        if ":" in name:
+            raise ValueError(f"{name}: ':' isn't allowed in part names")  # "macro:..." is taken
         taken = set(self.types) | {p.kind for p in self._pending or ()}
         if name in taken:
             raise ValueError(f"{name}: there already is a part with that name")

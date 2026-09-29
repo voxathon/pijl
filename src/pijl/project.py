@@ -74,6 +74,20 @@ class Project:
     def meta_file(self) -> Path:
         return self.path / "project.json"
 
+    def last_open(self) -> str | None:
+        """The macro that was open when pijl last saved or opened one (reopened on start)."""
+        try:
+            value = json.loads(self.meta_file.read_text(encoding="utf-8")).get("open")
+        except (OSError, ValueError):
+            return None
+        return value if isinstance(value, str) else None
+
+    def remember_open(self, name: str | None) -> None:
+        meta = json.loads(self.meta_file.read_text(encoding="utf-8"))
+        if meta.get("open") != name:
+            meta["open"] = name
+            write_atomic(self.meta_file, json.dumps(meta, indent=2) + "\n")
+
     @classmethod
     def open(cls, name: str = DEFAULT_PROJECT) -> Project:
         """Open the named project, creating it (and the data root) if it doesn't exist yet."""

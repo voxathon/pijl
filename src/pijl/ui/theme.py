@@ -8,6 +8,7 @@ UI_SCALE = 1.2
 # Part bodies are (fill, border) pairs. Bright fills get a darker border,
 # dark fills a lighter one, so every block reads against the background.
 PART_BODY = ((62, 84, 150), (34, 47, 92))
+MACRO_SWATCH = ((128, 84, 160), (74, 46, 98))  # saved macros in the part picker
 SWITCH_OFF = ((70, 40, 40), (112, 62, 62))
 SWITCH_ON = ((220, 60, 60), (140, 30, 30))
 LED_OFF = ((45, 45, 52), (86, 86, 98))

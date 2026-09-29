@@ -48,3 +48,13 @@ def test_new_projects_get_their_own_copy_of_the_part_templates():
     (p.parts_dir / "gates" / "nand.py").write_text("# edited by the user\n")
     Project.open()
     assert (p.parts_dir / "gates" / "nand.py").read_text() == "# edited by the user\n"  # never re-copied
+
+
+def test_last_open_is_remembered():
+    p = Project.open()
+    assert p.last_open() is None
+    p.remember_open("half adder")
+    assert Project.open().last_open() == "half adder"
+    assert json.loads(p.meta_file.read_text())["pijl"] == FORMAT  # the rest of project.json survives
+    p.remember_open(None)
+    assert p.last_open() is None

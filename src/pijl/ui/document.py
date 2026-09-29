@@ -1,9 +1,7 @@
-"""Snapshots of the board: the basis for undo/redo and copy/paste (and later, save files).
+"""Taking snapshots of the board and applying them: undo/redo, copy/paste, loading.
 
-A Snapshot is plain data -- part kinds, labels, positions, wire endpoints and
-bends -- keyed by stable uids (parts and wires both have one, since a wire can
-be attached to another wire). Simulation state (which switches are on) is
-deliberately NOT part of it: toggling is using the circuit, not editing it.
+A Snapshot (see pijl/snapshot.py) is plain data -- part kinds, labels, positions,
+props, wire endpoints and bends -- keyed by stable uids.
 
 Undo doesn't rebuild the board from scratch. `restore` diffs the target
 snapshot against what's on screen and only adds/removes/moves what changed,
@@ -17,27 +15,17 @@ keeps that true: the surviving wire is the older one.)
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import copy
 from typing import TYPE_CHECKING, Iterable
 
 from ..sim import Pin, Wire
-from .views import PartView, Point, WireView
+from ..snapshot import EMPTY, EndRef, Snapshot
+from .views import PartView, WireView
 
 if TYPE_CHECKING:
     from .editor import Editor
 
-PartData = tuple[str, str, float, float]  # kind, label, x, y
-# ("p", part uid, is_input, pin index) or ("w", wire uid)
-EndRef = tuple
-# src ref, dst ref, bends (src to dst), src junction point, dst junction point
-# (junction points are None for pin ends: those follow from the part's position)
-WireData = tuple[EndRef, EndRef, tuple[Point, ...], Point | None, Point | None]
-
-
-@dataclass(frozen=True)
-class Snapshot:
-    parts: dict[int, PartData]
-    wires: dict[int, WireData]
+__all__ = ["EMPTY", "History", "Snapshot", "capture", "instantiate", "internal_wires", "restore"]
 
 
 def capture(editor: Editor, views: Iterable[PartView] | None = None) -> Snapshot:
@@ -45,7 +33,7 @@ def capture(editor: Editor, views: Iterable[PartView] | None = None) -> Snapshot
     (both ends on those parts, or on wires that are themselves inside)."""
     views = list(editor.part_views.values() if views is None else views)
     uids = {v.part.uid for v in views}
-    parts = {v.part.uid: (v.part.kind, v.part.label, v.x, v.y) for v in views}
+    parts = {v.part.uid: (v.part.kind, v.part.label, v.x, v.y, copy.deepcopy(v.part.props)) for v in views}
     inside = internal_wires(editor, uids)
     wires = {}
     for view in inside:
@@ -83,9 +71,9 @@ def restore(editor: Editor, target: Snapshot) -> None:
     for view in [v for v in editor.wire_views.values() if stale(v)]:
         if view.wire in editor.wire_views:  # may be gone already, as a branch of an earlier one
             editor.remove_wire(view)
-    # 3. parts: add missing, update moved/relabeled
+    # 3. parts: add missing, update moved/relabeled/re-propped
     moved = set()
-    for uid, (kind, label, x, y) in target.parts.items():
+    for uid, (kind, label, x, y, props) in target.parts.items():
         view = by_uid.get(uid)
         if view is None:
             view = by_uid[uid] = editor.add_part(kind, x, y, uid=uid)
@@ -96,6 +84,8 @@ def restore(editor: Editor, target: Snapshot) -> None:
             view.part.label = label
             view.refresh_name()
             view.name.move_to(*view.name_pos())
+        if view.part.props != props:
+            view.part.props = copy.deepcopy(props)
     # 4. wires, parents first: add missing, update bends / junction points
     wire_by_uid = {v.wire.uid: v.wire for v in editor.wire_views.values()}
     changed: list[WireView] = []
@@ -123,8 +113,9 @@ def instantiate(editor: Editor, clip: Snapshot, live: bool = True) -> tuple[list
     """Add a copy of `clip` at its original coordinates, with fresh uids (for paste).
     `live=False`: the parts are ghosts until the caller opens them (see Circuit.open_part)."""
     new: dict[int, PartView] = {}
-    for uid, (kind, label, x, y) in clip.parts.items():
+    for uid, (kind, label, x, y, props) in clip.parts.items():
         view = new[uid] = editor.add_part(kind, x, y, live=live)
+        view.part.props = copy.deepcopy(props)
         if label:
             view.part.label = label
             view.refresh_name()
