@@ -21,9 +21,12 @@ WIRE_CONFLICT = (240, 175, 40)  # net driven to different values at once (future
 WIRE_PREVIEW = (200, 200, 210, 160)
 WIRE_PREVIEW_SNAP = (120, 220, 140, 220)
 
-TOOLBAR_BG = ((40, 40, 48), (62, 62, 74))      # (fill, border), like parts
-TOOLBAR_HOVER = ((64, 64, 78), (110, 110, 130))
-TOOLBAR_BORDER = 1
+PICKER_BG = (34, 34, 41)
+PICKER_HEADER = (40, 40, 48)   # the panel's title bar, and its collapsed strip's button
+PICKER_SECTION = (38, 38, 46)  # collection rows
+PICKER_HOVER = (58, 58, 72)
+PICKER_BORDER = (62, 62, 74)
+PICKER_DIM_TEXT = (120, 120, 135, 255)
 HELP_TEXT = (150, 150, 165, 255)
 
 MENU_PANEL = ((36, 36, 44), (84, 84, 100))  # (fill, border)

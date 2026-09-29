@@ -29,7 +29,7 @@ class MenuItem:
 class ContextMenu:
     def __init__(self, batch: pyglet.graphics.Batch) -> None:
         self.batch = batch
-        self.bg_group = pyglet.graphics.Group(order=10)  # above the toolbar
+        self.bg_group = pyglet.graphics.Group(order=10)  # above the part picker
         self.row_group = pyglet.graphics.Group(order=11)
         self.text_group = pyglet.graphics.Group(order=12)
         self.items: list[MenuItem] = []
@@ -44,7 +44,11 @@ class ContextMenu:
     def open(self, sx: float, sy: float, items: list[MenuItem], win_w: int, win_h: int) -> None:
         self.close()
         self.items = items
-        w = ITEM_W + 2 * PAD
+        labels = [pyglet.text.Label(item.text, font_name="Consolas", font_size=11,
+                                    color=T.MENU_DANGER if item.danger else T.PART_TEXT, anchor_y="center",
+                                    batch=self.batch, group=self.text_group) for item in items]
+        item_w = max([ITEM_W, *(label.content_width + 20 for label in labels)])  # at least ITEM_W, wider if needed
+        w = item_w + 2 * PAD
         h = len(items) * ITEM_H + 2 * PAD
         # top-left corner at the cursor, flipped to stay on screen
         left = sx if sx + w <= win_w else sx - w
@@ -54,14 +58,11 @@ class ContextMenu:
 
         self.panel = Box(w, h, 1, *T.MENU_PANEL, self.batch, self.bg_group)
         self.panel.position = (left, top - h)
-        for i, item in enumerate(items):
+        for i, label in enumerate(labels):
             y = top - PAD - (i + 1) * ITEM_H
-            row = shapes.Rectangle(left + PAD, y, ITEM_W, ITEM_H, color=T.MENU_PANEL[0],
+            row = shapes.Rectangle(left + PAD, y, item_w, ITEM_H, color=T.MENU_PANEL[0],
                                    batch=self.batch, group=self.row_group)
-            label = pyglet.text.Label(item.text, font_name="Consolas", font_size=11,
-                                      color=T.MENU_DANGER if item.danger else T.PART_TEXT,
-                                      x=left + PAD + 10, y=y + ITEM_H / 2, anchor_y="center",
-                                      batch=self.batch, group=self.text_group)
+            label.position = (left + PAD + 10, y + ITEM_H / 2, 0)
             self.rows.append((row, label))
         self.hovered = None
 

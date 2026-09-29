@@ -7,3 +7,4 @@ nuitka-crash-report.xml
 main.exe
 __pycache__/
 .pytest_cache/
+memory/
