@@ -23,10 +23,10 @@ def test_move_part_between_collections_and_out():
     assert sorted(everything(lib)) == sorted(BUILTINS)
 
 
-def test_move_part_within_a_list_uses_marker_positions():
+def test_move_part_within_a_list_uses_final_positions():
     lib = Library()
     gates = lib.collections[1]  # NAND AND OR NOT
-    lib.move_part("NAND", gates, 3)  # marker between OR and NOT
+    lib.move_part("NAND", gates, 2)
     assert gates.parts == ["AND", "OR", "NAND", "NOT"]
     lib.move_part("NOT", gates, 0)
     assert gates.parts == ["NOT", "AND", "OR", "NAND"]
@@ -46,7 +46,7 @@ def test_new_collections_get_unique_names_and_delete_frees_parts():
 def test_move_collection_and_rename():
     lib = Library()
     io, gates = lib.collections
-    lib.move_collection(io, 2)
+    lib.move_collection(io, 1)
     assert lib.collections == [gates, io]
     lib.rename(io, "  ")
     assert io.name == "I/O"

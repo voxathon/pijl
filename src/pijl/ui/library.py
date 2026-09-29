@@ -37,17 +37,11 @@ class Library:
         return self.loose if dest is None else dest.parts
 
     def move_part(self, part: str, dest: Collection | None, index: int | None = None) -> None:
-        """Put `part` into `dest` (None = loose) before position `index` (None = at the end).
-        `index` counts positions as they are *before* the move, like an insertion marker."""
-        src = self._list(self.where(part))
-        old = src.index(part)
+        """Put `part` into `dest` (None = loose) so it ends up at position `index`
+        (None = at the end). Positions count the list without the part in it."""
+        self._list(self.where(part)).remove(part)
         target = self._list(dest)
-        if index is None:
-            index = len(target)
-        if src is target and old < index:
-            index -= 1  # the part's own slot above the marker disappears
-        src.pop(old)
-        target.insert(index, part)
+        target.insert(len(target) if index is None else index, part)
 
     def new_collection(self, index: int | None = None) -> Collection:
         names = {c.name for c in self.collections}
@@ -68,11 +62,8 @@ class Library:
         self.loose.extend(c.parts)
 
     def move_collection(self, c: Collection, index: int) -> None:
-        """Move `c` before position `index` (counted before the move)."""
-        old = self.collections.index(c)
-        if old < index:
-            index -= 1
-        self.collections.pop(old)
+        """Move `c` so it ends up at position `index` (counted without `c`)."""
+        self.collections.remove(c)
         self.collections.insert(index, c)
 
     def rename(self, c: Collection, name: str) -> None:

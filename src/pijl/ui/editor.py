@@ -10,14 +10,17 @@ Controls
     click a part           pick it up; it follows the cursor (dragging it out of the panel does too)
       click                place it (shift+click: place and keep another)
       click another part   swap to that part instead
-      right-click / Esc    cancel (so does a click anywhere else on the panel)
-    click a collection     expand / collapse it
+      right-click / Esc    cancel (so does a click anywhere on the panel; clicking the carried
+                           part puts it back, so a double-click leaves you ready to drag rows)
+    click a collection     expand / collapse it (a quick second click is ignored: mouse bounce)
     drag a part            move it into another collection (drop on its header or between its
-                           parts), or below everything to take it out of collections
+                           parts), or below everything to take it out of collections; the other
+                           rows slide apart to show where it lands
     drag a collection      reorder the collections
     "+" button             new collection; type its name, Enter commits, Esc keeps the default
-    right-click            menus: rename / delete a collection, move a part to a collection, ...
-    scroll                 scroll the list
+    right-click            menus: rename / delete / collapse-or-expand-all collections, take a part
+                           out of its collection or into a new one
+    scroll                 scroll the list (smoothly; dragging near its edges scrolls too)
   click a pin              start a wire; it follows the cursor
   press+drag on a wire     start a branch from that spot, like from a pin (a plain click
                            selects the wire; Alt+click or right-click -> Branch also work)
@@ -53,6 +56,7 @@ Controls
 
 from __future__ import annotations
 
+import time
 from enum import Enum, auto
 
 import pyglet
@@ -77,6 +81,7 @@ from .wire_edit import WireEditSession
 SIM_STEPS_PER_FRAME = 1
 HOME = (400, 300)
 LABEL_MAX = 32
+DOUBLE_CLICK = 0.4  # s: a second click on the same picker row within this is treated as mouse bounce
 
 
 class Mode(Enum):
@@ -138,6 +143,8 @@ class Editor(pyglet.window.Window):
         self.grab = (0.0, 0.0)               # part origin minus cursor, world units
         self.press_at = (0, 0)               # screen pos of the press on a part / wire / picker row
         self.picker_row: Row | None = None   # picker row pressed / being dragged
+        self.picker_bounce = False           # that press is a double-click's 2nd half: its click does nothing
+        self.last_picker_click: tuple = (None, 0.0)  # (row key, time) of the last click on a picker row
         self.pressed_wire: WireView | None = None
         self.press_world: Point = (0.0, 0.0)
         self.wire_start: Pin | Wire | None = None  # where the wire being drawn starts
@@ -153,6 +160,7 @@ class Editor(pyglet.window.Window):
         self.placing_views: list[PartView] = []
         self.placing_wires: list[WireView] = []
         self.place_again = None               # shift+click: start another of the same
+        self.placing_kind: str | None = None  # the picker part on the cursor (None for a paste)
         self.clipboard: Snapshot | None = None
         # selection
         self.selection = Selection()
@@ -392,11 +400,14 @@ class Editor(pyglet.window.Window):
             return
 
         if self.mode is Mode.PLACING_PART:
-            if button == mouse.LEFT and tool:
+            if button == mouse.LEFT and in_picker:
+                # Back onto the panel: never mind. A press there then acts like any picker press
+                # (so rows can be dragged right away; clicking another part swaps to it), except
+                # that pressing the part being carried just puts it back -- which is also what
+                # the second half of a double-click does.
+                held = self.placing_kind
                 self._cancel()
-                self._start_placing(tool)       # swap to a different part
-            elif button == mouse.LEFT and in_picker:
-                self._cancel()                  # dropped back onto the panel: never mind
+                self._picker_press(in_picker, x, y, put_back=tool is not None and tool == held)
             elif button == mouse.LEFT:
                 # Shift = "keep another", but Ctrl+Shift is subgrid snapping, not a request for more.
                 again = bool(modifiers & key.MOD_SHIFT) and not modifiers & key.MOD_CTRL
@@ -502,7 +513,7 @@ class Editor(pyglet.window.Window):
         elif self.mode is Mode.PICKER_PRESS:
             px, py = self.press_at
             if abs(x - px) + abs(y - py) >= T.DRAG_THRESHOLD_PX:
-                self.picker.begin_drag(self.picker_row)
+                self.picker.begin_drag(self.picker_row, self.press_at)
                 self.mode = Mode.PICKER_DRAG
         if self.mode is Mode.PICKER_DRAG:
             row = self.picker_row
@@ -549,7 +560,10 @@ class Editor(pyglet.window.Window):
             self.wire_edit.end_drag()
         elif button == mouse.LEFT and self.mode is Mode.PICKER_PRESS:
             row, self.picker_row, self.mode = self.picker_row, None, Mode.IDLE
-            if row.what == "part":
+            self.last_picker_click = (row.key, time.monotonic())
+            if self.picker_bounce:
+                pass  # 2nd half of a double-click, or putting the carried part back
+            elif row.what == "part":
                 self._start_placing(row.part)
             else:
                 row.collection.open = not row.collection.open
@@ -563,10 +577,8 @@ class Editor(pyglet.window.Window):
         if self.mode is Mode.MENU:
             self._close_menu()  # the menu belongs to what's under it; don't let the world slide away
         if self.picker.contains(x, y):
-            self.picker.scroll_by(scroll_y)
-            if self.mode is Mode.PICKER_DRAG:
-                self.picker.drag_to(x, y)  # the list moved under the cursor
-            else:
+            self.picker.scroll_by(scroll_y)  # eases there; a drag follows along (see PartPicker.update)
+            if self.mode is not Mode.PICKER_DRAG:
                 self.picker.set_hover(self.picker.hit(x, y))
             return
         self.camera.scroll(x, y, scroll_y)
@@ -622,7 +634,7 @@ class Editor(pyglet.window.Window):
         elif symbol == key.BACKSPACE and self.mode is Mode.WIRING:
             self._pop_bend_or_cancel()
         elif symbol == key.TAB and self.mode not in (Mode.PICKER_PRESS, Mode.PICKER_DRAG):
-            self._toggle_picker()
+            self.picker.toggle()
         elif symbol == key.HOME:
             self.camera.set_level(0, 0, 0)
             self.camera.center_on(*HOME, self.width, self.height)
@@ -724,13 +736,15 @@ class Editor(pyglet.window.Window):
         self.edit_view, self.edit = None, None
         self.mode = Mode.IDLE
 
-    def _picker_press(self, hit, x: float, y: float) -> None:
+    def _picker_press(self, hit, x: float, y: float, put_back: bool = False) -> None:
         if hit == "toggle":
-            self._toggle_picker()
+            self.picker.toggle()
         elif hit == "new":
             self._start_rename(self.library.new_collection(), fresh=True)
         elif isinstance(hit, Row) and hit.what in ("part", "section"):
-            self.picker_row, self.press_at = hit, (x, y)
+            last_key, last_time = self.last_picker_click
+            bounce = last_key == hit.key and time.monotonic() - last_time < DOUBLE_CLICK
+            self.picker_row, self.press_at, self.picker_bounce = hit, (x, y), put_back or bounce
             self.mode = Mode.PICKER_PRESS  # a click or a drag; the release / movement decides
 
     def _picker_menu(self, hit, x: float, y: float) -> None:
@@ -743,20 +757,27 @@ class Editor(pyglet.window.Window):
             lib.move_part(part, dest)
             self.picker.refresh()
 
+        def into_new_collection(part, index):
+            c = lib.new_collection(index)
+            lib.move_part(part, c)
+            self._start_rename(c, fresh=True)
+
         def delete(c):
             lib.delete_collection(c)
             self.picker.refresh()
 
         if isinstance(hit, Row) and hit.what in ("section", "empty"):
             c = hit.collection
+            any_open = any(x.open for x in lib.collections)
             items = [MenuItem("Rename...", lambda: self._start_rename(c)),
-                     MenuItem("New collection", lambda: new_collection(lib.collections.index(c) + 1))]
+                     MenuItem("New collection", lambda: new_collection(lib.collections.index(c) + 1)),
+                     MenuItem("Collapse all" if any_open else "Expand all",
+                              lambda: self.picker.set_all_open(not any_open))]
             if not c.builtin:
                 items.append(MenuItem("Delete", lambda: delete(c), danger=True))
         elif isinstance(hit, Row) and hit.what == "part":
-            p = hit.part
-            items = [MenuItem(f"Move to {c.name}", lambda c=c: move(p, c))
-                     for c in lib.collections if c is not hit.collection]
+            p, at = hit.part, (lib.collections.index(hit.collection) + 1 if hit.collection else None)
+            items = [MenuItem("Move to new collection", lambda: into_new_collection(p, at))]
             if hit.collection is not None:
                 items.append(MenuItem("Remove from collection", lambda: move(p, None)))
         else:
@@ -764,13 +785,8 @@ class Editor(pyglet.window.Window):
         if items:
             self._open_menu(x, y, items)
 
-    def _toggle_picker(self) -> None:
-        self.picker.toggle()
-        self.help.x = self.picker.width + 8
-
     def _start_rename(self, c, fresh: bool = False) -> None:
         self.picker.start_rename(c, fresh)
-        self.help.x = self.picker.width + 8  # renaming opens a collapsed picker
         self.mode = Mode.RENAMING
 
     def _finish_rename(self, commit: bool) -> None:
@@ -783,10 +799,12 @@ class Editor(pyglet.window.Window):
 
     def _start_placing(self, kind: str) -> None:
         self._carry([self.add_part(kind, 0, 0)], [], again=lambda: self._start_placing(kind))
+        self.placing_kind = kind
 
     def _start_paste(self) -> None:
         views, wires = instantiate(self, self.clipboard)
         self._carry(views, wires, again=self._start_paste)
+        self.placing_kind = None
 
     def _carry(self, views: list[PartView], wires: list[WireView], again) -> None:
         """Attach new (ghost) parts + wires to the cursor, centered on it, until a click."""
@@ -817,6 +835,7 @@ class Editor(pyglet.window.Window):
         for w in wires:
             w.set_ghost(False)
         self.placing_views, self.placing_wires, self.place_again = [], [], None
+        self.placing_kind = None
         self.mode = Mode.IDLE
         if again:
             place_again()
@@ -962,6 +981,7 @@ class Editor(pyglet.window.Window):
             for view in self.placing_views:
                 self.remove_part(view)  # takes the ghost wires with it
             self.placing_views, self.placing_wires, self.place_again = [], [], None
+            self.placing_kind = None
         if self.preview is not None:
             self.preview.delete()
             self.preview = None
@@ -991,6 +1011,8 @@ class Editor(pyglet.window.Window):
     # ======================================================================
 
     def update(self, dt: float) -> None:
+        self.picker.update(dt)
+        self.help.x = self.picker.width + 8  # follows the panel sliding in / out
         for _ in range(SIM_STEPS_PER_FRAME):
             self.circuit.step()
         for view in self.part_views.values():

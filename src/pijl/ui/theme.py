@@ -2,6 +2,9 @@
 
 BACKGROUND = (28, 28, 34, 255)
 
+# Screen-space UI (part picker, context menus) is drawn this many times its base size.
+UI_SCALE = 1.2
+
 # Part bodies are (fill, border) pairs. Bright fills get a darker border,
 # dark fills a lighter one, so every block reads against the background.
 PART_BODY = ((62, 84, 150), (34, 47, 92))
@@ -22,9 +25,10 @@ WIRE_PREVIEW = (200, 200, 210, 160)
 WIRE_PREVIEW_SNAP = (120, 220, 140, 220)
 
 PICKER_BG = (34, 34, 41)
-PICKER_HEADER = (40, 40, 48)   # the panel's title bar, and its collapsed strip's button
+PICKER_HEADER = (40, 40, 48)  # the panel's title bar, and its collapsed strip's button
 PICKER_SECTION = (38, 38, 46)  # collection rows
 PICKER_HOVER = (58, 58, 72)
+PICKER_LIFT = (70, 70, 88)  # a row being dragged
 PICKER_BORDER = (62, 62, 74)
 PICKER_DIM_TEXT = (120, 120, 135, 255)
 HELP_TEXT = (150, 150, 165, 255)
@@ -36,17 +40,17 @@ CARET = (235, 235, 245)
 
 # Selection
 SELECT = (90, 170, 255)
-SELECT_WIRE = (90, 170, 255, 110)   # glow under selected wires
+SELECT_WIRE = (90, 170, 255, 110)  # glow under selected wires
 SELECT_BOX_FILL = (90, 170, 255, 30)
-SELECT_OUTSET = 4                   # part outline distance from the body, world units
+SELECT_OUTSET = 4  # part outline distance from the body, world units
 SELECT_THICKNESS = 2
 
 # Wire editing
 WIRE_HALO = (255, 255, 255, 40)
 HANDLE_FILL = (235, 235, 245)
 HANDLE_BORDER = (20, 20, 26)
-HANDLE_HOVER = (120, 220, 140)     # same green as a valid wire target
-ADD_HANDLE_FILL = (28, 28, 34)     # hollow look: background-colored center
+HANDLE_HOVER = (120, 220, 140)  # same green as a valid wire target
+ADD_HANDLE_FILL = (28, 28, 34)  # hollow look: background-colored center
 ADD_HANDLE_BORDER = (200, 200, 215)
 GHOST_OPACITY = 150
 
@@ -70,7 +74,7 @@ WIRE_THICKNESS = 3
 JUNCTION_RADIUS = 4.5  # dot where a wire attaches to another wire
 PART_BORDER = 2
 LABEL_SIZE = 10  # pt at zoom 1
-LABEL_GAP = 6    # between a part and its label
+LABEL_GAP = 6  # between a part and its label
 
 # pyglet picks circle smoothness from the radius at creation, which is far too
 # coarse once zoomed in. These stay smooth up to the max zoom (8x).
@@ -78,5 +82,5 @@ PIN_SEGMENTS = 48
 JOINT_SEGMENTS = 24
 
 # Screen-space sizes
-HIT_SLOP_PX = 4        # how forgiving pin/wire clicks are, in screen pixels
+HIT_SLOP_PX = 4  # how forgiving pin/wire clicks are, in screen pixels
 DRAG_THRESHOLD_PX = 4  # mouse must move this far before a press becomes a drag

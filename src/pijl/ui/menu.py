@@ -16,7 +16,8 @@ from pyglet import shapes
 from . import theme as T
 from .views import Box
 
-ITEM_W, ITEM_H, PAD = 140, 26, 3
+S = T.UI_SCALE
+ITEM_W, ITEM_H, PAD = 140 * S, 26 * S, 3 * S
 
 
 @dataclass
@@ -44,10 +45,10 @@ class ContextMenu:
     def open(self, sx: float, sy: float, items: list[MenuItem], win_w: int, win_h: int) -> None:
         self.close()
         self.items = items
-        labels = [pyglet.text.Label(item.text, font_name="Consolas", font_size=11,
+        labels = [pyglet.text.Label(item.text, font_name="Consolas", font_size=11 * S,
                                     color=T.MENU_DANGER if item.danger else T.PART_TEXT, anchor_y="center",
                                     batch=self.batch, group=self.text_group) for item in items]
-        item_w = max([ITEM_W, *(label.content_width + 20 for label in labels)])  # at least ITEM_W, wider if needed
+        item_w = max([ITEM_W, *(label.content_width + 20 * S for label in labels)])  # at least ITEM_W, wider if needed
         w = item_w + 2 * PAD
         h = len(items) * ITEM_H + 2 * PAD
         # top-left corner at the cursor, flipped to stay on screen
@@ -56,13 +57,13 @@ class ContextMenu:
         left = max(0, min(left, win_w - w))
         top = max(h, min(top, win_h))
 
-        self.panel = Box(w, h, 1, *T.MENU_PANEL, self.batch, self.bg_group)
+        self.panel = Box(w, h, max(1, round(S / 2)), *T.MENU_PANEL, self.batch, self.bg_group)
         self.panel.position = (left, top - h)
         for i, label in enumerate(labels):
             y = top - PAD - (i + 1) * ITEM_H
             row = shapes.Rectangle(left + PAD, y, item_w, ITEM_H, color=T.MENU_PANEL[0],
                                    batch=self.batch, group=self.row_group)
-            label.position = (left + PAD + 10, y + ITEM_H / 2, 0)
+            label.position = (left + PAD + 10 * S, y + ITEM_H / 2, 0)
             self.rows.append((row, label))
         self.hovered = None
 
