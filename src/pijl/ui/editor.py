@@ -20,7 +20,7 @@ Controls
   drag on empty space      box-select anything the box touches (shift: add to selection)
   click empty space / Esc  clear the selection;  Ctrl+A select all;  Del/Backspace delete it
   drag a chip              move it; dragging a selected chip moves the whole selection
-  right-click chip/wire    context menu (click outside or Esc closes)
+  right-click chip/wire    select just it + context menu (click outside or Esc closes)
     Label...               type in place; Enter commits, Esc reverts, clicking elsewhere commits
     Edit (wires)           hold+drag square handles to move bends, "+" handles or the wire
                            itself to add one; right-click a square to remove it. Enter or a
@@ -337,10 +337,14 @@ class Editor(pyglet.window.Window):
                 self.mode = Mode.BOX_SELECTING
 
         elif button == mouse.RIGHT:
+            # Right-clicking narrows the selection to the clicked item, so the
+            # highlight shows exactly what the menu will act on.
             if view := self.chip_at(wx, wy):
+                self.selection.set(chips=[view])
                 self._open_menu(x, y, [MenuItem("Label...", lambda: self._start_edit(view)),
                                        MenuItem("Delete", lambda: self.remove_chip(view), danger=True)])
             elif wire := self.wire_at(wx, wy):
+                self.selection.set(wires=[wire])
                 self._open_menu(x, y, [MenuItem("Edit", lambda: self._start_wire_edit(wire)),
                                        MenuItem("Delete", lambda: self.remove_wire(wire), danger=True)])
             else:
