@@ -30,6 +30,13 @@ MENU_HOVER = (60, 60, 76)
 MENU_DANGER = (240, 110, 110, 255)
 CARET = (235, 235, 245)
 
+# Selection
+SELECT = (90, 170, 255)
+SELECT_WIRE = (90, 170, 255, 110)   # glow under selected wires
+SELECT_BOX_FILL = (90, 170, 255, 30)
+SELECT_OUTSET = 4                   # chip outline distance from the body, world units
+SELECT_THICKNESS = 2
+
 # Wire editing
 WIRE_HALO = (255, 255, 255, 40)
 HANDLE_FILL = (235, 235, 245)

@@ -24,12 +24,13 @@ class Layers:
     """Draw order inside the world batch (lower order draws first)."""
 
     def __init__(self) -> None:
-        self.wire_halo = pyglet.graphics.Group(order=-1)  # glow under a wire being edited
+        self.wire_halo = pyglet.graphics.Group(order=-1)  # glow under selected / edited wires
         self.wires = pyglet.graphics.Group(order=0)
-        self.bodies = pyglet.graphics.Group(order=1)
-        self.pins = pyglet.graphics.Group(order=2)
-        self.text_order = 3  # SDFText makes its own group at this order
-        self.overlay = pyglet.graphics.Group(order=4)
+        self.selection = pyglet.graphics.Group(order=1)   # chip outlines, just under the bodies
+        self.bodies = pyglet.graphics.Group(order=2)
+        self.pins = pyglet.graphics.Group(order=3)
+        self.text_order = 4  # SDFText makes its own group at this order
+        self.overlay = pyglet.graphics.Group(order=5)
 
 
 class Polyline:
@@ -192,9 +193,25 @@ class ChipView:
         self.pin_dots = [shapes.Circle(0, 0, T.PIN_RADIUS, segments=T.PIN_SEGMENTS, color=T.PIN_OFF,
                                        batch=batch, group=layers.pins)
                          for _ in chip.pins]
+        # Selection outline: a ring just outside the body, drawn under it and the pins.
+        o = T.SELECT_OUTSET
+        self.outline = shapes.Box(0, 0, self.w + 2 * o, self.h + 2 * o, thickness=T.SELECT_THICKNESS,
+                                  color=T.SELECT, batch=batch, group=layers.selection)
+        self.outline.visible = False
         self._last_state: tuple[bool, ...] | None = None
         self.move_to(x, y)
         self.sync()
+
+    @property
+    def selected(self) -> bool:
+        return self.outline.visible
+
+    def set_selected(self, on: bool) -> None:
+        self.outline.visible = on
+
+    def intersects(self, x0: float, y0: float, x1: float, y1: float) -> bool:
+        """Does the body overlap the world-space rectangle (x0, y0)-(x1, y1)?"""
+        return self.x <= x1 and x0 <= self.x + self.w and self.y <= y1 and y0 <= self.y + self.h
 
     # ---- geometry --------------------------------------------------------
 
@@ -209,6 +226,7 @@ class ChipView:
     def move_to(self, x: float, y: float) -> None:
         self.x, self.y = x, y
         self.body.position = (x, y)
+        self.outline.position = (x - T.SELECT_OUTSET, y - T.SELECT_OUTSET)
         self.kind_text.move_to(x + self.w / 2, y + self.h / 2)
         self.name.move_to(*self.name_pos())
         for dot, pin in zip(self.pin_dots, self.chip.pins):
@@ -265,6 +283,7 @@ class ChipView:
 
     def delete(self) -> None:
         self.body.delete()
+        self.outline.delete()
         self.kind_text.delete()
         self.name.delete()
         for dot in self.pin_dots:
@@ -282,7 +301,9 @@ class WireView:
         self.wire = wire
         self.src, self.dst = src, dst
         self.bends = list(bends)
+        self.batch, self.layers = batch, layers
         self.line = Polyline(self.points, T.WIRE_OFF, batch, layers.wires)
+        self.highlight: Polyline | None = None  # selection glow, only while selected
         self._last_state: bool | None = None
         self.sync()
 
@@ -293,11 +314,32 @@ class WireView:
 
     def set_ends(self, src: Point, dst: Point) -> None:
         self.src, self.dst = src, dst
-        self.line.set_points(self.points)
+        self._redraw()
 
     def set_bends(self, bends: list[Point]) -> None:
         self.bends = list(bends)
+        self._redraw()
+
+    def _redraw(self) -> None:
         self.line.set_points(self.points)
+        if self.highlight is not None:
+            self.highlight.set_points(self.points)
+
+    @property
+    def selected(self) -> bool:
+        return self.highlight is not None
+
+    def set_selected(self, on: bool) -> None:
+        if on and self.highlight is None:
+            self.highlight = Polyline(self.points, T.SELECT_WIRE, self.batch, self.layers.wire_halo,
+                                      thickness=T.WIRE_THICKNESS + 6)
+        elif not on and self.highlight is not None:
+            self.highlight.delete()
+            self.highlight = None
+
+    def inside(self, x0: float, y0: float, x1: float, y1: float) -> bool:
+        """Is the whole wire within the world-space rectangle (x0, y0)-(x1, y1)?"""
+        return all(x0 <= x <= x1 and y0 <= y <= y1 for x, y in self.points)
 
     def sync(self) -> None:
         on = self.wire.src.state
@@ -309,4 +351,5 @@ class WireView:
         return self.line.distance_to(wx, wy)
 
     def delete(self) -> None:
+        self.set_selected(False)
         self.line.delete()
