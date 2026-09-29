@@ -16,8 +16,11 @@ Controls
     right-click/Backspace  remove last bend point (or cancel if none)
     Esc / click start pin  cancel
   drag a chip              move it (hold-to-drag; a plain click toggles an IN switch)
-  right-click chip/wire    context menu: Label... / Delete (click outside or Esc closes)
+  right-click chip/wire    context menu (click outside or Esc closes)
     Label...               type in place; Enter commits, Esc reverts, clicking elsewhere commits
+    Edit (wires)           hold+drag square handles to move bends, "+" handles or the wire
+                           itself to add one; right-click a square to remove it. Enter or a
+                           click elsewhere finishes, Esc reverts. See wire_edit.py.
   right-drag empty space   pan (middle-drag pans in any mode)
   hold Ctrl                snap chips and wire bends to the grid
   scroll                   zoom
@@ -41,6 +44,7 @@ from .menu import ContextMenu, MenuItem
 from .sdf_text import SDFText
 from .toolbar import Toolbar
 from .views import ChipView, Layers, Point, Polyline, WireView
+from .wire_edit import WireEditSession
 
 SIM_STEPS_PER_FRAME = 1
 PALETTE = ["IN", "OUT", "NAND", "AND", "OR", "NOT"]
@@ -56,6 +60,7 @@ class Mode(Enum):
     WIRING = auto()         # a wire follows the cursor from its start pin until a click on a pin
     MENU = auto()           # context menu open; the next click picks an item or closes it
     EDITING_LABEL = auto()  # typing a chip's label in place
+    EDITING_WIRE = auto()   # moving / adding / removing one wire's bend points
 
 
 def _make_config() -> pyglet.gl.Config | None:
@@ -106,6 +111,7 @@ class Editor(pyglet.window.Window):
         self.edit_text = ""
         self.edit_caret = 0                  # insertion index into edit_text
         self.caret: shapes.Rectangle | None = None
+        self.wire_edit: WireEditSession | None = None
 
         self._build_demo()
         self.camera.center_on(*HOME, self.width, self.height)
@@ -220,6 +226,10 @@ class Editor(pyglet.window.Window):
             self.panning = True
             return
 
+        if self.mode is Mode.EDITING_WIRE:
+            self._wire_edit_press(x, y, wx, wy, button)
+            return
+
         if self.mode is Mode.PLACING_CHIP:
             if button == mouse.LEFT and tool:
                 self._cancel()
@@ -275,7 +285,8 @@ class Editor(pyglet.window.Window):
                 self._open_menu(x, y, [MenuItem("Label...", lambda: self._start_edit(view)),
                                        MenuItem("Delete", lambda: self.remove_chip(view), danger=True)])
             elif wire := self.wire_at(wx, wy):
-                self._open_menu(x, y, [MenuItem("Delete", lambda: self.remove_wire(wire), danger=True)])
+                self._open_menu(x, y, [MenuItem("Edit", lambda: self._start_wire_edit(wire)),
+                                       MenuItem("Delete", lambda: self.remove_wire(wire), danger=True)])
             else:
                 self.panning = True
 
@@ -294,6 +305,9 @@ class Editor(pyglet.window.Window):
         self.toolbar.set_hover(self.toolbar.button_at(x, y))
         if self.mode is Mode.MENU:
             self.menu.hover(x, y)
+        elif self.mode is Mode.EDITING_WIRE and self.wire_edit.set_hover(self.wire_edit.target_at(x, y)):
+            hand = self.get_system_mouse_cursor(self.CURSOR_HAND)
+            self.set_mouse_cursor(hand if self.wire_edit.hover else None)
         self._follow_cursor()
 
     def on_mouse_release(self, x, y, button, modifiers):
@@ -306,6 +320,8 @@ class Editor(pyglet.window.Window):
             self.mode, self.active = Mode.IDLE, None
         elif button == mouse.LEFT and self.mode is Mode.DRAGGING_CHIP:
             self.mode, self.active = Mode.IDLE, None
+        elif button == mouse.LEFT and self.mode is Mode.EDITING_WIRE:
+            self.wire_edit.end_drag()
 
     def on_mouse_scroll(self, x, y, scroll_x, scroll_y):
         self.mouse = (x, y)
@@ -326,6 +342,11 @@ class Editor(pyglet.window.Window):
             return
         if symbol in (key.LCTRL, key.RCTRL):
             self._follow_cursor()  # snap whatever is on the cursor right away
+        elif self.mode is Mode.EDITING_WIRE and symbol in (key.ENTER, key.NUM_ENTER):
+            self._finish_wire_edit(commit=True)
+        elif (self.mode is Mode.EDITING_WIRE and symbol in (key.DELETE, key.BACKSPACE)
+              and self.wire_edit.hover and self.wire_edit.hover[0] == "bend"):
+            self.wire_edit.remove(self.wire_edit.hover[1])  # delete the hovered bend
         elif symbol == key.ESCAPE:
             self._cancel()
         elif symbol == key.BACKSPACE and self.mode is Mode.WIRING:
@@ -376,6 +397,37 @@ class Editor(pyglet.window.Window):
 
     def _close_menu(self) -> None:
         self.menu.close()
+        self.mode = Mode.IDLE
+
+    def _start_wire_edit(self, view: WireView) -> None:
+        self.mode = Mode.EDITING_WIRE
+        self.wire_edit = WireEditSession(view, self.camera, self.world, self.layers)
+        self.wire_edit.set_hover(self.wire_edit.target_at(*self.mouse))
+
+    def _wire_edit_press(self, x: float, y: float, wx: float, wy: float, button: int) -> None:
+        s = self.wire_edit
+        target = s.target_at(x, y)
+        if button == mouse.LEFT:
+            if target and target[0] == "bend":
+                s.begin_drag(target[1], wx, wy)
+            elif target:  # "+" handle: new bend at the midpoint
+                s.begin_drag(s.insert(target[1], s.add_handle_pos(target[1])), wx, wy)
+            elif hit := s.segment_at(wx, wy):  # on the wire itself: split right there
+                s.begin_drag(s.insert(*hit), wx, wy)
+            else:
+                self._finish_wire_edit(commit=True)  # click elsewhere finishes
+        elif button == mouse.RIGHT:
+            if target and target[0] == "bend":
+                s.remove(target[1])
+            else:
+                self._finish_wire_edit(commit=True)
+
+    def _finish_wire_edit(self, commit: bool) -> None:
+        if not commit:
+            self.wire_edit.revert()
+        self.wire_edit.close()
+        self.wire_edit = None
+        self.set_mouse_cursor(None)
         self.mode = Mode.IDLE
 
     def _start_edit(self, view: ChipView) -> None:
@@ -440,6 +492,11 @@ class Editor(pyglet.window.Window):
             self.refresh_wires_of(self.active.chip)
         elif self.mode is Mode.WIRING:
             self._update_preview()
+        elif self.mode is Mode.EDITING_WIRE:
+            if self.wire_edit.dragging is not None:
+                self.wire_edit.drag_to(*self.camera.screen_to_world(*self.mouse), self.snapped)
+            else:
+                self.wire_edit.refresh()  # zoom changes handle sizes
 
     def _update_preview(self) -> None:
         wx, wy = self.camera.screen_to_world(*self.mouse)
@@ -462,6 +519,8 @@ class Editor(pyglet.window.Window):
             self._close_menu()
         elif self.mode is Mode.EDITING_LABEL:
             self._finish_edit(commit=False)
+        elif self.mode is Mode.EDITING_WIRE:
+            self._finish_wire_edit(commit=False)
         if self.mode is Mode.PLACING_CHIP and self.active is not None:
             self.remove_chip(self.active)
         if self.preview is not None:

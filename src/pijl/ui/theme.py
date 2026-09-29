@@ -29,6 +29,14 @@ MENU_PANEL = ((36, 36, 44), (84, 84, 100))  # (fill, border)
 MENU_HOVER = (60, 60, 76)
 MENU_DANGER = (240, 110, 110, 255)
 CARET = (235, 235, 245)
+
+# Wire editing
+WIRE_HALO = (255, 255, 255, 40)
+HANDLE_FILL = (235, 235, 245)
+HANDLE_BORDER = (20, 20, 26)
+HANDLE_HOVER = (120, 220, 140)     # same green as a valid wire target
+ADD_HANDLE_FILL = (28, 28, 34)     # hollow look: background-colored center
+ADD_HANDLE_BORDER = (200, 200, 215)
 GHOST_OPACITY = 150
 
 # Grid: (minor line, major line) colors. Brighter while Ctrl-snapping.

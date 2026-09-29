@@ -24,6 +24,7 @@ class Layers:
     """Draw order inside the world batch (lower order draws first)."""
 
     def __init__(self) -> None:
+        self.wire_halo = pyglet.graphics.Group(order=-1)  # glow under a wire being edited
         self.wires = pyglet.graphics.Group(order=0)
         self.bodies = pyglet.graphics.Group(order=1)
         self.pins = pyglet.graphics.Group(order=2)
@@ -279,13 +280,24 @@ class WireView:
     def __init__(self, wire: Wire, src: Point, bends: list[Point], dst: Point,
                  batch: pyglet.graphics.Batch, layers: Layers) -> None:
         self.wire = wire
+        self.src, self.dst = src, dst
         self.bends = list(bends)
-        self.line = Polyline([src, *self.bends, dst], T.WIRE_OFF, batch, layers.wires)
+        self.line = Polyline(self.points, T.WIRE_OFF, batch, layers.wires)
         self._last_state: bool | None = None
         self.sync()
 
+    @property
+    def points(self) -> list[Point]:
+        """Every vertex: src pin, bends..., dst pin. Segment k runs points[k] -> points[k+1]."""
+        return [self.src, *self.bends, self.dst]
+
     def set_ends(self, src: Point, dst: Point) -> None:
-        self.line.set_points([src, *self.bends, dst])
+        self.src, self.dst = src, dst
+        self.line.set_points(self.points)
+
+    def set_bends(self, bends: list[Point]) -> None:
+        self.bends = list(bends)
+        self.line.set_points(self.points)
 
     def sync(self) -> None:
         on = self.wire.src.state
