@@ -1,2 +1,4 @@
 def main() -> None:
-    print("Hello from pijl!")
+    from .ui import run
+
+    run()

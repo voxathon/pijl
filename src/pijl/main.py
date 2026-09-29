@@ -1,12 +1,11 @@
 # nuitka-project: --standalone
 # nuitka-project: --onefile
 
-import numpy as np
+from pijl.ui import run
 
 
 def main():
-    arr = np.array([1, 2, 3, 4, 5])
-    print(f"NumPy Mean: {arr.mean()}")
+    run()
 
 
 if __name__ == "__main__":

@@ -5,3 +5,5 @@ main.dist/
 main.onefile-build/
 nuitka-crash-report.xml
 main.exe
+__pycache__/
+.pytest_cache/
