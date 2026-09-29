@@ -56,6 +56,7 @@ Controls
 
 from __future__ import annotations
 
+import sys
 import time
 from enum import Enum, auto
 
@@ -64,6 +65,7 @@ from pyglet import shapes
 from pyglet.math import Mat4
 from pyglet.window import key, mouse
 
+from ..parts import load as load_parts
 from ..project import Project
 from ..sim import Part, Circuit, Pin, Wire
 from . import theme as T
@@ -76,7 +78,8 @@ from .menu import ContextMenu, MenuItem
 from .picker import PartPicker, Row
 from .sdf_text import SDFText
 from .selection import Selection
-from .views import PartView, Layers, Point, Polyline, WireView, arc_length_at, points_before, project_onto
+from .views import (PartView, Layers, Point, Polyline, WireView, arc_length_at, points_before, project_onto,
+                    theme_color)
 from .wire_edit import WireEditSession
 
 SIM_STEPS_PER_FRAME = 1
@@ -115,7 +118,8 @@ class Editor(pyglet.window.Window):
         self.history: History | None = None  # set up after the demo; checked by dispatch_event
         super().__init__(1280, 720, caption="pijl", resizable=True, vsync=True, config=_make_config())
         self.project = Project.open()  # where saves go; created on first run (see project.py)
-        self.circuit = Circuit()
+        self.parts = load_parts(self.project.parts_dir)  # the project's part scripts (see pijl.parts)
+        self.circuit = Circuit(self.parts)
         self.camera = Camera()
         self.grid = Grid()
         self.keys = key.KeyStateHandler()  # live "is this key down?" lookups
@@ -125,14 +129,21 @@ class Editor(pyglet.window.Window):
         self.layers = Layers()
         self.text = SDFText(self.world, self.layers.text_order)
         self.hud = pyglet.graphics.Batch()
-        self.library = Library()
-        self.picker = PartPicker(self.library, self.hud, self.height, self._pixel_ratio())
+        self.library = Library([(t.kind, t.category) for t in self.parts])
+        self.picker = PartPicker(self.library, self.hud, self.height, self._pixel_ratio(),
+                                 swatch=lambda kind: theme_color(self.parts.get(kind).look.swatch))
         self.menu = ContextMenu(self.hud)
         self.help = pyglet.text.Label(
             "click pin: wire | click: select | drag empty: box select | Del: delete | Ctrl+C/X/V | "
             "Ctrl+Z/Y | right-click: menu | middle-drag: pan | scroll: zoom | hold Ctrl: snap",
             font_name="Consolas", font_size=10, color=T.HELP_TEXT,
             x=self.picker.width + 8, y=self.height - 8, anchor_y="top", batch=self.hud)
+        # Part script problems: scripts that didn't load, hooks that raised (see pijl.parts)
+        self.status = pyglet.text.Label(
+            "", font_name="Consolas", font_size=10, color=T.MENU_DANGER,
+            x=self.picker.width + 8, y=self.height - 24, anchor_y="top", batch=self.hud)
+        for msg in self.parts.errors:
+            self._report(f"part script {msg}")
 
         self.part_views: dict[Part, PartView] = {}
         self.wire_views: dict[Wire, WireView] = {}
@@ -183,8 +194,9 @@ class Editor(pyglet.window.Window):
     # model + view bookkeeping
     # ======================================================================
 
-    def add_part(self, kind: str, x: float, y: float, uid: int | None = None) -> PartView:
-        part = self.circuit.add_part(kind, uid)
+    def add_part(self, kind: str, x: float, y: float, uid: int | None = None, live: bool = True) -> PartView:
+        """`live=False`: a ghost, for carrying on the cursor (see _carry / _commit_placing)."""
+        part = self.circuit.add_part(kind, uid, live)
         view = PartView(part, x, y, self.world, self.layers, self.text)
         self.part_views[part] = view
         return view
@@ -313,6 +325,8 @@ class Editor(pyglet.window.Window):
 
     def _build_demo(self) -> None:
         # Everything on grid points, so the wires come out straight.
+        if "NAND" not in self.parts:
+            return  # the project's part scripts no longer have one
         a = self.add_part("IN", 200, 360)     # output pin at (240, 380)
         b = self.add_part("IN", 200, 220)     # output pin at (240, 240)
         g = self.add_part("NAND", 380, 280)   # inputs at y=320 / y=300, output at (460, 310)
@@ -545,10 +559,9 @@ class Editor(pyglet.window.Window):
         if button in (mouse.MIDDLE, mouse.RIGHT) and self.panning:
             self.panning = False
         elif button == mouse.LEFT and self.mode is Mode.PRESSING_PART:
-            # A click without movement: switches toggle, everything else gets selected.
-            if self.active.part.kind == "IN":
-                self.active.part.toggle()
-            else:
+            # A click without movement: clickable parts (switches) get the click,
+            # everything else gets selected.
+            if not self.circuit.click(self.active.part):
                 self.selection.set(parts=[self.active])
             self.mode, self.active = Mode.IDLE, None
         elif button == mouse.LEFT and self.mode is Mode.BOX_SELECTING:
@@ -800,11 +813,11 @@ class Editor(pyglet.window.Window):
         return fb_w / self.width if self.width else 1.0
 
     def _start_placing(self, kind: str) -> None:
-        self._carry([self.add_part(kind, 0, 0)], [], again=lambda: self._start_placing(kind))
+        self._carry([self.add_part(kind, 0, 0, live=False)], [], again=lambda: self._start_placing(kind))
         self.placing_kind = kind
 
     def _start_paste(self) -> None:
-        views, wires = instantiate(self, self.clipboard)
+        views, wires = instantiate(self, self.clipboard, live=False)
         self._carry(views, wires, again=self._start_paste)
         self.placing_kind = None
 
@@ -834,6 +847,7 @@ class Editor(pyglet.window.Window):
         views, wires, place_again = self.placing_views, self.placing_wires, self.place_again
         for v in views:
             v.set_ghost(False)
+            self.circuit.open_part(v.part)
         for w in wires:
             w.set_ghost(False)
         self.placing_views, self.placing_wires, self.place_again = [], [], None
@@ -1014,9 +1028,12 @@ class Editor(pyglet.window.Window):
 
     def update(self, dt: float) -> None:
         self.picker.update(dt)
-        self.help.x = self.picker.width + 8  # follows the panel sliding in / out
+        self.help.x = self.status.x = self.picker.width + 8  # follows the panel sliding in / out
+        self.circuit.frame()
         for _ in range(SIM_STEPS_PER_FRAME):
             self.circuit.step()
+        while self.circuit.errors:
+            self._report(self.circuit.errors.pop(0))
         for view in self.part_views.values():
             view.sync()
         for wire, view in self.wire_views.items():
@@ -1025,6 +1042,7 @@ class Editor(pyglet.window.Window):
     def on_resize(self, width, height):
         super().on_resize(width, height)  # keeps the projection matrix in sync
         self.help.y = height - 8
+        self.status.y = height - 24
         self.picker.resize(height, self._pixel_ratio())
 
     def on_draw(self):
@@ -1035,6 +1053,15 @@ class Editor(pyglet.window.Window):
         self.world.draw()
         self.view = Mat4()  # identity: HUD is in screen pixels
         self.hud.draw()
+
+    def on_close(self):
+        self.circuit.close_all()  # every opened part gets its close()
+        super().on_close()
+
+    def _report(self, msg: str) -> None:
+        """Show a problem at the top of the window (the newest one) and on stderr."""
+        print(msg, file=sys.stderr)
+        self.status.text = msg
 
 
 def run() -> None:

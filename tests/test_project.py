@@ -36,3 +36,15 @@ def test_newer_project_format_is_refused():
     p.meta_file.write_text(json.dumps({"pijl": FORMAT + 1}))
     with pytest.raises(ValueError):
         Project.open()
+
+
+def test_new_projects_get_their_own_copy_of_the_part_templates():
+    from pijl.parts import load
+
+    p = Project.open()
+    assert (p.parts_dir / "gates" / "nand.py").is_file()
+    reg = load(p.parts_dir)
+    assert reg.errors == [] and "NAND" in reg
+    (p.parts_dir / "gates" / "nand.py").write_text("# edited by the user\n")
+    Project.open()
+    assert (p.parts_dir / "gates" / "nand.py").read_text() == "# edited by the user\n"  # never re-copied

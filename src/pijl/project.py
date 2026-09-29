@@ -9,6 +9,8 @@ data root. For now there's only ever one, "default", created on first run.
           project.json            marks the folder as a project; format version
           library.json            picker collections (later)
           macros/                 one .json file per macro (later)
+          parts/                  part scripts: a copy of the shipped templates, made when
+                                  the project is created; the project's own from then on
 
 The data root is outside the program's own folder on purpose: a Nuitka onefile
 build unpacks to a temp folder that's deleted on exit, and `uv run` works from
@@ -19,9 +21,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+from .parts import TEMPLATES
 
 APP = "pijl"
 DEFAULT_PROJECT = "default"
@@ -58,6 +63,10 @@ class Project:
         return self.path / "macros"
 
     @property
+    def parts_dir(self) -> Path:
+        return self.path / "parts"
+
+    @property
     def library_file(self) -> Path:
         return self.path / "library.json"
 
@@ -76,6 +85,10 @@ class Project:
                 raise ValueError(f"project {name!r} has format {version!r}; this pijl reads up to {FORMAT}")
         else:
             write_atomic(project.meta_file, json.dumps({"pijl": FORMAT}, indent=2) + "\n")
+        if not project.parts_dir.exists():
+            # The project gets its own copy of the built-in parts, so it keeps behaving
+            # the same whatever later pijl versions ship (and can edit them).
+            shutil.copytree(TEMPLATES, project.parts_dir, ignore=shutil.ignore_patterns("__pycache__"))
         return project
 
 

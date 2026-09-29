@@ -1,5 +1,8 @@
-from pijl.sim.circuit import BUILTINS
 from pijl.ui.library import Library
+
+PARTS = [("IN", "I/O"), ("OUT", "I/O"), ("NAND", "GATES"), ("AND", "GATES"), ("OR", "GATES"),
+         ("NOT", "GATES"), ("XOR", "")]
+KINDS = [kind for kind, _ in PARTS]
 
 
 def everything(lib: Library) -> list[str]:
@@ -7,24 +10,25 @@ def everything(lib: Library) -> list[str]:
 
 
 def test_defaults_hold_every_builtin_once():
-    lib = Library()
+    lib = Library(PARTS)
     assert [c.name for c in lib.collections] == ["I/O", "GATES"]
     assert all(c.builtin for c in lib.collections)
-    assert sorted(everything(lib)) == sorted(BUILTINS)
+    assert lib.loose == ["XOR"]  # no category: loose
+    assert sorted(everything(lib)) == sorted(KINDS)
 
 
 def test_move_part_between_collections_and_out():
-    lib = Library()
+    lib = Library(PARTS)
     io, gates = lib.collections
     lib.move_part("NOT", io, 1)
     assert io.parts == ["IN", "NOT", "OUT"] and "NOT" not in gates.parts
     lib.move_part("NOT", None)
-    assert lib.where("NOT") is None and lib.loose == ["NOT"]
-    assert sorted(everything(lib)) == sorted(BUILTINS)
+    assert lib.where("NOT") is None and lib.loose == ["XOR", "NOT"]
+    assert sorted(everything(lib)) == sorted(KINDS)
 
 
 def test_move_part_within_a_list_uses_final_positions():
-    lib = Library()
+    lib = Library(PARTS)
     gates = lib.collections[1]  # NAND AND OR NOT
     lib.move_part("NAND", gates, 2)
     assert gates.parts == ["AND", "OR", "NAND", "NOT"]
@@ -33,18 +37,18 @@ def test_move_part_within_a_list_uses_final_positions():
 
 
 def test_new_collections_get_unique_names_and_delete_frees_parts():
-    lib = Library()
+    lib = Library(PARTS)
     a, b = lib.new_collection(), lib.new_collection()
     assert a.name != b.name
     lib.move_part("AND", a)
     lib.delete_collection(a)
-    assert a not in lib.collections and lib.loose == ["AND"]
+    assert a not in lib.collections and lib.loose == ["XOR", "AND"]
     lib.delete_collection(lib.collections[0])  # builtin: refused
     assert lib.collections[0].name == "I/O"
 
 
 def test_move_collection_and_rename():
-    lib = Library()
+    lib = Library(PARTS)
     io, gates = lib.collections
     lib.move_collection(io, 1)
     assert lib.collections == [gates, io]

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Callable
 
 import pyglet
 from pyglet import shapes
@@ -52,11 +53,6 @@ def approach(value: float, target: float, k: float, eps: float) -> float:
     if abs(target - value) <= eps:
         return target
     return value + (target - value) * k
-
-
-def swatch_colors(part: str) -> tuple:
-    """(fill, border) of the chip in front of a part's name: the part's own body colors."""
-    return {"IN": T.SWITCH_ON, "OUT": T.LED_ON}.get(part, T.PART_BODY)
 
 
 @dataclass(eq=False)
@@ -133,7 +129,7 @@ class Widget:
             return lb
 
         if self.what == "part":
-            fill, border = swatch_colors(row.part)
+            fill, border = picker.swatch(row.part)
             self.chip_border = shapes.Rectangle(0, 0, SWATCH, SWATCH, color=border, batch=b, group=layer.fg)
             self.chip = shapes.Rectangle(0, 0, SWATCH - 2 * S, SWATCH - 2 * S, color=fill, batch=b, group=layer.fg)
             self.shapes += [self.chip_border, self.chip]
@@ -262,8 +258,9 @@ class Widget:
 
 class PartPicker:
     def __init__(self, library: Library, batch: pyglet.graphics.Batch, win_h: int,
-                 pixel_ratio: float = 1.0) -> None:
+                 pixel_ratio: float = 1.0, swatch: Callable[[str], tuple] = lambda part: T.PART_BODY) -> None:
         self.lib = library
+        self.swatch = swatch  # part -> (fill, border) of the little color chip in front of its name
         self.batch = batch
         self.open = True
         self.open_t = 1.0               # animated: 1 = fully out, 0 = tucked away

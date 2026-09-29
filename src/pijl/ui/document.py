@@ -119,11 +119,12 @@ def restore(editor: Editor, target: Snapshot) -> None:
     editor.refresh_wires([*editor.wires_touching(moved), *changed])
 
 
-def instantiate(editor: Editor, clip: Snapshot) -> tuple[list[PartView], list[WireView]]:
-    """Add a copy of `clip` at its original coordinates, with fresh uids (for paste)."""
+def instantiate(editor: Editor, clip: Snapshot, live: bool = True) -> tuple[list[PartView], list[WireView]]:
+    """Add a copy of `clip` at its original coordinates, with fresh uids (for paste).
+    `live=False`: the parts are ghosts until the caller opens them (see Circuit.open_part)."""
     new: dict[int, PartView] = {}
     for uid, (kind, label, x, y) in clip.parts.items():
-        view = new[uid] = editor.add_part(kind, x, y)
+        view = new[uid] = editor.add_part(kind, x, y, live=live)
         if label:
             view.part.label = label
             view.refresh_name()

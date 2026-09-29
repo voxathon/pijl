@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ..sim.circuit import BUILTINS
-
 NEW_NAME = "NEW COLLECTION"
 
 
@@ -23,11 +21,19 @@ class Collection:
 
 
 class Library:
-    def __init__(self) -> None:
-        self.collections = [Collection("I/O", ["IN", "OUT"], builtin=True),
-                            Collection("GATES", ["NAND", "AND", "OR", "NOT"], builtin=True)]
-        placed = {p for c in self.collections for p in c.parts}
-        self.loose: list[str] = [k for k in BUILTINS if k not in placed]
+    def __init__(self, parts: list[tuple[str, str]]) -> None:
+        """`parts`: (kind, category) pairs, in order. Each category becomes a builtin
+        collection (in order of first appearance); parts without one are loose."""
+        by_name: dict[str, Collection] = {}
+        self.loose: list[str] = []
+        for kind, category in parts:
+            if not category:
+                self.loose.append(kind)
+                continue
+            if category not in by_name:
+                by_name[category] = Collection(category, builtin=True)
+            by_name[category].parts.append(kind)
+        self.collections = list(by_name.values())
 
     def where(self, part: str) -> Collection | None:
         """The collection holding `part`, or None if it's loose."""

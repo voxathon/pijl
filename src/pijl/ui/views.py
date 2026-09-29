@@ -195,16 +195,16 @@ class PartView:
                  layers: Layers, text: SDFText) -> None:
         self.part = part
         self.x, self.y = x, y
-        io = part.kind in ("IN", "OUT")
+        self.look = look = part.type.look
         n = max(len(part.inputs), len(part.outputs), 1)
-        self.w = T.IO_WIDTH if io else T.PART_WIDTH
+        self.w = T.IO_WIDTH if look.narrow else T.PART_WIDTH
         self.h = (n + 1) * T.PIN_SPACING  # multiple of GRID, see theme.py
 
         self.body = Box(self.w, self.h, T.PART_BORDER, *T.PART_BODY, batch, layers.bodies)
-        self.kind_text = text.label(part.kind, 0, 0, size=10 if io else 12, color=T.PART_TEXT)
+        self.kind_text = text.label(part.kind, 0, 0, size=10 if look.narrow else 12, color=T.PART_TEXT)
         # The user's label sits outside the body: left of IN switches, right of
         # OUT LEDs (so it reads like a pin name at the board edge), below gates.
-        anchor = {"IN": "right", "OUT": "left"}.get(part.kind, "center")
+        anchor = {"left": "right", "right": "left"}.get(look.label, "center")
         self.name = text.label(part.label, 0, 0, size=T.LABEL_SIZE, color=T.LABEL_TEXT, anchor_x=anchor)
         self.pin_dots = [shapes.Circle(0, 0, T.PIN_RADIUS, segments=T.PIN_SEGMENTS, color=T.PIN_OFF,
                                        batch=batch, group=layers.pins)
@@ -249,9 +249,9 @@ class PartView:
             dot.position = self.pin_pos(pin)
 
     def name_pos(self) -> Point:
-        if self.part.kind == "IN":
+        if self.look.label == "left":
             return self.x - T.LABEL_GAP, self.y + self.h / 2
-        if self.part.kind == "OUT":
+        if self.look.label == "right":
             return self.x + self.w + T.LABEL_GAP, self.y + self.h / 2
         return self.x + self.w / 2, self.y - T.LABEL_GAP - self.name.cap_height / 2
 
@@ -289,10 +289,8 @@ class PartView:
         # 3-component colors keep the current opacity (matters for ghosts)
         for dot, on in zip(self.pin_dots, state):
             dot.color = T.PIN_ON if on else T.PIN_OFF
-        if self.part.kind == "IN":
-            self._set_body(T.SWITCH_ON if state[0] else T.SWITCH_OFF)
-        elif self.part.kind == "OUT":
-            self._set_body(T.LED_ON if state[0] else T.LED_OFF)
+        if self.look.lit and state:  # body color follows the first pin (switches, LEDs)
+            self._set_body(theme_color(self.look.lit[1] if state[0] else self.look.lit[0]))
 
     def _set_body(self, colors: tuple[tuple[int, int, int], tuple[int, int, int]]) -> None:
         self.body.color, self.body.border_color = colors
@@ -432,3 +430,10 @@ def project_onto(points: list[Point], p: Point) -> Point:
         if d < best_d:
             best, best_d = q, d
     return p if best_d < 1e-9 else best
+
+
+def theme_color(name: str) -> tuple:
+    """A part look's color by its theme.py name (looks come from part scripts, so
+    they name colors instead of importing the theme). Unknown names: plain body."""
+    value = getattr(T, name, None)
+    return value if isinstance(value, tuple) else T.PART_BODY

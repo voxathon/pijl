@@ -1,7 +1,8 @@
 """Pure logic simulation. No pygame/pyglet/UI imports allowed in here.
 
 Model:
-  - A Part has input pins and output pins.
+  - A Part has input pins and output pins. What it does is up to its PartType
+    (see pijl.parts): the circuit only knows the contract, never specific kinds.
   - A Wire joins two endpoints. An endpoint is a Pin, or another Wire (a
     junction / branch: "attached somewhere along that wire").
   - Everything joined by wires forms a *net*. A net's output pins drive it,
@@ -13,26 +14,24 @@ Model:
   - Circuit.step() advances time by one tick: every part computes its outputs
     from its *current* inputs, then every net carries its value to its readers.
     So each gate costs one tick of delay, and feedback loops (latches) work
-    without infinite recursion.
+    without infinite recursion. Parts are evaluated a whole kind at a time, on
+    arrays (PartType.eval), which is what lets big boards go fast later.
+  - Parts are *live* once placed. Ghosts (following the cursor before a click)
+    aren't: they're never opened, and only pure parts among them are evaluated.
 """
 
 from __future__ import annotations
 
+import time
+import traceback
 from dataclasses import dataclass, field
-from typing import Callable, Union
+from typing import Any, Callable, Union
 
-# kind -> (n_inputs, n_outputs, logic function or None)
-# A logic function takes a list of input bools and returns a list of output bools.
-LogicFn = Callable[[list[bool]], list[bool]]
+import numpy as np
 
-BUILTINS: dict[str, tuple[int, int, LogicFn | None]] = {
-    "IN":   (0, 1, None),  # switch: output is driven by the user, see Part.toggle()
-    "OUT":  (1, 0, None),  # LED: just displays its input
-    "NAND": (2, 1, lambda i: [not (i[0] and i[1])]),
-    "AND":  (2, 1, lambda i: [i[0] and i[1]]),
-    "OR":   (2, 1, lambda i: [i[0] or i[1]]),
-    "NOT":  (1, 1, lambda i: [not i[0]]),
-}
+from ..parts import Ctx, PartType, Registry, builtin_registry, fresh_props
+
+_FAILED = object()  # what Circuit._guard returns when the hook raised
 
 
 @dataclass(eq=False)
@@ -59,15 +58,14 @@ class Part:
     # restored comes back with the same uid) and is what snapshots/save files use
     # to refer to parts, since Python object identity doesn't survive either.
     uid: int = 0
+    type: PartType | None = field(default=None, repr=False)
+    props: dict[str, Any] = field(default_factory=dict)  # this instance's settings (see PartType.props)
+    state: dict[str, Any] = field(default_factory=dict)  # scratch space for its PartType's hooks
+    live: bool = False  # opened: placed for real, not a ghost
 
     @property
     def pins(self) -> list[Pin]:
         return self.inputs + self.outputs
-
-    def toggle(self) -> None:
-        """Only meaningful for IN switches."""
-        if self.kind == "IN":
-            self.outputs[0].state = not self.outputs[0].state
 
 
 Endpoint = Union[Pin, "Wire"]
@@ -88,8 +86,14 @@ class Wire:
 
 
 class Circuit:
-    def __init__(self) -> None:
+    def __init__(self, registry: Registry | None = None) -> None:
+        self.registry = registry or builtin_registry()
         self.parts: list[Part] = []
+        self.tick = 0
+        self.faults: dict[str, str] = {}  # kind -> why it's disabled (a hook raised)
+        self.errors: list[str] = []       # new fault messages, for the UI to pick up
+        self._kinds_dirty = True
+        self._kinds: dict[PartType, list[Part]] = {}  # instances grouped by type
         self.wires: list[Wire] = []  # creation order: a wire always comes after the wires it attaches to
         self._next_uid = 1
         self._next_wire_uid = 1
@@ -102,27 +106,63 @@ class Circuit:
 
     # ---- editing -------------------------------------------------------
 
-    def add_part(self, kind: str, uid: int | None = None) -> Part:
-        """`uid` recreates a specific part (undo, loading); normally leave it None."""
-        n_in, n_out, _ = BUILTINS[kind]
+    def add_part(self, kind: str, uid: int | None = None, live: bool = True) -> Part:
+        """`uid` recreates a specific part (undo, loading); normally leave it None.
+        `live=False` makes a ghost: call open_part once it's placed for real."""
+        t = self.registry.get(kind)
         if uid is None:
             uid = self._next_uid
         self._next_uid = max(self._next_uid, uid + 1)
-        part = Part(kind, uid=uid)
-        part.inputs = [Pin(part, i, True) for i in range(n_in)]
-        part.outputs = [Pin(part, i, False) for i in range(n_out)]
+        part = Part(kind, uid=uid, type=t, props=fresh_props(t))
+        part.inputs = [Pin(part, i, True) for i in range(len(t.ins))]
+        part.outputs = [Pin(part, i, False) for i in range(len(t.outs))]
         self.parts.append(part)
+        self._kinds_dirty = True
+        if live:
+            self.open_part(part)
         return part
+
+    def open_part(self, part: Part) -> None:
+        """Make a ghost live (placed for real). Calls its type's open hook."""
+        if part.live:
+            return
+        part.live = True
+        t = part.type
+        if t.has("open") and t.kind not in self.faults:
+            self._guard(t, "open", lambda: t.open(part))
+
+    def close_part(self, part: Part) -> None:
+        if not part.live:
+            return
+        part.live = False
+        t = part.type
+        if t.has("close"):
+            self._guard(t, "close", lambda: t.close(part))
+
+    def close_all(self) -> None:
+        """The circuit is going away (app closing): close every live part."""
+        for part in self.parts:
+            self.close_part(part)
+
+    def click(self, part: Part) -> bool:
+        """The user clicked a placed part. False if its type doesn't take clicks."""
+        t = part.type
+        if not t.has("click") or not part.live:
+            return False
+        if t.kind not in self.faults:
+            self._guard(t, "click", lambda: t.click(part))
+        return True
 
     def remove_part(self, part: Part) -> list[Wire]:
         """Removes the part, every wire touching it, and every wire hanging off
         those. Returns all removed wires."""
+        self.close_part(part)
         removed: list[Wire] = []
         for w in [w for w in self.wires if any(isinstance(e, Pin) and e.part is part for e in w.ends)]:
             if w in self.wires:  # may already be gone as a branch of an earlier one
                 removed += self.remove_wire(w)
         self.parts.remove(part)
-        self._nets_dirty = True
+        self._nets_dirty = self._kinds_dirty = True
         return removed
 
     def can_connect(self, a: Endpoint, b: Endpoint) -> bool:
@@ -262,16 +302,27 @@ class Circuit:
         if self._nets_dirty:
             self._rebuild_nets()
 
-        # Phase 1: every part computes outputs from current inputs.
+        # Phase 1: every part computes outputs from current inputs, one kind at a time.
         # Compute all first, then write, so evaluation order doesn't matter.
-        results: list[tuple[Part, list[bool]]] = []
-        for part in self.parts:
-            fn = BUILTINS[part.kind][2]
-            if fn is not None:
-                results.append((part, fn([p.state for p in part.inputs])))
-        for part, outs in results:
-            for pin, value in zip(part.outputs, outs):
-                pin.state = value
+        now = time.monotonic()
+        results: list[tuple[list[Part], list[list[bool]]]] = []
+        for t, group in self._by_kind().items():
+            if not t.has("eval") or t.kind in self.faults:
+                continue
+            if not t.pure:
+                group = [p for p in group if p.live]
+            if not group:
+                continue
+            n = len(group)
+            ins = [np.fromiter((p.inputs[i].state for p in group), bool, n) for i in range(len(t.ins))]
+            ctx = Ctx(group, self.tick, now)
+            outs = self._guard(t, "eval", lambda: _outputs(t, t.eval(ctx, *ins), n))
+            if outs is not _FAILED:
+                results.append((group, outs))
+        for group, outs in results:
+            for i, values in enumerate(outs):
+                for part, value in zip(group, values):
+                    part.outputs[i].state = value
 
         # Phase 2: every net resolves its drivers and hands the value to its readers.
         for i, (drivers, readers) in enumerate(self._nets):
@@ -286,3 +337,50 @@ class Circuit:
             self.net_conflict[i] = conflict
             for pin in readers:
                 pin.state = value
+        self.tick += 1
+
+    def frame(self) -> None:
+        """Once per frame (not per step): the frame hook of every live part that has one."""
+        now = time.monotonic()
+        for t, group in self._by_kind().items():
+            if t.has("frame") and t.kind not in self.faults:
+                live = [p for p in group if p.live]
+                if live:
+                    self._guard(t, "frame", lambda: t.frame(Ctx(live, self.tick, now)))
+
+    # ---- part types --------------------------------------------------------
+
+    def _by_kind(self) -> dict[PartType, list[Part]]:
+        if self._kinds_dirty:
+            self._kinds = {}
+            for part in self.parts:
+                self._kinds.setdefault(part.type, []).append(part)
+            self._kinds_dirty = False
+        return self._kinds
+
+    def _guard(self, t: PartType, hook: str, fn: Callable[[], Any]) -> Any:
+        """Run one of t's hooks. If it raises, t is disabled in this circuit (its
+        outputs drop to 0 and its hooks stop being called) and the error is kept."""
+        try:
+            return fn()
+        except Exception:
+            if t.kind not in self.faults:
+                detail = traceback.format_exc(limit=-1).strip().splitlines()[-1]
+                self.faults[t.kind] = msg = f"{t.kind}.{hook}: {detail}"
+                self.errors.append(msg)
+                for part in self._by_kind().get(t, ()):
+                    for pin in part.outputs:
+                        pin.state = False
+            return _FAILED
+
+
+def _outputs(t: PartType, raw: Any, n: int) -> list[list[bool]]:
+    """Normalize what eval returned: one list of n bools per output pin."""
+    k = len(t.outs)
+    if k == 0:
+        return []
+    if k == 1 and not (isinstance(raw, tuple) and len(raw) == 1):
+        raw = (raw,)  # one output: anything but a 1-tuple is its value (a scalar, list or array)
+    if not isinstance(raw, tuple) or len(raw) != k:
+        raise ValueError(f"eval returned {raw!r}; expected {k} output value(s)")
+    return [np.broadcast_to(np.asarray(v).astype(bool), (n,)).tolist() for v in raw]
