@@ -20,6 +20,7 @@ WIRE_PREVIEW_SNAP = (120, 220, 140, 220)
 TOOLBAR_BG = (40, 40, 48)
 TOOLBAR_HOVER = (70, 70, 84)
 HELP_TEXT = (150, 150, 165, 255)
+GHOST_OPACITY = 150
 
 # World-space sizes
 PIN_RADIUS = 6
@@ -27,6 +28,12 @@ PIN_SPACING = 22
 CHIP_WIDTH = 72
 IO_WIDTH = 40
 WIRE_THICKNESS = 3
+
+# pyglet picks circle smoothness from the radius at creation, which is far too
+# coarse once zoomed in. These stay smooth up to the max zoom (8x).
+PIN_SEGMENTS = 48
+JOINT_SEGMENTS = 24
+CORNER_SEGMENTS = 12   # per corner
 
 # Screen-space sizes
 HIT_SLOP_PX = 4        # how forgiving pin/wire clicks are, in screen pixels
