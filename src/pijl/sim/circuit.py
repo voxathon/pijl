@@ -1,7 +1,7 @@
 """Pure logic simulation. No pygame/pyglet/UI imports allowed in here.
 
 Model:
-  - A Chip has input pins and output pins.
+  - A Part has input pins and output pins.
   - A Wire joins two endpoints. An endpoint is a Pin, or another Wire (a
     junction / branch: "attached somewhere along that wire").
   - Everything joined by wires forms a *net*. A net's output pins drive it,
@@ -10,7 +10,7 @@ Model:
         drivers agree     -> that value
         drivers disagree  -> CONFLICT: reads 0 for now, flagged so the UI can
                              show it (future X). See Circuit.step.
-  - Circuit.step() advances time by one tick: every chip computes its outputs
+  - Circuit.step() advances time by one tick: every part computes its outputs
     from its *current* inputs, then every net carries its value to its readers.
     So each gate costs one tick of delay, and feedback loops (latches) work
     without infinite recursion.
@@ -26,7 +26,7 @@ from typing import Callable, Union
 LogicFn = Callable[[list[bool]], list[bool]]
 
 BUILTINS: dict[str, tuple[int, int, LogicFn | None]] = {
-    "IN":   (0, 1, None),  # switch: output is driven by the user, see Chip.toggle()
+    "IN":   (0, 1, None),  # switch: output is driven by the user, see Part.toggle()
     "OUT":  (1, 0, None),  # LED: just displays its input
     "NAND": (2, 1, lambda i: [not (i[0] and i[1])]),
     "AND":  (2, 1, lambda i: [i[0] and i[1]]),
@@ -37,27 +37,27 @@ BUILTINS: dict[str, tuple[int, int, LogicFn | None]] = {
 
 @dataclass(eq=False)
 class Pin:
-    chip: Chip
+    part: Part
     index: int
     is_input: bool
     state: bool = False
 
     def __repr__(self) -> str:
         side = "in" if self.is_input else "out"
-        return f"<Pin {self.chip.kind}.{side}{self.index}={int(self.state)}>"
+        return f"<Pin {self.part.kind}.{side}{self.index}={int(self.state)}>"
 
 
 @dataclass(eq=False)
-class Chip:
+class Part:
     kind: str
     inputs: list[Pin] = field(default_factory=list)
     outputs: list[Pin] = field(default_factory=list)
     # User-given name. Lives in the model (not the UI) because it's circuit data:
-    # when a board is packaged into a custom chip, IN/OUT labels become its pin names.
+    # when a board is saved as a macro, IN/OUT labels become its pin names.
     label: str = ""
-    # Stable identity within a circuit. Survives undo/redo (a chip deleted and
+    # Stable identity within a circuit. Survives undo/redo (a part deleted and
     # restored comes back with the same uid) and is what snapshots/save files use
-    # to refer to chips, since Python object identity doesn't survive either.
+    # to refer to parts, since Python object identity doesn't survive either.
     uid: int = 0
 
     @property
@@ -80,7 +80,7 @@ class Wire:
     # pin-to-pin wire reads src=output, dst=input like before junctions existed.
     src: Endpoint
     dst: Endpoint
-    uid: int = 0  # stable identity, like Chip.uid (wires can be endpoints of wires)
+    uid: int = 0  # stable identity, like Part.uid (wires can be endpoints of wires)
 
     @property
     def ends(self) -> tuple[Endpoint, Endpoint]:
@@ -89,7 +89,7 @@ class Wire:
 
 class Circuit:
     def __init__(self) -> None:
-        self.chips: list[Chip] = []
+        self.parts: list[Part] = []
         self.wires: list[Wire] = []  # creation order: a wire always comes after the wires it attaches to
         self._next_uid = 1
         self._next_wire_uid = 1
@@ -102,26 +102,26 @@ class Circuit:
 
     # ---- editing -------------------------------------------------------
 
-    def add_chip(self, kind: str, uid: int | None = None) -> Chip:
-        """`uid` recreates a specific chip (undo, loading); normally leave it None."""
+    def add_part(self, kind: str, uid: int | None = None) -> Part:
+        """`uid` recreates a specific part (undo, loading); normally leave it None."""
         n_in, n_out, _ = BUILTINS[kind]
         if uid is None:
             uid = self._next_uid
         self._next_uid = max(self._next_uid, uid + 1)
-        chip = Chip(kind, uid=uid)
-        chip.inputs = [Pin(chip, i, True) for i in range(n_in)]
-        chip.outputs = [Pin(chip, i, False) for i in range(n_out)]
-        self.chips.append(chip)
-        return chip
+        part = Part(kind, uid=uid)
+        part.inputs = [Pin(part, i, True) for i in range(n_in)]
+        part.outputs = [Pin(part, i, False) for i in range(n_out)]
+        self.parts.append(part)
+        return part
 
-    def remove_chip(self, chip: Chip) -> list[Wire]:
-        """Removes the chip, every wire touching it, and every wire hanging off
+    def remove_part(self, part: Part) -> list[Wire]:
+        """Removes the part, every wire touching it, and every wire hanging off
         those. Returns all removed wires."""
         removed: list[Wire] = []
-        for w in [w for w in self.wires if any(isinstance(e, Pin) and e.chip is chip for e in w.ends)]:
+        for w in [w for w in self.wires if any(isinstance(e, Pin) and e.part is part for e in w.ends)]:
             if w in self.wires:  # may already be gone as a branch of an earlier one
                 removed += self.remove_wire(w)
-        self.chips.remove(chip)
+        self.parts.remove(part)
         self._nets_dirty = True
         return removed
 
@@ -129,7 +129,7 @@ class Circuit:
         if a is b:
             return False
         if isinstance(a, Pin) and isinstance(b, Pin):
-            return a.is_input != b.is_input and a.chip is not b.chip
+            return a.is_input != b.is_input and a.part is not b.part
         if isinstance(b, Pin):
             a, b = b, a
         if isinstance(a, Pin):  # pin + wire
@@ -238,8 +238,8 @@ class Circuit:
                 index[root] = len(self._nets)
                 self._nets.append(([], []))
         self._net_of_wire = {w: index[find(id(w))] for w in self.wires}
-        for chip in self.chips:
-            for pin in chip.pins:
+        for part in self.parts:
+            for pin in part.pins:
                 if id(pin) in parent:
                     drivers, readers = self._nets[index[find(id(pin))]]
                     (readers if pin.is_input else drivers).append(pin)
@@ -262,15 +262,15 @@ class Circuit:
         if self._nets_dirty:
             self._rebuild_nets()
 
-        # Phase 1: every chip computes outputs from current inputs.
+        # Phase 1: every part computes outputs from current inputs.
         # Compute all first, then write, so evaluation order doesn't matter.
-        results: list[tuple[Chip, list[bool]]] = []
-        for chip in self.chips:
-            fn = BUILTINS[chip.kind][2]
+        results: list[tuple[Part, list[bool]]] = []
+        for part in self.parts:
+            fn = BUILTINS[part.kind][2]
             if fn is not None:
-                results.append((chip, fn([p.state for p in chip.inputs])))
-        for chip, outs in results:
-            for pin, value in zip(chip.outputs, outs):
+                results.append((part, fn([p.state for p in part.inputs])))
+        for part, outs in results:
+            for pin, value in zip(part.outputs, outs):
                 pin.state = value
 
         # Phase 2: every net resolves its drivers and hands the value to its readers.

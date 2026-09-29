@@ -13,7 +13,7 @@ Consolas is monospace, so layout is "advance the pen by a fixed amount".
 Why not pyglet.text.Label in world space? It rasterizes at one size, so the
 camera stretches a small bitmap into mush. Re-rasterizing labels per zoom
 level works but costs ~0.27 ms per label per zoom step (measured) -- a
-visible hitch with a few hundred chips.
+visible hitch with a few hundred parts.
 """
 
 from __future__ import annotations

@@ -8,14 +8,14 @@ def snap(n: int) -> Snapshot:
 
 def test_uids_are_unique_and_restorable():
     c = Circuit()
-    a, b = c.add_chip("IN"), c.add_chip("NOT")
+    a, b = c.add_part("IN"), c.add_part("NOT")
     assert (a.uid, b.uid) == (1, 2)
-    c.remove_chip(b)
-    again = c.add_chip("NOT", uid=2)  # undo recreates the same uid
+    c.remove_part(b)
+    again = c.add_part("NOT", uid=2)  # undo recreates the same uid
     assert again.uid == 2
-    assert c.add_chip("AND").uid == 3  # and fresh uids never collide with restored ones
-    c.add_chip("OR", uid=10)
-    assert c.add_chip("OR").uid == 11
+    assert c.add_part("AND").uid == 3  # and fresh uids never collide with restored ones
+    c.add_part("OR", uid=10)
+    assert c.add_part("OR").uid == 11
 
 
 def test_commit_ignores_no_ops():

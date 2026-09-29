@@ -13,7 +13,7 @@ import math
 import pyglet
 from pyglet import shapes
 
-from ..sim import Chip, Pin, Wire
+from ..sim import Part, Pin, Wire
 from . import theme as T
 from .sdf_text import SDFText
 
@@ -26,7 +26,7 @@ class Layers:
     def __init__(self) -> None:
         self.wire_halo = pyglet.graphics.Group(order=-1)  # glow under selected / edited wires
         self.wires = pyglet.graphics.Group(order=0)
-        self.selection = pyglet.graphics.Group(order=1)   # chip outlines, just under the bodies
+        self.selection = pyglet.graphics.Group(order=1)   # part outlines, just under the bodies
         self.bodies = pyglet.graphics.Group(order=2)
         self.pins = pyglet.graphics.Group(order=3)
         self.text_order = 4  # SDFText makes its own group at this order
@@ -190,25 +190,25 @@ class Box:
             edge.delete()
 
 
-class ChipView:
-    def __init__(self, chip: Chip, x: float, y: float, batch: pyglet.graphics.Batch,
+class PartView:
+    def __init__(self, part: Part, x: float, y: float, batch: pyglet.graphics.Batch,
                  layers: Layers, text: SDFText) -> None:
-        self.chip = chip
+        self.part = part
         self.x, self.y = x, y
-        io = chip.kind in ("IN", "OUT")
-        n = max(len(chip.inputs), len(chip.outputs), 1)
-        self.w = T.IO_WIDTH if io else T.CHIP_WIDTH
+        io = part.kind in ("IN", "OUT")
+        n = max(len(part.inputs), len(part.outputs), 1)
+        self.w = T.IO_WIDTH if io else T.PART_WIDTH
         self.h = (n + 1) * T.PIN_SPACING  # multiple of GRID, see theme.py
 
-        self.body = Box(self.w, self.h, T.CHIP_BORDER, *T.CHIP_BODY, batch, layers.bodies)
-        self.kind_text = text.label(chip.kind, 0, 0, size=10 if io else 12, color=T.CHIP_TEXT)
+        self.body = Box(self.w, self.h, T.PART_BORDER, *T.PART_BODY, batch, layers.bodies)
+        self.kind_text = text.label(part.kind, 0, 0, size=10 if io else 12, color=T.PART_TEXT)
         # The user's label sits outside the body: left of IN switches, right of
         # OUT LEDs (so it reads like a pin name at the board edge), below gates.
-        anchor = {"IN": "right", "OUT": "left"}.get(chip.kind, "center")
-        self.name = text.label(chip.label, 0, 0, size=T.LABEL_SIZE, color=T.LABEL_TEXT, anchor_x=anchor)
+        anchor = {"IN": "right", "OUT": "left"}.get(part.kind, "center")
+        self.name = text.label(part.label, 0, 0, size=T.LABEL_SIZE, color=T.LABEL_TEXT, anchor_x=anchor)
         self.pin_dots = [shapes.Circle(0, 0, T.PIN_RADIUS, segments=T.PIN_SEGMENTS, color=T.PIN_OFF,
                                        batch=batch, group=layers.pins)
-                         for _ in chip.pins]
+                         for _ in part.pins]
         # Selection outline: a ring just outside the body, drawn under it and the pins.
         o = T.SELECT_OUTSET
         self.outline = shapes.Box(0, 0, self.w + 2 * o, self.h + 2 * o, thickness=T.SELECT_THICKNESS,
@@ -232,7 +232,7 @@ class ChipView:
     # ---- geometry --------------------------------------------------------
 
     def pin_pos(self, pin: Pin) -> Point:
-        side = self.chip.inputs if pin.is_input else self.chip.outputs
+        side = self.part.inputs if pin.is_input else self.part.outputs
         n = len(side)
         px = self.x if pin.is_input else self.x + self.w
         # index 0 at the top, pins centered vertically
@@ -245,26 +245,26 @@ class ChipView:
         self.outline.position = (x - T.SELECT_OUTSET, y - T.SELECT_OUTSET)
         self.kind_text.move_to(x + self.w / 2, y + self.h / 2)
         self.name.move_to(*self.name_pos())
-        for dot, pin in zip(self.pin_dots, self.chip.pins):
+        for dot, pin in zip(self.pin_dots, self.part.pins):
             dot.position = self.pin_pos(pin)
 
     def name_pos(self) -> Point:
-        if self.chip.kind == "IN":
+        if self.part.kind == "IN":
             return self.x - T.LABEL_GAP, self.y + self.h / 2
-        if self.chip.kind == "OUT":
+        if self.part.kind == "OUT":
             return self.x + self.w + T.LABEL_GAP, self.y + self.h / 2
         return self.x + self.w / 2, self.y - T.LABEL_GAP - self.name.cap_height / 2
 
     def refresh_name(self) -> None:
-        """Show chip.label (after it was edited)."""
-        self.name.set_text(self.chip.label)
+        """Show part.label (after it was edited)."""
+        self.name.set_text(self.part.label)
 
     def contains(self, wx: float, wy: float) -> bool:
         return self.x <= wx <= self.x + self.w and self.y <= wy <= self.y + self.h
 
     def pin_at(self, wx: float, wy: float, slop: float) -> Pin | None:
         r = T.PIN_RADIUS + slop
-        for pin in self.chip.pins:
+        for pin in self.part.pins:
             px, py = self.pin_pos(pin)
             if (px - wx) ** 2 + (py - wy) ** 2 <= r * r:
                 return pin
@@ -282,16 +282,16 @@ class ChipView:
     # ---- state -> visuals --------------------------------------------------
 
     def sync(self) -> None:
-        state = tuple(p.state for p in self.chip.pins)
+        state = tuple(p.state for p in self.part.pins)
         if state == self._last_state:
             return
         self._last_state = state
         # 3-component colors keep the current opacity (matters for ghosts)
         for dot, on in zip(self.pin_dots, state):
             dot.color = T.PIN_ON if on else T.PIN_OFF
-        if self.chip.kind == "IN":
+        if self.part.kind == "IN":
             self._set_body(T.SWITCH_ON if state[0] else T.SWITCH_OFF)
-        elif self.chip.kind == "OUT":
+        elif self.part.kind == "OUT":
             self._set_body(T.LED_ON if state[0] else T.LED_OFF)
 
     def _set_body(self, colors: tuple[tuple[int, int, int], tuple[int, int, int]]) -> None:

@@ -1,4 +1,4 @@
-"""Screen-space chip palette along the bottom of the window.
+"""Screen-space part palette along the bottom of the window.
 
 Drawn with an identity view matrix, so it ignores the camera.
 """
@@ -21,7 +21,7 @@ class Toolbar:
             x = MARGIN + i * (BUTTON_W + GAP)
             rect = Box(BUTTON_W, BUTTON_H, T.TOOLBAR_BORDER, *T.TOOLBAR_BG, batch, bg)
             rect.position = (x, MARGIN)
-            label = pyglet.text.Label(kind, font_name="Consolas", font_size=11, color=T.CHIP_TEXT,
+            label = pyglet.text.Label(kind, font_name="Consolas", font_size=11, color=T.PART_TEXT,
                                       x=x + BUTTON_W / 2, y=MARGIN + BUTTON_H / 2,
                                       anchor_x="center", anchor_y="center", batch=batch, group=fg)
             self.buttons.append((kind, rect, label))

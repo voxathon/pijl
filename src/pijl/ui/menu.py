@@ -59,7 +59,7 @@ class ContextMenu:
             row = shapes.Rectangle(left + PAD, y, ITEM_W, ITEM_H, color=T.MENU_PANEL[0],
                                    batch=self.batch, group=self.row_group)
             label = pyglet.text.Label(item.text, font_name="Consolas", font_size=11,
-                                      color=T.MENU_DANGER if item.danger else T.CHIP_TEXT,
+                                      color=T.MENU_DANGER if item.danger else T.PART_TEXT,
                                       x=left + PAD + 10, y=y + ITEM_H / 2, anchor_y="center",
                                       batch=self.batch, group=self.text_group)
             self.rows.append((row, label))

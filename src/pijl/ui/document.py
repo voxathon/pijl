@@ -1,14 +1,14 @@
 """Snapshots of the board: the basis for undo/redo and copy/paste (and later, save files).
 
-A Snapshot is plain data -- chip kinds, labels, positions, wire endpoints and
-bends -- keyed by stable uids (chips and wires both have one, since a wire can
+A Snapshot is plain data -- part kinds, labels, positions, wire endpoints and
+bends -- keyed by stable uids (parts and wires both have one, since a wire can
 be attached to another wire). Simulation state (which switches are on) is
 deliberately NOT part of it: toggling is using the circuit, not editing it.
 
 Undo doesn't rebuild the board from scratch. `restore` diffs the target
 snapshot against what's on screen and only adds/removes/moves what changed,
-because creating pyglet shapes is the slow part (~0.8 ms per chip). A side
-effect: chips that survive an undo keep their switch states.
+because creating pyglet shapes is the slow part (~0.8 ms per part). A side
+effect: parts that survive an undo keep their switch states.
 
 Wire uids grow in creation order and a wire is always created after the wires
 it attaches to, so iterating wires by uid always visits parents first. (Splicing
@@ -21,31 +21,31 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable
 
 from ..sim import Pin, Wire
-from .views import ChipView, Point, WireView
+from .views import PartView, Point, WireView
 
 if TYPE_CHECKING:
     from .editor import Editor
 
-ChipData = tuple[str, str, float, float]  # kind, label, x, y
-# ("p", chip uid, is_input, pin index) or ("w", wire uid)
+PartData = tuple[str, str, float, float]  # kind, label, x, y
+# ("p", part uid, is_input, pin index) or ("w", wire uid)
 EndRef = tuple
 # src ref, dst ref, bends (src to dst), src junction point, dst junction point
-# (junction points are None for pin ends: those follow from the chip's position)
+# (junction points are None for pin ends: those follow from the part's position)
 WireData = tuple[EndRef, EndRef, tuple[Point, ...], Point | None, Point | None]
 
 
 @dataclass(frozen=True)
 class Snapshot:
-    chips: dict[int, ChipData]
+    parts: dict[int, PartData]
     wires: dict[int, WireData]
 
 
-def capture(editor: Editor, views: Iterable[ChipView] | None = None) -> Snapshot:
+def capture(editor: Editor, views: Iterable[PartView] | None = None) -> Snapshot:
     """The whole board, or just `views` plus every wire fully inside that set
-    (both ends on those chips, or on wires that are themselves inside)."""
-    views = list(editor.chip_views.values() if views is None else views)
-    uids = {v.chip.uid for v in views}
-    chips = {v.chip.uid: (v.chip.kind, v.chip.label, v.x, v.y) for v in views}
+    (both ends on those parts, or on wires that are themselves inside)."""
+    views = list(editor.part_views.values() if views is None else views)
+    uids = {v.part.uid for v in views}
+    parts = {v.part.uid: (v.part.kind, v.part.label, v.x, v.y) for v in views}
     inside = internal_wires(editor, uids)
     wires = {}
     for view in inside:
@@ -53,15 +53,15 @@ def capture(editor: Editor, views: Iterable[ChipView] | None = None) -> Snapshot
         wires[w.uid] = (_ref(w.src), _ref(w.dst), tuple(view.bends),
                         None if isinstance(w.src, Pin) else view.src,
                         None if isinstance(w.dst, Pin) else view.dst)
-    return Snapshot(chips, wires)
+    return Snapshot(parts, wires)
 
 
-def internal_wires(editor: Editor, chip_uids: set[int]) -> list[WireView]:
-    """Wire views whose every end lands on those chips or on other internal wires."""
+def internal_wires(editor: Editor, part_uids: set[int]) -> list[WireView]:
+    """Wire views whose every end lands on those parts or on other internal wires."""
     inside: set[Wire] = set()
     result = []
     for w in editor.circuit.wires:  # creation order: parents first
-        if all(e.chip.uid in chip_uids if isinstance(e, Pin) else e in inside for e in w.ends):
+        if all(e.part.uid in part_uids if isinstance(e, Pin) else e in inside for e in w.ends):
             inside.add(w)
             result.append(editor.wire_views[w])
     return result
@@ -69,10 +69,10 @@ def internal_wires(editor: Editor, chip_uids: set[int]) -> list[WireView]:
 
 def restore(editor: Editor, target: Snapshot) -> None:
     """Make the board match `target`, touching only what differs."""
-    by_uid = {v.chip.uid: v for v in editor.chip_views.values()}
-    # 1. chips that shouldn't exist (their wires and branches go with them)
-    for uid in by_uid.keys() - target.chips.keys():
-        editor.remove_chip(by_uid.pop(uid))
+    by_uid = {v.part.uid: v for v in editor.part_views.values()}
+    # 1. parts that shouldn't exist (their wires and branches go with them)
+    for uid in by_uid.keys() - target.parts.keys():
+        editor.remove_part(by_uid.pop(uid))
     # 2. wires that shouldn't exist -- or exist with different endpoints (cut-deletion
     #    splices a branch onto its trunk, re-pointing the trunk's far end). Those are
     #    rebuilt in step 4; branches that get removed along with them are too.
@@ -83,17 +83,17 @@ def restore(editor: Editor, target: Snapshot) -> None:
     for view in [v for v in editor.wire_views.values() if stale(v)]:
         if view.wire in editor.wire_views:  # may be gone already, as a branch of an earlier one
             editor.remove_wire(view)
-    # 3. chips: add missing, update moved/relabeled
+    # 3. parts: add missing, update moved/relabeled
     moved = set()
-    for uid, (kind, label, x, y) in target.chips.items():
+    for uid, (kind, label, x, y) in target.parts.items():
         view = by_uid.get(uid)
         if view is None:
-            view = by_uid[uid] = editor.add_chip(kind, x, y, uid=uid)
+            view = by_uid[uid] = editor.add_part(kind, x, y, uid=uid)
         elif (view.x, view.y) != (x, y):
             view.move_to(x, y)
-            moved.add(view.chip)
-        if view.chip.label != label:
-            view.chip.label = label
+            moved.add(view.part)
+        if view.part.label != label:
+            view.part.label = label
             view.refresh_name()
             view.name.move_to(*view.name_pos())
     # 4. wires, parents first: add missing, update bends / junction points
@@ -113,19 +113,19 @@ def restore(editor: Editor, target: Snapshot) -> None:
             view.src, view.dst = src_pt or view.src, dst_pt or view.dst
             view.set_bends(list(bends))
             changed.append(view)
-    # 5. re-attach ends: wires on moved chips, changed wires, and whatever hangs off them.
-    #    Only those: touching every wire made undoing one moved chip on a 2000-chip
+    # 5. re-attach ends: wires on moved parts, changed wires, and whatever hangs off them.
+    #    Only those: touching every wire made undoing one moved part on a 2000-part
     #    board take ~80 ms.
     editor.refresh_wires([*editor.wires_touching(moved), *changed])
 
 
-def instantiate(editor: Editor, clip: Snapshot) -> tuple[list[ChipView], list[WireView]]:
+def instantiate(editor: Editor, clip: Snapshot) -> tuple[list[PartView], list[WireView]]:
     """Add a copy of `clip` at its original coordinates, with fresh uids (for paste)."""
-    new: dict[int, ChipView] = {}
-    for uid, (kind, label, x, y) in clip.chips.items():
-        view = new[uid] = editor.add_chip(kind, x, y)
+    new: dict[int, PartView] = {}
+    for uid, (kind, label, x, y) in clip.parts.items():
+        view = new[uid] = editor.add_part(kind, x, y)
         if label:
-            view.chip.label = label
+            view.part.label = label
             view.refresh_name()
             view.name.move_to(*view.name_pos())
     new_wires: dict[int, Wire] = {}
@@ -173,13 +173,13 @@ class History:
 
 def _ref(end) -> EndRef:
     if isinstance(end, Pin):
-        return "p", end.chip.uid, end.is_input, end.index
+        return "p", end.part.uid, end.is_input, end.index
     return "w", end.uid
 
 
-def _resolve(ref: EndRef, chips: dict[int, ChipView], wires: dict[int, Wire]):
+def _resolve(ref: EndRef, parts: dict[int, PartView], wires: dict[int, Wire]):
     if ref[0] == "p":
-        _, chip_uid, is_input, index = ref
-        chip = chips[chip_uid].chip
-        return (chip.inputs if is_input else chip.outputs)[index]
+        _, part_uid, is_input, index = ref
+        part = parts[part_uid].part
+        return (part.inputs if is_input else part.outputs)[index]
     return wires[ref[1]]
