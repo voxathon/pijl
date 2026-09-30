@@ -1,9 +1,10 @@
 """Round shapes drawn as one quad each, made round by the fragment shader.
 
-  Dot      pins and junctions: a filled circle.
+  Dot      pins: a filled circle.
   Segment  one straight piece of a wire, optionally with round caps at its ends.
            Caps go where a wire bends, so corners come out round without a
            separate joint shape (see views.Polyline).
+  WireDot  junctions: a Dot made of a zero-length Segment, so it draws with its wire.
 
 pyglet's Circle is a fan of triangles: to stay smooth at 8x zoom a pin needed
 48 segments, i.e. 144 vertices -- most of the vertices of a whole part, and
@@ -272,3 +273,31 @@ class Segment:
         if self._vlist is not None:
             self._vlist.delete()
             self._vlist = None
+
+
+class WireDot(Segment):
+    """A Dot drawn by the segment program: a zero-length segment with both caps.
+    Junction dots are these, so they draw in their wire's place in the stream
+    (a wire crossing over the junction covers the dot too) instead of in a layer
+    above every wire. Same interface as Dot."""
+
+    def __init__(self, x: float, y: float, radius: float, color: tuple, batch: pyglet.graphics.Batch,
+                 group: pyglet.graphics.Group | None = None) -> None:
+        super().__init__(2 * radius, color, batch, group)
+        self.position = (x, y)
+
+    @property
+    def position(self) -> Point:
+        return self._a
+
+    @position.setter
+    def position(self, xy: Point) -> None:
+        self.place(xy, xy, True, True)
+
+    @property
+    def color(self) -> tuple:
+        return self._ca
+
+    @color.setter
+    def color(self, value: tuple) -> None:
+        self.set_colors(value, value)

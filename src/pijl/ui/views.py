@@ -15,7 +15,7 @@ from pyglet import shapes
 
 from ..sim import Part, Pin, Wire
 from . import theme as T
-from .dots import Dot
+from .sdf_shapes import Dot, Segment, WireDot
 from .paint import Pair, Rgb, mix, sample, with_hue
 from .sdf_text import SDFText
 
@@ -37,7 +37,8 @@ class Layers:
 
 
 class _GradientLine(shapes.Line):
-    """A Line whose two ends can have different colors (the GPU blends between them)."""
+    """A Line whose two ends can have different colors (the GPU blends between them).
+    For screen-space bits (menu swatches); wires use sdf_shapes.Segment."""
 
     def __init__(self, *args, **kwargs) -> None:
         self._rgba2: tuple[int, int, int] | None = None  # end color; None: same as the start
@@ -66,8 +67,9 @@ GRADIENT_STEPS = 8  # pieces per stretch between two gradient stops (OKLab isn't
 
 
 class Polyline:
-    """Thick line through several points, with round joints so corners have no gaps.
-    One color, or a gradient along its length (set_gradient)."""
+    """Thick line through several points, rounded at the corners (the segments meeting
+    there have round caps) so they have no gaps. One color, or a gradient along its
+    length (set_gradient)."""
 
     def __init__(self, points: list[Point], color, batch: pyglet.graphics.Batch,
                  group: pyglet.graphics.Group, thickness: float = T.WIRE_THICKNESS) -> None:
@@ -75,15 +77,13 @@ class Polyline:
         self._color = color
         self._stops: list[tuple[float, tuple]] | None = None  # gradient: (fraction of the length, rgb)
         self._opacity: int | None = None  # None: whatever alpha the color carries
-        self.segments: list[_GradientLine] = []
-        self.joints: list[Dot] = []
+        self.segments: list[Segment] = []
         self.points: list[Point] = []
         # What the segments are laid out for, so a gradient that only changes colors
         # (a wire switching on / off) recolors them instead of laying them out again.
         self._layout_key: object = _STALE
         self._plain = True  # laid out for one color (no gradient, or nothing to spread it over)
         self._vfracs: list[float] = []  # fraction of the length at each segment vertex
-        self._corner_idx: list[int] = []  # which of those vertices are real corners (get a joint)
         self._colors: dict[tuple, list] = {}  # gradient stops -> color per vertex, for this layout
         self.set_points(points)
 
@@ -120,8 +120,6 @@ class Polyline:
                 colors = self._colors[k] = [_sample_rgb(stops, f) for f in self._vfracs]
         for seg, c0, c1 in zip(self.segments, colors, colors[1:]):
             seg.set_colors(c0, c1)
-        for joint, i in zip(self.joints, self._corner_idx):
-            joint.color = colors[i]
 
     def _lay_out(self) -> None:
         """Place segments along the points. A gradient splits them further: at every stop,
@@ -154,25 +152,18 @@ class Polyline:
                     corner_idx.append(len(verts))
                 verts.append(b)
                 vfracs.append(fracs[i + 1])
-        self._vfracs, self._corner_idx = vfracs, corner_idx
+        self._vfracs = vfracs
         self._plain = self._stops is None or total == 0
         n_seg = max(len(verts) - 1, 0)
         while len(self.segments) < n_seg:
-            self.segments.append(self._styled(_GradientLine(0, 0, 0, 0, thickness=self.thickness, color=self._color,
-                                                            batch=self.batch, group=self.group)))
+            self.segments.append(self._styled(Segment(self.thickness, self._color, self.batch, self.group)))
         while len(self.segments) > n_seg:
             self.segments.pop().delete()
-        for seg, (a, b) in zip(self.segments, zip(verts, verts[1:])):
-            seg.x, seg.y = a
-            seg.x2, seg.y2 = b
-        # round joints only at the real corners (pieces of one straight segment need none)
-        n_joint = len(corner_idx)
-        while len(self.joints) < n_joint:
-            self.joints.append(self._styled(Dot(0, 0, self.thickness / 2, self._color, self.batch, self.group)))
-        while len(self.joints) > n_joint:
-            self.joints.pop().delete()
-        for joint, i in zip(self.joints, corner_idx):
-            joint.position = verts[i]
+        # round caps only at the real corners (pieces of one straight segment need none, and the
+        # line's own ends stay square: they sit under a pin or junction dot, or on the cursor)
+        corners = set(corner_idx)
+        for k, (seg, a, b) in enumerate(zip(self.segments, verts, verts[1:])):
+            seg.place(a, b, k in corners, k + 1 in corners)
 
     @property
     def color(self):
@@ -188,8 +179,6 @@ class Polyline:
             return
         for s in self.segments:
             s.set_colors(value, value)
-        for j in self.joints:
-            j.color = value
 
     @property
     def opacity(self) -> int:
@@ -198,7 +187,7 @@ class Polyline:
     @opacity.setter
     def opacity(self, value: int) -> None:
         self._opacity = value
-        for shape in self.segments + self.joints:
+        for shape in self.segments:
             shape.opacity = value
 
     def _styled(self, shape):
@@ -213,10 +202,7 @@ class Polyline:
     def delete(self) -> None:
         for s in self.segments:
             s.delete()
-        for j in self.joints:
-            j.delete()
         self.segments.clear()
-        self.joints.clear()
 
 
 def _sample_rgb(stops: list[tuple[float, tuple]], f: float) -> tuple:
@@ -511,7 +497,8 @@ class WireView:
         self.line = Polyline(self.points, T.WIRE_OFF, batch, layers.wires)
         self.highlight: Polyline | None = None  # selection glow, only while selected
         # A dot on each end that attaches to another wire (a junction), like on schematics.
-        self.dots = {end: Dot(0, 0, T.JUNCTION_RADIUS, T.WIRE_OFF, batch, layers.pins)
+        # (In the wires layer, right after the line: a wire crossing the junction covers it.)
+        self.dots = {end: WireDot(0, 0, T.JUNCTION_RADIUS, T.WIRE_OFF, batch, layers.wires)
                      for end in ("src", "dst") if not isinstance(getattr(wire, end), Pin)}
         self._last_state: tuple[bool, bool] | None = None
         self._redraw()
