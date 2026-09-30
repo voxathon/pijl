@@ -487,7 +487,15 @@ class Editor(pyglet.window.Window):
         """HIT_SLOP_PX converted to world units, so clicking feels the same at any zoom."""
         return T.HIT_SLOP_PX / self.camera.zoom
 
+    @property
+    def pins_clickable(self) -> bool:
+        """Zoomed far out, pins are specks and their (screen-sized) reach would cover
+        the whole part: clicks go to parts instead, and wires can't be started or ended."""
+        return T.PIN_RADIUS * self.camera.zoom >= T.PIN_HIT_MIN_PX
+
     def pin_at(self, wx: float, wy: float) -> Pin | None:
+        if not self.pins_clickable:
+            return None
         for view in ordered(self.part_index.near(wx, wy, self.slop), newest_first=True):
             if self.mode is Mode.PLACING_PART and view in self.placing_views:
                 continue  # parts on the cursor aren't targets
@@ -496,8 +504,15 @@ class Editor(pyglet.window.Window):
         return None
 
     def part_at(self, wx: float, wy: float) -> PartView | None:
-        return next((v for v in ordered(self.part_index.near(wx, wy, 0), newest_first=True)
-                     if v.contains(wx, wy)), None)
+        hit = next((v for v in ordered(self.part_index.near(wx, wy, 0), newest_first=True)
+                    if v.contains(wx, wy)), None)
+        if hit is None and not self.pins_clickable:
+            # Zoomed far out parts are a few px big: the nearest within reach will do
+            # (only here, where pins don't claim the space around parts).
+            near = ((v.distance_to(wx, wy), -v.seq, v) for v in self.part_index.near(wx, wy, self.slop))
+            d, _, hit = min(near, default=(math.inf, 0, None))
+            hit = hit if d <= self.slop else None
+        return hit
 
     def wire_at(self, wx: float, wy: float) -> WireView | None:
         """The nearest wire within reach (the older one on a tie, e.g. right on a junction)."""

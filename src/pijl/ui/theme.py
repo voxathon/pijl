@@ -134,4 +134,5 @@ TITLE_SIZE, IO_TITLE_SIZE = 12, 10
 
 # Screen-space sizes
 HIT_SLOP_PX = 4  # how forgiving pin/wire clicks are, in screen pixels
+PIN_HIT_MIN_PX = 2.5  # pins smaller than this (radius on screen, ~42% zoom) can't be clicked: parts can
 DRAG_THRESHOLD_PX = 4  # mouse must move this far before a press becomes a drag

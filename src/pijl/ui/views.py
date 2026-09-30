@@ -535,6 +535,12 @@ class PartView:
     def contains(self, wx: float, wy: float) -> bool:
         return self.x <= wx <= self.x + self.w and self.y <= wy <= self.y + self.h
 
+    def distance_to(self, wx: float, wy: float) -> float:
+        """From the body's edge (0 inside)."""
+        dx = max(self.x - wx, 0.0, wx - self.x - self.w)
+        dy = max(self.y - wy, 0.0, wy - self.y - self.h)
+        return math.hypot(dx, dy)
+
     def pin_at(self, wx: float, wy: float, slop: float) -> Pin | None:
         r = T.PIN_RADIUS + slop
         for pin in self.part.pins:
