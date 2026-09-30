@@ -204,6 +204,9 @@ class Widget:
         if (
             self.what == "part"
         ):  # greyed out while it can't be placed (see PartPicker.disabled)
+            name = self.p.name_of(self.row.part)  # (a macro can be renamed)
+            if self.name.text != name:
+                self.name.text = name
             color = T.PICKER_DIM_TEXT if self.p.disabled(self.row.part) else T.PART_TEXT
             if tuple(self.name.color) != tuple(color):
                 self.name.color = color

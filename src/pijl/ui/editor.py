@@ -61,7 +61,8 @@ Controls
                            it out along the last doubling, Ctrl+Shift+scroll the other way.
                            See duplicate.py.
   Ctrl+S                   save the board as a macro: asks for a name, prefilled with the
-                           current one (Enter keeps it; type another to save a copy)
+                           current one (Enter keeps it; type another to save a copy;
+                           Shift+Enter renames it instead)
   Ctrl+O                   open a macro: type to filter, arrows + Enter (or click); saved macros
                            are also in the picker's MACROS section: right-click -> Open
                            (or Rename..., which changes only its title: boards using it
@@ -1908,25 +1909,34 @@ class Editor(pyglet.window.Window):
             except ValueError as e:
                 p.set_hint(str(e), danger=True)
                 return
-            taken = self.store.find(title)
-            if taken is not None and taken != id:
-                p.set_hint(f"{self._title(taken)} already exists", danger=True)
+            if self._title_taken(p, id, title):
                 return
             self._close_prompt()
-            if title == old:
-                return
-            if self._retitle([(id, title)]):
-                self.catalog.book.forget()
-                self._rebuild_macros([id])
-                self.library.sync(self._library_entries())
-                self.lib_history.record(
-                    self.library.to_dict(), retitled=[(id, old, title)]
-                )
-                self.history.redo_stack.clear()  # (see _record_touched)
-                self.picker.refresh()
-                self._notice(f"renamed {old} to {title}")
+            self._rename_macro(id, title)
 
         self._open_prompt(p, enter)
+
+    def _title_taken(self, p: Prompt, id: str, title: str) -> bool:
+        """Is `title` another macro's than `id`'s? (Says so in the prompt if it is.)"""
+        taken = self.store.find(title)
+        if taken is not None and taken != id:
+            p.set_hint(f"{self._title(taken)} already exists", danger=True)
+            return True
+        return False
+
+    def _rename_macro(self, id: str, title: str) -> None:
+        """Give macro `id` the (free, checked) title `title`, as an undo step."""
+        old = self._title(id)
+        if title == old:
+            return
+        if self._retitle([(id, title)]):
+            self.catalog.book.forget()
+            self._rebuild_macros([id])
+            self.library.sync(self._library_entries())
+            self.lib_history.record(self.library.to_dict(), retitled=[(id, old, title)])
+            self.history.redo_stack.clear()  # (see _record_touched)
+            self.picker.refresh()
+            self._notice(f"renamed {old} to {title}")
 
     def _retitle(self, titles: list[tuple[str, str]]) -> list[str]:
         """Give macros (id, title) those titles. Returns the ids that took it; the others
@@ -2690,15 +2700,36 @@ class Editor(pyglet.window.Window):
             "Save macro as",
             text=self.doc_title or "",
             max_len=NAME_MAX,
-            hint="Enter: save   Esc: cancel",
+            hint="Enter: save   Shift+Enter: rename   Esc: cancel"
+            if self.doc is not None
+            else "Enter: save   Esc: cancel",
         )
         confirmed = [None]  # the existing title the user already agreed to overwrite
+        renaming = [None]  # the title Shift+Enter offered to rename this macro to
 
         def enter(p: Prompt) -> None:
             try:
                 title = check_name(p.text)
             except ValueError as e:
                 p.set_hint(str(e), danger=True)
+                return
+            # Shift+Enter: rename this macro instead (only its title: the board isn't
+            # saved). Asks first; Enter again (with the same title) does it.
+            if self.doc is not None and (self._shift() or renaming[0] == title):
+                if self._title_taken(p, self.doc, title):
+                    return
+                if title == self.doc_title:
+                    self._close_prompt()  # nothing to rename
+                    return
+                if renaming[0] != title:
+                    renaming[0] = title
+                    p.set_hint(
+                        f"Enter again to rename {self.doc_title} to {title}"
+                        + (" (unsaved changes stay unsaved)" if self.dirty else "")
+                    )
+                    return
+                self._close_prompt()
+                self._rename_macro(self.doc, title)
                 return
             existing = self.store.find(title)  # (its id)
             mine = existing is not None and existing == self.doc
