@@ -1,12 +1,12 @@
 """The part-script contract: what a part script provides, and what the engine promises it.
 
 A part script is a .py file in a project's parts folder (see registry.py for how
-they're found). It declares `API = 1` and a `register(reg)` function that calls
+they're found). It declares `API = 2` and a `register(reg)` function that calls
 `reg.add(...)` with PartTypes -- as many as it likes:
 
     from pijl.parts import part
 
-    API = 1
+    API = 2
 
     def register(reg):
         reg.add(part("NAND", ins=("a", "b"), outs=("out",), eval=lambda a, b: ~(a & b)))
@@ -16,10 +16,16 @@ and overrides whichever hooks it needs; every hook is optional.
 
 What the engine promises:
   - eval runs once per kind per step, on arrays: element i of every input array
-    (and of the result) belongs to ctx.parts[i]. Inputs are numpy bool arrays, so
-    use & | ^ ~, not `and`/`or`/`not`. Return a tuple with one value per output
-    pin (just the value if there's one pin); each value is an array or list with
-    one entry per instance, or a scalar, which is copied to every instance.
+    (and of the result) belongs to ctx.parts[i]. Inputs are pijl.logic.Logic
+    arrays: four-state values (0, 1, X, Z) whose & | ^ ~ do four-state logic, so
+    use those, not `and`/`or`/`not`. Return a tuple with one value per output
+    pin (just the value if there's one pin); each value is a Logic array, a
+    Level (X, Z, ...), a bool, or an array or list of those with one entry per
+    instance. Scalars are copied to every instance. Plain bools mean 0 / 1;
+    return Z to not drive the net (a tri-state output).
+  - API 1 scripts (written before four-state logic) still load: they get plain
+    bool arrays (X and Z read as 0), and if a pure one has any input that isn't
+    a known 0 or 1, all its outputs are X.
   - Every hook runs on the main thread. Start your own threads if you need them;
     just don't touch the UI from them.
   - A hook that raises disables its kind (in that circuit) and reports the error.
@@ -39,7 +45,8 @@ from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     from ..sim.circuit import Part
 
-API = 1  # bump when this contract changes in a way old scripts can't follow
+API = 2  # bump when this contract changes in a way old scripts can't follow
+SUPPORTED_APIS = (1, 2)  # what the loader still accepts (see _evaluate in sim/circuit.py)
 
 LABEL_SIDES = ("below", "left", "right")
 
@@ -66,6 +73,9 @@ class PartType:
     category: str = ""               # default collection in the part picker ("" = loose)
     look: Look = Look()
     port: str | None = None          # "in" / "out": macro ports. Engine-only, see ports.py
+    weak: tuple[str, ...] = ()       # outputs that only drive a net nobody else drives (pulls).
+                                     # Of those on a net, the highest props["priority"] wins
+    api: int = API                   # the API its script was written for (set by the loader)
 
     def eval(self, ctx: Ctx, *ins):
         """Every step: input arrays in, output arrays (or scalars) out."""

@@ -4,8 +4,9 @@ Loading a folder:
   - every .py file under it is imported, recursively, in path order; files and
     folders whose name starts with "_" are private (helpers) and not imported
     directly -- scripts can still import them, relative imports included
-  - a script that defines `register` is a part script: its `API` must match and
-    `register(reg)` is called; a script without `register` is just a helper
+  - a script that defines `register` is a part script: its `API` must be one this
+    pijl supports (see SUPPORTED_APIS) and `register(reg)` is called; a script
+    without `register` is just a helper
   - the folder becomes a package under a unique made-up name, so two folders
     that both have a utils.py don't collide
   - a script that fails in any way (import error, wrong API, a bad or duplicate
@@ -24,7 +25,7 @@ import sys
 import traceback
 from pathlib import Path
 
-from .contract import API, LABEL_SIDES, Look, PartType
+from .contract import API, LABEL_SIDES, SUPPORTED_APIS, Look, PartType
 from .ports import PORTS
 
 _package_ids = itertools.count(1)
@@ -69,9 +70,11 @@ class Registry:
         taken = set(self.types) | {p.kind for p in self._pending or ()}
         if name in taken:
             raise ValueError(f"{name}: there already is a part with that name")
-        t.ins, t.outs = tuple(t.ins), tuple(t.outs)
+        t.ins, t.outs, t.weak = tuple(t.ins), tuple(t.outs), tuple(t.weak)
         if not all(isinstance(p, str) for p in t.ins + t.outs):
             raise TypeError(f"{name}: pin names must be strings")
+        if not set(t.weak) <= set(t.outs):
+            raise ValueError(f"{name}: weak pins must be outputs")
         if t.port is not None and not engine:
             raise ValueError(f"{name}: only the engine defines ports (IN/OUT)")
         if t.pure and not t.outs:
@@ -113,10 +116,12 @@ class Registry:
             register = getattr(module, "register", None)
             if register is None:
                 return  # a helper
-            if getattr(module, "API", None) != API:
-                raise ValueError(f"API = {getattr(module, 'API', None)!r}, this pijl has API = {API}")
+            api = getattr(module, "API", None)
+            if api not in SUPPORTED_APIS:
+                raise ValueError(f"API = {api!r}, this pijl has API = {API}")
             register(self)
             for t in self._pending:
+                t.api = api
                 self.types[t.kind] = t
         except Exception:
             detail = traceback.format_exc(limit=-1).strip().splitlines()[-1]

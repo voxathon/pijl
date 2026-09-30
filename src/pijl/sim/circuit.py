@@ -5,12 +5,17 @@ Model:
     (see pijl.parts): the circuit only knows the contract, never specific kinds.
   - A Wire joins two endpoints. An endpoint is a Pin, or another Wire (a
     junction / branch: "attached somewhere along that wire").
+  - Values are four-state: 0, 1, X (unknown) and Z (not driven); see pijl.logic.
   - Everything joined by wires forms a *net*. A net's output pins drive it,
     its input pins read it:
-        no drivers        -> reads 0   (future Z: floating)
-        drivers agree     -> that value
-        drivers disagree  -> CONFLICT: reads 0 for now, flagged so the UI can
-                             show it (future X). See Circuit.step.
+        no drivers        -> Z (floating; a gate reads it as X)
+        drivers agree     -> that value (Z drivers don't count)
+        drivers disagree  -> X, and flagged as a conflict so the UI can show it
+    Weak outputs (PartType.weak: pull-ups, pull-downs) only count when the strong
+    drivers leave the net at Z. Of those, only the ones with the highest
+    props["priority"] on the net count; if they disagree, that's a conflict too.
+  - New parts power up with their outputs at X (parts without an eval, like the
+    IN switch, at 0) -- or, with settling (below), at random 0s and 1s.
   - Circuit.step() advances time by one tick: every part computes its outputs
     from its *current* inputs, then every net carries its value to its readers.
     So each gate costs one tick of delay, and feedback loops (latches) work
@@ -23,19 +28,22 @@ Model:
     on the board), recursively. Its pins are joined straight into the nets of the
     body's IN / OUT ports, so the inside and outside of a macro are one net: no
     delay at the boundary, and wrapping something in a macro can't change timing.
-  - Settling (`settle_ticks`): new parts are a little random for a while. For its
-    first ticks, each part only takes its newly computed outputs about half the
-    time. Without it, anything symmetric that appears all at once -- a latch
-    being opened, pasted or placed inside a macro -- flips between both of its
-    unstable states forever, since in a one-tick-per-gate world nothing ever
-    breaks the tie. Real hardware settles on noise; this is the noise. Seeded,
-    so the same actions give the same results. Off (0) unless asked for.
+  - Settling (`settle_ticks`): new parts are a little random for a while. A part
+    powers up (opens) with random 0s and 1s on its outputs, and for its first
+    ticks it only takes its newly computed outputs about half the time. Without
+    it, a latch that appears all at once -- opened, pasted or placed inside a
+    macro -- stays X forever (nothing ever tells it which way to fall), and a
+    symmetric one started at 0s and 1s flips between both unstable states
+    forever. Real hardware settles on noise; this is the noise. Only the power-on
+    value is random: an X with a real cause (a floating input, a fight) stays X
+    and doesn't flicker. Seeded, so the same actions give the same results. Off
+    (0) unless asked for.
 
-Speed: every pin's state lives in one numpy array (Pin.state reads and writes its
-slot), so a step is array work, not a loop over pins. Each part kind keeps index
-arrays of its instances' input and output pins; nets are index arrays of their
-drivers (sorted by net, reduced with min / max) and of their readers. Wires have
-slots too, with their ends kept in arrays as wiring changes, so finding the nets
+Speed: every pin's state lives in one numpy array of logic codes (Pin.state reads
+and writes its slot), so a step is array work, not a loop over pins. Each part kind
+keeps index arrays of its instances' input and output pins; nets are index arrays of
+their drivers (a net with one just copies it; the rest are sorted by net and
+OR-reduced, see logic.resolve) and of their readers. Wires have slots too, with their ends kept in arrays as wiring changes, so finding the nets
 again (scipy's connected components) doesn't loop over wires in Python either.
 What changed for the UI (take_changes) is a diff of the state arrays against what
 it was shown last.
@@ -53,29 +61,34 @@ import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
+from ..logic import CODE, ONE, X, Z, ZERO, Level, Logic, codes, fights, resolve
 from ..parts import Ctx, PartType, Registry, builtin_registry, fresh_props
 
 _FAILED = object()  # what Circuit._guard returns when the hook raised
 
 
 class _PinStates:
-    """Every pin of a circuit, by slot: its state, and whether it reads its net."""
+    """Every pin of a circuit, by slot: its state (a logic code), whether it reads its
+    net, and whether it's a weak driver."""
 
     def __init__(self) -> None:
-        self.states = np.zeros(1024, bool)
+        self.states = np.zeros(1024, CODE)
         self.reader = np.zeros(1024, bool)  # an input or a pass-through pin: reads its net, never drives
         self.alive = np.zeros(1024, bool)   # its part is still in the circuit
+        self.weak = np.zeros(1024, bool)    # a weak output (see PartType.weak)
         self.pins: list[Pin] = []
 
-    def add(self, pin: Pin) -> int:
+    def add(self, pin: Pin, initial: Level, weak: bool) -> int:
         slot = len(self.pins)
         if slot == len(self.states):
-            for name in ("states", "reader", "alive"):
+            for name in ("states", "reader", "alive", "weak"):
                 old = getattr(self, name)
-                setattr(self, name, np.concatenate((old, np.zeros(len(old), bool))))
+                setattr(self, name, np.concatenate((old, np.zeros_like(old))))
         self.pins.append(pin)
+        self.states[slot] = initial
         self.reader[slot] = pin.is_input
         self.alive[slot] = True
+        self.weak[slot] = weak
         return slot
 
 
@@ -109,19 +122,21 @@ class _WireSlots:
 class Pin:
     __slots__ = ("part", "index", "is_input", "slot", "_passive", "_store")
 
-    def __init__(self, part: Part, index: int, is_input: bool, store: _PinStates) -> None:
+    def __init__(self, part: Part, index: int, is_input: bool, store: _PinStates,
+                 initial: Level = Z, weak: bool = False) -> None:
         self.part, self.index, self.is_input = part, index, is_input
         self._passive = False
         self._store = store
-        self.slot = store.add(self)
+        self.slot = store.add(self, initial, weak)
 
     @property
-    def state(self) -> bool:
-        return bool(self._store.states[self.slot])
+    def state(self) -> Level:
+        return Level(int(self._store.states[self.slot]))
 
     @state.setter
-    def state(self, value: bool) -> None:
-        self._store.states[self.slot] = value
+    def state(self, value) -> None:
+        """A Level, or a bool / 0 / 1."""
+        self._store.states[self.slot] = codes(value)
 
     @property
     def passive(self) -> bool:
@@ -136,7 +151,7 @@ class Pin:
 
     def __repr__(self) -> str:
         side = "in" if self.is_input else "out"
-        return f"<Pin {self.part.kind}.{side}{self.index}={int(self.state)}>"
+        return f"<Pin {self.part.kind}.{side}{self.index}={self.state}>"
 
 
 @dataclass(eq=False)
@@ -218,14 +233,20 @@ class Circuit:
         self._next_wire_uid = 1
         # Nets are derived from the wiring and cached until the wiring changes.
         self._nets_dirty = True
-        self._drivers = np.empty(0, np.intp)   # driver pin slots, grouped by net
-        self._driven = np.empty(0, np.intp)    # the nets that have drivers, ascending ...
+        # Driver pin slots. Nets with one driver just copy it; the others are reduced.
+        self._solo = np.empty(0, np.intp)      # the only driver of its net ...
+        self._solo_net = np.empty(0, np.intp)  # ... and that net
+        self._drivers = np.empty(0, np.intp)   # drivers of nets with several, grouped by net
+        self._driven = np.empty(0, np.intp)    # those nets, ascending ...
         self._drv_starts = np.empty(0, np.intp)  # ... and where each one's drivers start
         self._readers = np.empty(0, np.intp)   # reader pin slots ...
         self._reader_net = np.empty(0, np.intp)  # ... and their nets
+        self._weak = np.empty(0, np.intp)      # the weak drivers that count (top priority), by net ...
+        self._weak_nets = np.empty(0, np.intp)  # ... the nets that have some ...
+        self._weak_starts = np.empty(0, np.intp)  # ... and where each one's start
         self._wire_net = np.zeros(0, np.intp)  # per wire slot: its net (-1: gone)
-        self.net_value = np.zeros(0, bool)
-        self.net_conflict = np.zeros(0, bool)
+        self.net_value = np.zeros(0, CODE)     # logic codes (see pijl.logic)
+        self.net_conflict = np.zeros(0, bool)  # drivers fighting: one says 0, another 1
         # What the UI was shown last (take_changes), to tell it what changed since.
         self._changed_all = True
         self._shown = np.zeros(0, bool)
@@ -265,7 +286,9 @@ class Circuit:
         if part.slot == len(self._settle):
             self._settle = np.concatenate((self._settle, np.zeros(len(self._settle), np.int32)))
         part.inputs = [Pin(part, i, True, self._pins) for i in range(len(t.ins))]
-        part.outputs = [Pin(part, i, False, self._pins) for i in range(len(t.outs))]
+        power_on = X if t.has("eval") else ZERO  # (the IN switch starts off)
+        part.outputs = [Pin(part, i, False, self._pins, power_on, name in t.weak)
+                        for i, name in enumerate(t.outs)]
         if getattr(t, "body", None) is not None:
             self._expand(part)
         self._kinds_dirty = self._batches_dirty = self._nets_dirty = True
@@ -324,6 +347,9 @@ class Circuit:
             if self.settle_ticks:
                 self._settle[p.slot] = self.settle_ticks
                 self._settling += 1
+                if p.outputs and p.type.has("eval"):  # power-on noise
+                    slots = [pin.slot for pin in p.outputs]
+                    self._pins.states[slots] = self.rng.integers(ZERO, ONE + 1, len(slots), dtype=CODE)
             t = p.type
             if t.has("open") and t.kind not in self.faults:
                 self._guard(t, "open", lambda: t.open(p))
@@ -382,6 +408,12 @@ class Circuit:
             self.hidden_wires = [w for w in self.hidden_wires if w not in dead_wires]
         self._nets_dirty = self._kinds_dirty = self._batches_dirty = True
         return removed
+
+    def props_changed(self, part: Part) -> None:
+        """Call after changing a board part's props: some of them (a pull's priority)
+        decide how its nets resolve."""
+        if part.type.weak:
+            self._nets_dirty = True
 
     def can_connect(self, a: Endpoint, b: Endpoint) -> bool:
         if a is b:
@@ -546,27 +578,39 @@ class Circuit:
 
         in_net = member[:n_pins]
         reader = store.reader[:n_pins]
-        drivers = np.flatnonzero(in_net & ~reader)
-        order = np.argsort(net_of[drivers], kind="stable")
-        self._drivers = drivers[order]
-        driver_net = net_of[self._drivers]
-        self._driven, self._drv_starts = np.unique(driver_net, return_index=True)
+        weak = store.weak[:n_pins]
+        drivers, driven, starts = _grouped(np.flatnonzero(in_net & ~reader & ~weak), net_of)
+        counts = np.diff(np.append(starts, len(drivers)))  # drivers per driven net
+        solo = counts == 1
+        self._solo, self._solo_net = drivers[starts[solo]], driven[solo]
+        self._drivers, self._driven, self._drv_starts = _grouped(drivers[np.repeat(~solo, counts)], net_of)
         self._readers = np.flatnonzero(in_net & reader)
         self._reader_net = net_of[self._readers]
-        store.states[:n_pins][store.alive[:n_pins] & reader & ~in_net] = False  # unconnected: reads 0
+        store.states[:n_pins][store.alive[:n_pins] & reader & ~in_net] = Z  # unconnected: floating
+
+        # Weak drivers: only the highest priority ones on each net count. Priorities only
+        # change by editing (props_changed), so they're settled here, not every step.
+        pulls = np.flatnonzero(in_net & weak)
+        if pulls.size:
+            prio = np.array([_priority(store.pins[i].part) for i in pulls.tolist()], np.int64)
+            top = np.full(n_nets, np.iinfo(np.int64).min)
+            np.maximum.at(top, net_of[pulls], prio)
+            pulls = pulls[prio == top[net_of[pulls]]]
+        self._weak, self._weak_nets, self._weak_starts = _grouped(pulls, net_of)
 
         self._wire_net = net_of[n_pins:]
-        self.net_value = np.zeros(n_nets, bool)
+        self.net_value = np.zeros(n_nets, CODE)
         self.net_conflict = np.zeros(n_nets, bool)
         self._nets_dirty = False
         self._changed_all = True  # net numbers mean something else now; pins were reset
+        self._carry()  # readers see their (new) nets now, not a tick later with stale values
 
-    def wire_state(self, wire: Wire) -> tuple[bool, bool]:
+    def wire_state(self, wire: Wire) -> tuple[Level, bool]:
         """(value, conflict) of the net this wire belongs to, as of the last step."""
         if self._nets_dirty:
             self._rebuild_nets()
         i = self._wire_net[wire.slot]
-        return bool(self.net_value[i]), bool(self.net_conflict[i])
+        return Level(int(self.net_value[i])), bool(self.net_conflict[i])
 
     def take_changes(self) -> tuple[bool, set[Part], list[Wire]]:
         """What changed since the last call: (everything?, parts whose pins changed,
@@ -607,9 +651,8 @@ class Circuit:
             t = batch.type
             if t.kind in self.faults:
                 continue
-            ins = [states[idx] for idx in batch.ins]
             ctx = Ctx(batch.parts, self.tick, now)
-            outs = self._guard(t, "eval", lambda: _outputs(t, t.eval(ctx, *ins), len(batch.parts)))
+            outs = self._guard(t, "eval", lambda: _evaluate(t, ctx, [states[idx] for idx in batch.ins]))
             if outs is not _FAILED:
                 results.append((batch, outs))
         for batch, outs in results:
@@ -622,23 +665,33 @@ class Circuit:
                     states[idx] = values
 
         # Phase 2: every net resolves its drivers and hands the value to its readers.
-        # No drivers: 0 (future: Z). Drivers disagree: a conflict, which reads 0 until
-        # 4-state logic (X). So the value is the drivers' minimum, and a conflict is
-        # minimum != maximum.
-        value = np.zeros(len(self.net_value), bool)
-        conflict = np.zeros(len(self.net_value), bool)
-        if self._drivers.size:
-            d = states[self._drivers]
-            low = np.minimum.reduceat(d, self._drv_starts)
-            value[self._driven] = low
-            conflict[self._driven] = low != np.maximum.reduceat(d, self._drv_starts)
-        self.net_value, self.net_conflict = value, conflict
-        states[self._readers] = value[self._reader_net]
+        self._carry()
         self.tick += 1
         if self._settling:
             s = self._settle[:self._n_part_slots]
             s[s > 0] -= 1
             self._settling = int(np.count_nonzero(s))
+
+    def _carry(self) -> None:
+        """Resolve every net from its drivers and hand the value to its readers. The
+        value is the OR of the drivers' codes (logic.resolve): none or only Z -> Z,
+        disagreeing -> X. Nets the strong drivers leave at Z go to their pulls."""
+        states = self._pins.states
+        value = np.zeros(len(self.net_value), CODE)
+        conflict = np.zeros(len(self.net_value), bool)
+        value[self._solo_net] = states[self._solo]
+        if self._drivers.size:
+            d = states[self._drivers]
+            value[self._driven] = resolve(d, self._drv_starts)
+            conflict[self._driven] = fights(d, self._drv_starts)
+        if self._weak.size:
+            w = states[self._weak]
+            nets = self._weak_nets
+            free = value[nets] == Z
+            value[nets[free]] = resolve(w, self._weak_starts)[free]
+            conflict[nets[free]] = fights(w, self._weak_starts)[free]
+        self.net_value, self.net_conflict = value, conflict
+        states[self._readers] = value[self._reader_net]
 
     def frame(self) -> None:
         """Once per frame (not per step): the frame hook of every live part that has one."""
@@ -680,7 +733,7 @@ class Circuit:
 
     def _guard(self, t: PartType, hook: str, fn: Callable[[], Any]) -> Any:
         """Run one of t's hooks. If it raises, t is disabled in this circuit (its
-        outputs drop to 0 and its hooks stop being called) and the error is kept."""
+        outputs go X and its hooks stop being called) and the error is kept."""
         try:
             return fn()
         except Exception:
@@ -691,7 +744,7 @@ class Circuit:
                 self._changed_all = True
                 for part in self._by_kind().get(t, ()):
                     for pin in part.outputs:
-                        pin.state = False
+                        pin.state = X
             return _FAILED
 
 
@@ -710,8 +763,40 @@ def _by_uid(wires) -> list[Wire]:
     return sorted(wires, key=lambda w: w.uid)
 
 
+def _grouped(slots: np.ndarray, net_of: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Pin slots sorted by net, plus the nets (ascending) and where each one's pins start:
+    the shape logic.resolve takes."""
+    slots = slots[np.argsort(net_of[slots], kind="stable")]
+    nets, starts = np.unique(net_of[slots], return_index=True)
+    return slots, nets, starts
+
+
+def _priority(part: Part) -> int:
+    try:
+        return int(part.props.get("priority", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _evaluate(t: PartType, ctx: Ctx, ins: list[np.ndarray]) -> list[np.ndarray]:
+    """Run t.eval on the input codes; the output codes, one array of ctx.n per pin.
+
+    API 2 scripts get Logic arrays. API 1 scripts were written for plain bools, so
+    they get bools (X and Z read as 0), and a pure one's outputs are X wherever any
+    of its inputs isn't a known 0 or 1: it can't know what its function does with X.
+    """
+    if t.api >= 2:
+        return _outputs(t, t.eval(ctx, *(Logic.of_codes(c) for c in ins)), ctx.n)
+    outs = _outputs(t, t.eval(ctx, *(c == ONE for c in ins)), ctx.n)
+    if t.pure and ins:
+        unknown = np.logical_or.reduce([(c != ZERO) & (c != ONE) for c in ins])
+        if unknown.any():
+            outs = [np.where(unknown, CODE(X), o) for o in outs]
+    return outs
+
+
 def _outputs(t: PartType, raw: Any, n: int) -> list[np.ndarray]:
-    """Normalize what eval returned: one bool array of n per output pin."""
+    """Normalize what eval returned: one array of n logic codes per output pin."""
     k = len(t.outs)
     if k == 0:
         return []
@@ -719,4 +804,4 @@ def _outputs(t: PartType, raw: Any, n: int) -> list[np.ndarray]:
         raw = (raw,)  # one output: anything but a 1-tuple is its value (a scalar, list or array)
     if not isinstance(raw, tuple) or len(raw) != k:
         raise ValueError(f"eval returned {raw!r}; expected {k} output value(s)")
-    return [np.broadcast_to(np.asarray(v).astype(bool), (n,)) for v in raw]
+    return [np.broadcast_to(codes(v), (n,)) for v in raw]

@@ -21,7 +21,8 @@ from ..sim import Part, Pin, Wire
 from . import theme as T
 from .canvas import Canvas
 from .paint import Pair, Rgb, sample, with_hue
-from .sdf_shapes import DOT, RECT, SEGMENT, Dot, Rect, Segment, WireDot, _rgba
+from .sdf_shapes import (DOT, RECT, SEGMENT, SHOW_BY_CODE, SHOW_OFF, Dot, Rect, Segment, WireDot, _rgba,
+                         show)
 from .sdf_text import SDFLabel, SDFText
 from .spatial import SpatialIndex, polyline_boxes
 
@@ -123,7 +124,8 @@ GRADIENT_STEPS = 8  # pieces per stretch between two gradient stops (OKLab isn't
 class Polyline:
     """Thick line through several points, rounded at the corners (the segments meeting
     there have round caps) so they have no gaps. One color, or a gradient along its
-    length (set_gradient). Colors are (off, on) pairs; `state` picks which one shows."""
+    length (set_gradient). Colors are (off, on) pairs; `state` picks which one shows
+    (or a pattern: X, Z, a conflict; see sdf_shapes.show)."""
 
     def __init__(self, points: list[Point], color, canvas: Canvas,
                  group: pyglet.graphics.Group, thickness: float = T.WIRE_THICKNESS) -> None:
@@ -136,7 +138,7 @@ class Polyline:
         self.buf = canvas.buffer(SEGMENT, group)
         self._pair: Pair = (color, color)
         self._stops: list[tuple[float, Pair]] | None = None  # gradient: (fraction of the length, pair)
-        self._on = False
+        self._on = SHOW_OFF  # the segments' state byte
         self._opacity = 255
         self._lift = 0.0
         self.segments: list[Segment] = []
@@ -254,14 +256,16 @@ class Polyline:
             s.set_colors(off, off, on, on)
 
     @property
-    def state(self) -> bool:
+    def state(self) -> int:
         return self._on
 
     @state.setter
-    def state(self, on: bool) -> None:
-        if on != self._on:
-            self._on = on
-            self._write_flag(0, 255 if on else 0)
+    def state(self, value) -> None:
+        """A SHOW_* byte, a Level or a bool."""
+        v = value if type(value) is int else show(value)
+        if v != self._on:
+            self._on = v
+            self._write_flag(0, v)
 
     @property
     def opacity(self) -> int:
@@ -573,8 +577,8 @@ class PartView:
         if state == self._last_state:
             return
         self._last_state = state
-        for dot, on in zip(self.pin_dots, state):
-            dot.state = on
+        for dot, level in zip(self.pin_dots, state):
+            dot.state = level
         if self.look.lit and state:  # body color follows the first pin (switches, LEDs)
             self.body.state = state[0]
 
@@ -640,8 +644,7 @@ class WireView:
         # A dot on each end that attaches to another wire (a junction), like on schematics.
         # (In the wires layer, right after the line: a wire crossing the junction covers it.)
         self.dots: dict[str, WireDot] = {}
-        self._last_state: tuple[bool, bool] | None = None
-        self._conflict = False
+        self._last_state: tuple | None = None
         self.lifted = False  # see set_lifted
 
     @property
@@ -710,24 +713,21 @@ class WireView:
         """Is the whole wire within the world-space rectangle (x0, y0)-(x1, y1)?"""
         return all(x0 <= x <= x1 and y0 <= y <= y1 for x, y in self.points)
 
-    def sync(self, state: tuple[bool, bool]) -> None:
+    def sync(self, state: tuple) -> None:
         """`state` is the net's (value, conflict), from Circuit.wire_state."""
         if state == self._last_state:
             return
         self._last_state = state
-        on, conflict = state
-        if conflict != self._conflict:
-            self._conflict = conflict
-            self._recolor()
-        self.line.state = on
+        b = show(*state)  # 0 / 1: its colors; X, Z, a conflict: their patterns
+        self.line.state = b
         for dot in self.dots.values():
-            dot.state = on
+            dot.state = b
 
     def _recolor(self) -> None:
-        """Both colors of the line and dots: amber on a conflict, else the gradient,
-        else the classic grey / red."""
-        if self._conflict or not self.stops:
-            pair = (T.WIRE_CONFLICT, T.WIRE_CONFLICT) if self._conflict else (T.WIRE_OFF, T.WIRE_ON)
+        """Both colors of the line and dots: the gradient, else the classic grey / red.
+        (X, Z and conflicts are patterns the state picks, whatever these are.)"""
+        if not self.stops:
+            pair = (T.WIRE_OFF, T.WIRE_ON)
             self.line.set_pair(pair)
             for dot in self.dots.values():
                 dot.set_pair(*pair)
@@ -815,7 +815,7 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
         _, row, lit = looks[id(v.look)]
         rows.append((v.x, v.y, v.w, v.h))
         colors.append(row)
-        on.append(255 if lit and state and state[0] else 0)
+        on.append(SHOW_BY_CODE[state[0]] if lit and state else SHOW_OFF)
     buf = canvas.buffer(RECT, layers.bodies)
     slots = buf.alloc_many(len(views))
     f = buf.f
@@ -841,7 +841,7 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
         f["color"][slots] = _rgba(T.PIN_OFF)
         f["color_on"][slots] = _rgba(with_hue(T.PIN_ON, None))
         f["flags"][slots] = 0, 255, 0, 0
-        f["flags"][slots, 0] = np.array(on_flat, np.uint8) * 255
+        f["flags"][slots, 0] = SHOW_BY_CODE[np.array(on_flat, np.intp)]
         f["lift"][slots] = 0.0
         buf.mark_many(slots)
     dots = Dot.adopt(buf, slots.tolist())
@@ -965,7 +965,7 @@ def _make_wire_shapes(views: list[WireView]) -> None:
         line.points = list(pts)
         line._pair = (T.WIRE_OFF, T.WIRE_ON)
         line._layout_key, line._plain, line._vfracs = None, True, [0.0] * len(pts)
-        v._last_state = (False, False)
+        v._last_state = None  # (drawn off: the first sync shows what's really there)
     _index_many([(v, polyline_boxes(v.points)) for v in views])
     Touched.wire_many(v.wire.uid for v in views)
 

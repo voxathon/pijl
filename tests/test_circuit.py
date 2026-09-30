@@ -1,3 +1,4 @@
+from pijl.logic import ONE, X, Z, ZERO, Level
 from pijl.sim import Circuit
 
 
@@ -16,7 +17,7 @@ def test_nand_truth_table():
         for vb in (False, True):
             a.outputs[0].state, b.outputs[0].state = va, vb
             settle(c)
-            assert out.inputs[0].state == (not (va and vb))
+            assert out.inputs[0].state is Level(ZERO + (not (va and vb)))
 
 
 def test_invalid_connections_rejected():
@@ -62,18 +63,21 @@ def test_sr_latch_from_nands_holds_state():
     c.connect(n2.outputs[0], n1.inputs[1])
     q = n1.outputs[0]
 
+    s.outputs[0].state, r.outputs[0].state = True, True  # hold, fresh: nothing says which way
+    settle(c)
+    assert q.state is X
     s.outputs[0].state, r.outputs[0].state = False, True  # set
     settle(c)
-    assert q.state is True
+    assert q.state is ONE
     s.outputs[0].state = True  # release: hold
     settle(c)
-    assert q.state is True
+    assert q.state is ONE
     r.outputs[0].state = False  # reset
     settle(c)
-    assert q.state is False
+    assert q.state is ZERO
     r.outputs[0].state = True  # release: hold
     settle(c)
-    assert q.state is False
+    assert q.state is ZERO
 
 
 # ---- junctions / nets ------------------------------------------------------
@@ -87,8 +91,8 @@ def test_branch_fans_out_one_driver():
     assert branch.src is trunk and branch.dst is n2.inputs[0]
     a.outputs[0].state = True
     settle(c)
-    assert n1.inputs[0].state and n2.inputs[0].state
-    assert c.wire_state(branch) == (True, False)
+    assert n1.inputs[0].state is n2.inputs[0].state is ONE
+    assert c.wire_state(branch) == (ONE, False)
 
 
 def test_wire_ending_on_wire_joins_nets():
@@ -107,17 +111,17 @@ def test_two_drivers_agreeing_is_fine_disagreeing_is_a_conflict():
     a, b, led = c.add_part("IN"), c.add_part("IN"), c.add_part("OUT")
     w, _ = c.connect(a.outputs[0], led.inputs[0])
     w2, _ = c.connect(b.outputs[0], w)  # second driver onto the same net
-    for va, vb, expect_value, expect_conflict in [(False, False, False, False),
-                                                  (True, True, True, False),
-                                                  (True, False, False, True),   # X reads as 0 (placeholder)
-                                                  (False, True, False, True)]:
+    for va, vb, expect_value, expect_conflict in [(False, False, ZERO, False),
+                                                  (True, True, ONE, False),
+                                                  (True, False, X, True),
+                                                  (False, True, X, True)]:
         a.outputs[0].state, b.outputs[0].state = va, vb
         settle(c)
-        assert led.inputs[0].state == expect_value
+        assert led.inputs[0].state is expect_value
         assert c.wire_state(w) == c.wire_state(w2) == (expect_value, expect_conflict)
 
 
-def test_undriven_net_reads_zero():
+def test_undriven_net_floats():
     c = Circuit()
     n1, n2 = c.add_part("NOT"), c.add_part("NOT")
     assert not c.can_connect(n1.inputs[0], n2.inputs[0])  # in -> in pin-to-pin is still rejected...
@@ -126,7 +130,11 @@ def test_undriven_net_reads_zero():
     c.connect(trunk, n2.inputs[0])
     c.remove_part(a)  # ...but a net can lose its driver
     settle(c)
-    assert n1.inputs[0].state is False and n2.inputs[0].state is False
+    assert n1.inputs[0].state is n2.inputs[0].state is Z
+    assert n1.outputs[0].state is X  # a gate reads a floating input as X
+    lone = c.add_part("NOT")  # an input with no wire at all floats too
+    settle(c)
+    assert lone.inputs[0].state is Z and lone.outputs[0].state is X
 
 
 def test_removing_a_wire_removes_its_branches():
@@ -216,3 +224,44 @@ def test_rebuilding_wiring_skips_the_drawing_rules():
     assert c.connect(g.outputs[0], g.inputs[0]) == (None, [])  # can't be drawn by hand ...
     w, _ = c.connect(g.outputs[0], g.inputs[0], check=False)   # ... but undo must bring it back
     assert w is not None and c.wires_at(g.inputs[0]) == [w]
+
+
+# ---- four-state vs. two-state ------------------------------------------------------
+
+
+def test_known_values_match_a_plain_bool_simulation():
+    """With every input wired and no X anywhere, four-state logic must do exactly what
+    the old two-state engine did, tick for tick: checked against a tiny bool reference
+    of the same timing (outputs from current inputs, then nets carry them). Random
+    boards, feedback loops included."""
+    import random
+
+    fns = {"NAND": lambda a, b: not (a and b), "AND": lambda a, b: a and b,
+           "OR": lambda a, b: a or b, "NOT": lambda a: not a}
+    arity = {"NAND": 2, "AND": 2, "OR": 2, "NOT": 1}
+    for seed in range(30):
+        rng = random.Random(seed)
+        c = Circuit()
+        ins = [c.add_part("IN") for _ in range(3)]
+        gates = [c.add_part(rng.choice(list(fns))) for _ in range(rng.randint(3, 20))]
+        sources = [p.outputs[0] for p in ins + gates]
+        feed = {}  # input pin -> the output pin that drives it
+        for g in gates:
+            for pin in g.inputs:
+                feed[pin] = src = rng.choice(sources)  # (can be the gate's own output: a loop)
+                c.connect(src, pin, check=False)
+        for g in gates:
+            for pin in g.pins:
+                pin.state = ZERO  # the old engine powered up at 0, inputs included
+        c.take_changes()  # (builds the nets now: that carries values at once, outside the timing)
+        ref = {pin: False for p in ins + gates for pin in p.pins}
+        for tick in range(60):
+            if rng.random() < 0.3:
+                s = rng.choice(ins).outputs[0]
+                ref[s] = not ref[s]
+                s.state = ref[s]
+            c.step()
+            new = {g.outputs[0]: fns[g.kind](*(ref[p] for p in g.inputs)) for g in gates}
+            ref.update(new)
+            ref.update({pin: ref[src] for pin, src in feed.items()})
+            assert all(pin.state is (ONE if v else ZERO) for pin, v in ref.items()), (seed, tick)

@@ -2,6 +2,7 @@ import random
 
 import pytest
 
+from pijl.logic import ONE, X, ZERO, Level
 from pijl.macros import Catalog
 from pijl.parts import builtin_registry, load, TEMPLATES
 from pijl.sim import Circuit
@@ -13,6 +14,10 @@ from pathlib import Path
 
 GATES = ["NAND", "AND", "OR", "NOT"]
 ARITY = {"NAND": 2, "AND": 2, "OR": 2, "NOT": 1}
+
+
+def level(b: bool) -> Level:
+    return ONE if b else ZERO
 
 
 def catalog(defs: dict[str, Snapshot], registry=None) -> Catalog:
@@ -51,14 +56,12 @@ def latch(c: Circuit):
     return a.outputs[0], b.outputs[0]
 
 
-def test_without_settling_a_fresh_latch_oscillates_forever():
+def test_without_settling_a_fresh_latch_stays_unknown():
     c = Circuit()
     q, qb = latch(c)
-    seen = []
     for _ in range(200):
         c.step()
-        seen.append((q.state, qb.state))
-    assert set(seen[-10:]) == {(True, True), (False, False)}
+    assert q.state is qb.state is X  # nothing ever says which way it falls
 
 
 def test_settling_breaks_the_tie_and_then_holds():
@@ -72,9 +75,9 @@ def test_settling_breaks_the_tie_and_then_holds():
         for _ in range(50):
             c.step()
             held.append((q.state, qb.state))
-        assert len(set(held)) == 1 and held[0][0] != held[0][1]  # settled into a real state
+        assert len(set(held)) == 1 and {*held[0]} == {ZERO, ONE}  # settled into a real state
         outcomes.add(held[0])
-    assert outcomes == {(True, False), (False, True)}  # either one, depending on the noise
+    assert outcomes == {(ONE, ZERO), (ZERO, ONE)}  # either one, depending on the noise
 
 
 def test_settling_is_reproducible():
@@ -126,8 +129,8 @@ def test_a_macro_computes_like_its_body():
                 c.connect(src, dst)
             for _ in range(10):  # (exact tick-for-tick timing: see the wrapping test below)
                 c.step()
-            assert (s_led.inputs[0].state, c_led.inputs[0].state) == (a != b, a and b)
-            assert m.outputs[0].state == (a != b)  # the instance's pins show the value too
+            assert (s_led.inputs[0].state, c_led.inputs[0].state) == (level(a != b), level(a and b))
+            assert m.outputs[0].state is level(a != b)  # the instance's pins show the value too
 
 
 def test_nested_macros_and_removal():
@@ -142,7 +145,12 @@ def test_nested_macros_and_removal():
     c.connect(m.outputs[0], led.inputs[0])
     for _ in range(5):
         c.step()
-    assert led.inputs[0].state is False
+    assert led.inputs[0].state is X  # x floats: X XOR X could be anything
+    x = c.add_part("IN")
+    c.connect(x.outputs[0], m.inputs[0])
+    for _ in range(5):
+        c.step()
+    assert led.inputs[0].state is ZERO
     c.remove_part(m)
     assert c.hidden_parts == [] and c.hidden_wires == []
 

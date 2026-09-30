@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ctypes
 import heapq
+import time
 
 import numpy as np
 import pyglet
@@ -205,12 +206,14 @@ class InstanceBuffer:
         self.dirty[:] = False
         self.realloc = self.any_dirty = False
 
-    def draw(self, offset: tuple[float, float] = (0.0, 0.0)) -> None:
+    def draw(self, offset: tuple[float, float] = (0.0, 0.0), now: float = 0.0) -> None:
         if not self.top:
             return
         self._upload()
         self.program.use()
         self.program["lift_offset"] = offset
+        if "time" in self.program.uniforms:  # (only programs that animate something have it)
+            self.program["time"] = now
         if self.kind.texture is not None:
             tex = self.kind.texture()
             gl.glActiveTexture(gl.GL_TEXTURE0)
@@ -241,8 +244,9 @@ class Canvas:
     def draw(self) -> None:
         gl.glEnable(gl.GL_BLEND)
         gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+        now = time.monotonic() % 3600.0  # (kept small: it's a float32 in the shaders)
         for key in sorted(self._buffers):
-            self._buffers[key].draw(self.offset)
+            self._buffers[key].draw(self.offset, now)
         gl.glDisable(gl.GL_BLEND)
         self.batch.draw()
 

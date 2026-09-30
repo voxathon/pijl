@@ -22,9 +22,18 @@ PIN_ON = (240, 70, 70)
 
 WIRE_OFF = (85, 85, 98)
 WIRE_ON = (235, 60, 60)
-WIRE_CONFLICT = (240, 175, 40)  # net driven to different values at once (future: X)
 WIRE_PREVIEW = (200, 200, 210, 160)
 WIRE_PREVIEW_SNAP = (120, 220, 140, 220)
+
+# X (unknown) and Z (floating) are patterns, not colors, on wires, pins and lit bodies
+# (sdf_shapes.pattern). They run diagonally in world space, so they line up across
+# segments and parts; their period doubles as you zoom out, so they never turn to mush.
+LOGIC_X = ((255, 0, 255), (0, 0, 0))   # magenta / black bands: the missing texture look
+LOGIC_Z = ((12, 12, 15), (60, 60, 74))  # near black, with short dashes: nothing here
+LOGIC_PERIOD = 16      # world units between bands, zoomed in
+LOGIC_PERIOD_PX = 14   # ... but never fewer screen px than this
+LOGIC_DASH = 0.35      # Z: how much of each period is dash
+LOGIC_SCROLL_HZ = 0.75  # a conflict (drivers fighting) scrolls its X bands: periods per second
 
 
 def _dim(on: tuple[int, int, int]) -> tuple[int, int, int]:
@@ -34,7 +43,7 @@ def _dim(on: tuple[int, int, int]) -> tuple[int, int, int]:
 
 # Colors for wires and IN/OUT parts (Recolor menu, in this order): name -> (off, on).
 # Names are what save files store. No color set ("Default") inherits one: see paint.py.
-# A conflict still shows WIRE_CONFLICT whatever the color.
+# X, Z and conflicts show their patterns whatever the color.
 WIRE_COLORS: dict[str, tuple[tuple[int, int, int], tuple[int, int, int]]] = {
     name: (_dim(on), on) for name, on in (
         ("red", WIRE_ON),

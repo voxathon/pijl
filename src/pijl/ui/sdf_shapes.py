@@ -12,9 +12,11 @@ Every shape is one quad whatever the zoom; round edges are measured per pixel
 and anti-aliased to one screen pixel (like sdf_text.py). pyglet's Circle needed
 144 vertices for a pin to stay smooth at 8x zoom.
 
-Colors: each shape has an off and an on color and a `state` flag choosing
+Colors: each shape has an off and an on color and a `state` byte choosing
 between them (so a pin lighting up is a one-byte write), and an `opacity`
-(multiplied in; ghosts). `color = c` sets both to c.
+(multiplied in; ghosts). `color = c` sets both to c. The state byte can also ask
+for a pattern instead of either color: X, Z or a conflict (see SHOW_* and
+_PATTERN).
 """
 
 from __future__ import annotations
@@ -23,6 +25,8 @@ from functools import lru_cache
 
 import numpy as np
 
+from ..logic import Level
+from . import theme as T
 from .canvas import UNIFORMS, Canvas, Kind
 
 Point = tuple[float, float]
@@ -40,7 +44,55 @@ float coverage(float d) {
 }
 """
 
-# flags: x = state (on), y = opacity, z / w = per-kind extras. u8, normalized.
+# flags: x = state (what it shows), y = opacity, z / w = per-kind extras. u8, normalized.
+# The state byte: off / on pick the shape's own colors; the rest are patterns.
+SHOW_OFF, SHOW_ON, SHOW_X, SHOW_Z, SHOW_FIGHT = 0, 255, 1, 2, 3
+SHOW_BY_CODE = np.array([SHOW_Z, SHOW_OFF, SHOW_ON, SHOW_X], np.uint8)  # by logic code (pijl.logic)
+
+
+def show(value, fight: bool = False) -> int:
+    """The state byte for a Level (or a plain bool: on / off). `fight`: a conflict."""
+    if fight:
+        return SHOW_FIGHT
+    if isinstance(value, Level):
+        return int(SHOW_BY_CODE[value])
+    return SHOW_ON if value else SHOW_OFF
+
+
+def _vec3(rgb) -> str:
+    return "vec3({:.4f}, {:.4f}, {:.4f})".format(*(c / 255 for c in rgb[:3]))
+
+
+# World-space patterns for X, Z and conflicts. Diagonal, so they show on wires going
+# either way; in world space, so they run on seamlessly across segments, pins and
+# bodies (and move with a lifted selection). The period is LOGIC_PERIOD doubled until
+# it's at least LOGIC_PERIOD_PX on screen, crossfading between two sizes like the
+# grid's line levels. `wpp` (world units per screen px) comes from fwidth, taken
+# before anything discards.
+_PATTERN = f"""
+uniform float time;
+const vec3 X_A = {_vec3(T.LOGIC_X[0])}, X_B = {_vec3(T.LOGIC_X[1])};
+const vec3 Z_A = {_vec3(T.LOGIC_Z[0])}, Z_B = {_vec3(T.LOGIC_Z[1])};
+float band(float x) {{ return 0.5 + 0.5 * cos(6.2831853 * x); }}
+float dash(float x, float aa) {{
+    float s = fract(x);
+    return smoothstep(0.0, aa, s) * (1.0 - smoothstep({T.LOGIC_DASH} - aa, {T.LOGIC_DASH}, s));
+}}
+vec4 pattern(int kind, vec2 world, float wpp, float alpha) {{
+    float d = (world.x + world.y) * 0.70710678;
+    float lv = max(log2(max({float(T.LOGIC_PERIOD_PX)} * wpp / {float(T.LOGIC_PERIOD)}, 1e-6)), -1.0);
+    float k = floor(lv), f = lv - k;
+    float p0 = {float(T.LOGIC_PERIOD)} * exp2(k + 1.0), p1 = 2.0 * p0;
+    if (kind == {SHOW_Z}) {{
+        float z = mix(dash(d / p0, wpp / p0), dash(d / p1, wpp / p1), f);
+        return vec4(mix(Z_A, Z_B, z), alpha);
+    }}
+    float phase = kind == {SHOW_FIGHT} ? time * {T.LOGIC_SCROLL_HZ} : 0.0;
+    float x = mix(band(d / p0 - phase), band(d / p1 - phase), f);
+    return vec4(mix(X_B, X_A, x), alpha);
+}}
+bool patterned(int s) {{ return s == {SHOW_X} || s == {SHOW_Z} || s == {SHOW_FIGHT}; }}
+"""
 _CORNER = "vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));  // triangle strip: 0,0 1,0 0,1 1,1"
 
 
@@ -65,38 +117,51 @@ in vec4 fill; in vec4 fill_on; in vec4 edge; in vec4 edge_on;
 in vec4 flags;
 in float lift;
 out vec2 local;
+out vec2 world;
 flat out vec2 size;
 flat out float bw;
 flat out vec4 cf;
 flat out vec4 ce;
+flat out int show;
 {UNIFORMS}
 void main() {{
     {_CORNER}
     local = corner * rect.zw;
     size = rect.zw;
     bw = border;
-    bool on = flags.x > 0.5;
+    show = int(flags.x * 255.0 + 0.5);
+    bool on = show == {SHOW_ON};
     cf = on ? fill_on : fill;
     ce = on ? edge_on : edge;
     cf.a *= flags.y;
     ce.a *= flags.y;
-    gl_Position = window.projection * window.view * vec4(rect.xy + lift * lift_offset + local, 0.0, 1.0);
+    world = rect.xy + lift * lift_offset + local;
+    gl_Position = window.projection * window.view * vec4(world, 0.0, 1.0);
 }}
-""", """#version 150 core
+""", f"""#version 150 core
 in vec2 local;
+in vec2 world;
 flat in vec2 size;
 flat in float bw;
 flat in vec4 cf;
 flat in vec4 ce;
+flat in int show;
 out vec4 final_color;
-void main() {
+{_PATTERN}
+void main() {{
+    float wpp = max(fwidth(world.x), fwidth(world.y));
     float d = min(min(local.x, size.x - local.x), min(local.y, size.y - local.y));  // to the outside
     float w = fwidth(d);
     float t = bw > 0.0 ? 1.0 - smoothstep(bw - 0.5 * w, bw + 0.5 * w, d) : 0.0;
-    vec4 c = mix(cf, ce, t);
+    vec4 f = cf, e = ce;
+    if (patterned(show)) {{
+        f = pattern(show, world, wpp, cf.a);
+        e = vec4(f.rgb * 0.55, ce.a);  // the border: a darker take on it
+    }}
+    vec4 c = mix(f, e, t);
     if (c.a <= 0.0) discard;
     final_color = c;
-}
+}}
 """, np.dtype([("rect", "f4", 4), ("border", "f4"), ("fill", "u1", 4), ("fill_on", "u1", 4),
                ("edge", "u1", 4), ("edge_on", "u1", 4), ("flags", "u1", 4), ("lift", "f4")]),
             positions=("rect",))
@@ -110,24 +175,33 @@ in vec4 color; in vec4 color_on;
 in vec4 flags;
 in float lift;
 out vec2 local;   // the rim is at length 1
+out vec2 world;
 flat out vec4 c;
+flat out int show;
 {UNIFORMS}
 void main() {{
     {_CORNER}
     local = (corner * 2.0 - 1.0) * {PAD};
-    c = flags.x > 0.5 ? color_on : color;
+    show = int(flags.x * 255.0 + 0.5);
+    c = show == {SHOW_ON} ? color_on : color;
     c.a *= flags.y;
-    gl_Position = window.projection * window.view * vec4(center + lift * lift_offset + local * radius, 0.0, 1.0);
+    world = center + lift * lift_offset + local * radius;
+    gl_Position = window.projection * window.view * vec4(world, 0.0, 1.0);
 }}
 """, f"""#version 150 core
 in vec2 local;
+in vec2 world;
 flat in vec4 c;
+flat in int show;
 out vec4 final_color;
 {_COVERAGE}
+{_PATTERN}
 void main() {{
+    float wpp = max(fwidth(world.x), fwidth(world.y));
     float a = coverage(length(local));
     if (a <= 0.0) discard;
-    final_color = vec4(c.rgb, c.a * a);
+    vec4 k = patterned(show) ? pattern(show, world, wpp, c.a) : c;
+    final_color = vec4(k.rgb, k.a * a);
 }}
 """, np.dtype([("center", "f4", 2), ("radius", "f4"), ("color", "u1", 4), ("color_on", "u1", 4),
                ("flags", "u1", 4), ("lift", "f4")]), positions=("center",))
@@ -143,9 +217,11 @@ in vec4 cb; in vec4 cb_on;  // ... and at b; blended along the length
 in vec4 flags;              // z / w: round cap at a / b
 in float lift;
 out vec2 uv;                // world units: along the segment from a, and across it
+out vec2 world;
 flat out vec2 ext;          // (length, radius)
 flat out vec4 c0;
 flat out vec4 c1;
+flat out int show;
 {UNIFORMS}
 void main() {{
     {_CORNER}
@@ -159,26 +235,33 @@ void main() {{
     float v = mix(-w, w, corner.y);
     uv = vec2(u, v);
     ext = vec2(len, radius);
-    bool on = flags.x > 0.5;
+    show = int(flags.x * 255.0 + 0.5);
+    bool on = show == {SHOW_ON};
     c0 = on ? ca_on : ca;
     c1 = on ? cb_on : cb;
     c0.a *= flags.y;
     c1.a *= flags.y;
-    gl_Position = window.projection * window.view * vec4(a + lift * lift_offset + dir * u + n * v, 0.0, 1.0);
+    world = a + lift * lift_offset + dir * u + n * v;
+    gl_Position = window.projection * window.view * vec4(world, 0.0, 1.0);
 }}
 """, f"""#version 150 core
 in vec2 uv;
+in vec2 world;
 flat in vec2 ext;
 flat in vec4 c0;
 flat in vec4 c1;
+flat in int show;
 out vec4 final_color;
 {_COVERAGE}
+{_PATTERN}
 void main() {{
+    float wpp = max(fwidth(world.x), fwidth(world.y));
     float len = ext.x;
     vec2 p = vec2(uv.x - clamp(uv.x, 0.0, len), uv.y);  // to the nearest point of the core line
     float a = coverage(length(p) / ext.y);
     if (a <= 0.0) discard;
     vec4 c = mix(c0, c1, len > 0.0 ? clamp(uv.x / len, 0.0, 1.0) : 0.0);
+    if (patterned(show)) c = pattern(show, world, wpp, c.a);
     final_color = vec4(c.rgb, c.a * a);
 }}
 """, np.dtype([("a", "f4", 2), ("b", "f4", 2), ("radius", "f4"), ("ca", "u1", 4), ("ca_on", "u1", 4),
@@ -215,13 +298,14 @@ class _Shape:
         return self.buf.f[field][self.slot]
 
     @property
-    def state(self) -> bool:
-        return bool(self._get("flags")[0])
+    def state(self) -> int:
+        """What it shows: a SHOW_* byte. Set it to one, or to a Level or bool (see show())."""
+        return int(self._get("flags")[0])
 
     @state.setter
-    def state(self, on: bool) -> None:
+    def state(self, value) -> None:
         flags = self.buf.f["flags"]
-        v = 255 if on else 0
+        v = value if type(value) is int else show(value)
         if flags[self.slot, 0] != v:
             flags[self.slot, 0] = v
             self.buf.mark(self.slot)

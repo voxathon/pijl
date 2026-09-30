@@ -150,6 +150,7 @@ def _restore(editor: Editor, target: Snapshot, only: tuple[Iterable[int], Iterab
             view.name.move_to(*view.name_pos())
         if view.part.props != props:
             view.part.props = copy.deepcopy(props)
+            c.props_changed(view.part)
             Touched.part(uid)
     editor.add_parts(missing)
     # 4. wires, parents first: add missing (their views all at once), update bends / junction points

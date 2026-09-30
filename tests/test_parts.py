@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from pijl.logic import ONE, X, Z, ZERO
 from pijl.parts import TEMPLATES, builtin_registry, load
 from pijl.sim import Circuit
 
@@ -19,14 +20,20 @@ def settle(c: Circuit, steps: int = 10) -> None:
         c.step()
 
 
+def level(b: bool):
+    return ONE if b else ZERO
+
+
 # ---- loading ---------------------------------------------------------------------
 
 
 def test_builtins_are_the_ports_plus_the_template_scripts():
     reg = builtin_registry()
     assert reg.errors == []
-    assert [t.kind for t in reg] == ["IN", "OUT", "AND", "NAND", "NOT", "OR"]  # ports, then by path
-    assert {t.category for t in reg} == {"I/O", "GATES"}
+    assert [t.kind for t in reg] == ["IN", "OUT", "AND", "BUF", "NAND", "NOT", "OR", "TRI", "XOR",
+                                     "PULLUP", "PULLDOWN"]  # ports, then by path
+    assert {t.category for t in reg} == {"I/O", "GATES", "WIRING"}
+    assert {t.api for t in reg} == {2}
 
 
 def test_scripts_load_recursively_and_helpers_are_skipped():
@@ -47,7 +54,7 @@ def test_broken_scripts_are_skipped_whole_and_reported():
 def test_two_folders_cannot_define_the_same_part():
     reg = load(TEMPLATES, TEMPLATES)
     assert [t.kind for t in reg].count("NAND") == 1
-    assert len(reg.errors) == 4  # every template script, the second time
+    assert len(reg.errors) == len(list(TEMPLATES.rglob("*.py")))  # every template script, the second time
 
 
 def test_missing_folder_is_just_empty(tmp_path):
@@ -71,10 +78,10 @@ def test_every_gate_on_arrays():
             c.connect(ib.outputs[0], g.inputs[1])
             gates.append(g)
         settle(c, 3)
-        assert [g.outputs[0].state for g in gates] == [expect(a, b) for a, b in rows], kind
+        assert [g.outputs[0].state for g in gates] == [level(expect(a, b)) for a, b in rows], kind
     n = c.add_part("NOT")
     settle(c, 1)
-    assert n.outputs[0].state is True
+    assert n.outputs[0].state is X  # its input floats
 
 
 def test_scalars_many_inputs_and_many_outputs(circuit):
@@ -83,24 +90,26 @@ def test_scalars_many_inputs_and_many_outputs(circuit):
     split = circuit.add_part("SPLIT")
     circuit.connect(high[0].outputs[0], split.inputs[0])
     settle(circuit, 3)
-    assert all(h.outputs[0].state is True for h in high)
-    assert wide.outputs[0].state is False  # nothing wired: all inputs 0
-    assert [p.state for p in split.outputs] == [True, False]
+    assert all(h.outputs[0].state is ONE for h in high)
+    assert wide.outputs[0].state is X  # nothing wired: an API 1 part can't know what X does
+    assert [p.state for p in split.outputs] == [ONE, ZERO]
 
 
 def test_relative_imports_inside_a_script_folder(circuit):
-    inv = circuit.add_part("INV")
-    settle(circuit, 1)
-    assert inv.outputs[0].state is True
+    inv, high = circuit.add_part("INV"), circuit.add_part("HIGH")
+    circuit.connect(high.outputs[0], inv.inputs[0])
+    settle(circuit, 2)
+    assert inv.outputs[0].state is ZERO
 
 
 def test_a_raising_eval_disables_only_its_own_kind(circuit):
-    boom, n = circuit.add_part("BOOM"), circuit.add_part("NOT")
+    boom, n, high = circuit.add_part("BOOM"), circuit.add_part("NOT"), circuit.add_part("HIGH")
+    circuit.connect(high.outputs[0], n.inputs[0])
     settle(circuit, 3)
     assert "BOOM" in circuit.faults and "ZeroDivisionError" in circuit.faults["BOOM"]
     assert circuit.errors == [circuit.faults["BOOM"]]  # reported once
-    assert boom.outputs[0].state is False
-    assert n.outputs[0].state is True  # everything else keeps running
+    assert boom.outputs[0].state is X  # broken: nobody knows what it would say
+    assert n.outputs[0].state is ZERO  # everything else keeps running
 
 
 # ---- lifecycle -------------------------------------------------------------------
@@ -130,7 +139,7 @@ def test_frame_state_and_props(circuit):
     circuit.frame()
     circuit.step()
     assert (a.state["count"], b.state["count"]) == (1, 2)
-    assert (a.outputs[0].state, b.outputs[0].state) == (True, False)
+    assert (a.outputs[0].state, b.outputs[0].state) == (ONE, ZERO)
     assert circuit.registry.get("COUNTER").props == {"step": 1}  # instances got copies
 
 
@@ -138,7 +147,7 @@ def test_impure_ghosts_are_not_evaluated(circuit):
     ghost = circuit.add_part("COUNTER", live=False)
     settle(circuit)  # its eval would need state["count"], which only open() sets
     assert circuit.faults == {}
-    assert ghost.outputs[0].state is False
+    assert ghost.outputs[0].state is X  # as it powered up
 
 
 def test_a_bridge_thread_feeds_eval(circuit):
@@ -147,7 +156,7 @@ def test_a_bridge_thread_feeds_eval(circuit):
     while not bridge.state["value"] and time.monotonic() < deadline:
         time.sleep(0.01)
     circuit.step()
-    assert bridge.outputs[0].state is True
+    assert bridge.outputs[0].state is ONE
     circuit.remove_part(bridge)
     assert not bridge.state["thread"].is_alive()
 
@@ -155,6 +164,134 @@ def test_a_bridge_thread_feeds_eval(circuit):
 def test_clicks_go_to_clickable_placed_parts():
     c = Circuit()
     switch, gate, ghost = c.add_part("IN"), c.add_part("NAND"), c.add_part("IN", live=False)
-    assert c.click(switch) and switch.outputs[0].state is True
+    assert c.click(switch) and switch.outputs[0].state is ONE
     assert not c.click(gate)
-    assert not c.click(ghost) and ghost.outputs[0].state is False
+    assert not c.click(ghost) and ghost.outputs[0].state is ZERO  # switches start off
+
+
+# ---- four-state ------------------------------------------------------------------
+
+
+def test_api_1_and_2_scripts_see_x_differently(circuit):
+    """AND(0, X) is 0 -- if the script can see the X. API 1 gets bools, so it says X."""
+    zero, old, new = circuit.add_part("IN"), circuit.add_part("AND16"), circuit.add_part("AND4S")
+    for g in (old, new):
+        circuit.connect(zero.outputs[0], g.inputs[0])  # (the other inputs float: X)
+    settle(circuit, 3)
+    assert new.outputs[0].state is ZERO
+    assert old.outputs[0].state is X
+    assert circuit.registry.get("AND4S").api == 2 and circuit.registry.get("AND16").api == 1
+
+
+def bus(circuit, *kinds):
+    """Parts whose outputs all drive one net, read by an OUT."""
+    led = circuit.add_part("OUT")
+    parts = [circuit.add_part(k) for k in kinds]
+    trunk, _ = circuit.connect(parts[0].outputs[0], led.inputs[0])
+    for p in parts[1:]:
+        circuit.connect(p.outputs[0], trunk)
+    return led.inputs[0], trunk, parts
+
+
+def test_tri_state_bus(circuit):
+    seen, trunk, (t1, t2) = bus(circuit, "TRI", "TRI")
+    ins = {}
+    for t in (t1, t2):
+        a, en = circuit.add_part("IN"), circuit.add_part("IN")
+        circuit.connect(a.outputs[0], t.inputs[0])
+        circuit.connect(en.outputs[0], t.inputs[1])
+        ins[t] = en.outputs[0], a.outputs[0]
+
+    def drive(t, en, a):
+        ins[t][0].state, ins[t][1].state = en, a
+
+    drive(t1, False, True), drive(t2, False, False)
+    settle(circuit, 3)
+    assert seen.state is Z and circuit.wire_state(trunk) == (Z, False)  # nobody drives
+    drive(t1, True, True)
+    settle(circuit, 3)
+    assert seen.state is ONE  # t2's Z doesn't count
+    drive(t2, True, False)
+    settle(circuit, 3)
+    assert seen.state is X and circuit.wire_state(trunk) == (X, True)  # a fight
+
+
+def test_pulls_only_count_when_nobody_drives(circuit):
+    seen, trunk, (tri, pull) = bus(circuit, "TRI", "PULLUP")
+    x, en = circuit.add_part("NOT"), circuit.add_part("IN")  # (x's input floats: it says X)
+    circuit.connect(x.outputs[0], tri.inputs[0])
+    circuit.connect(en.outputs[0], tri.inputs[1])
+    settle(circuit, 3)
+    assert seen.state is ONE  # tri is off: the pull-up wins
+    en.outputs[0].state = True
+    settle(circuit, 3)
+    assert seen.state is X and circuit.wire_state(trunk) == (X, False)  # strong X beats a pull, no fight
+
+
+def test_pull_priority(circuit):
+    seen, trunk, (up, down) = bus(circuit, "PULLUP", "PULLDOWN")
+    assert up.props == down.props == {"priority": 0}
+    settle(circuit, 3)
+    assert seen.state is X and circuit.wire_state(trunk) == (X, True)  # equal priority: a conflict
+    down.props["priority"] = 1
+    circuit.props_changed(down)
+    settle(circuit, 3)
+    assert seen.state is ZERO and circuit.wire_state(trunk) == (ZERO, False)
+    up.props["priority"] = 2
+    circuit.props_changed(up)
+    settle(circuit, 3)
+    assert seen.state is ONE
+
+
+def test_weak_pins_must_be_outputs():
+    from pijl.parts import PartType, Registry
+
+    class Bad(PartType):
+        kind, ins, weak = "BAD", ("a",), ("a",)
+    with pytest.raises(ValueError, match="weak"):
+        Registry().add(Bad)
+
+
+
+def test_shipped_gates_in_four_states():
+    """Every input combination, 0 / 1 / X / Z, through the shipped templates."""
+    from itertools import product
+
+    from pijl.logic import Level
+
+    levels = (ZERO, ONE, X, Z)
+    c = Circuit()
+    xs = c.add_part("NOT")  # input floats: says X
+    source = {ZERO: None, ONE: None, X: xs.outputs[0], Z: None}  # Z: leave the input unwired
+
+    def wire(pin, v):
+        if v in (ZERO, ONE):
+            s = c.add_part("IN")
+            s.outputs[0].state = v
+            c.connect(s.outputs[0], pin)
+        elif v is X:
+            c.connect(source[X], pin)
+
+    cases = []
+    for kind, n in (("BUF", 1), ("XOR", 2), ("TRI", 2)):
+        for vals in product(levels, repeat=n):
+            g = c.add_part(kind)
+            for pin, v in zip(g.inputs, vals):
+                wire(pin, v)
+            cases.append((kind, vals, g))
+    settle(c, 3)
+
+    def known(v):
+        return v in (ZERO, ONE)
+
+    for kind, vals, g in cases:
+        got = g.outputs[0].state
+        if kind == "BUF":
+            expect = vals[0] if known(vals[0]) else X
+        elif kind == "XOR":
+            a, b = vals
+            expect = Level(ZERO + (a != b)) if known(a) and known(b) else X
+        else:  # TRI: (a, en). On, it passes a as it is (a floating a stays Z)
+            a, en = vals
+            expect = {ONE: a, ZERO: Z}.get(en, X)
+        assert got is expect, (kind, vals, got)
