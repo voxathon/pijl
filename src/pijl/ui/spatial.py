@@ -40,20 +40,34 @@ class SpatialIndex:
         self._put(obj, [(x0, y0, x1, y1)])
 
     def put_polyline(self, obj: Hashable, points: list[Point]) -> None:
-        boxes = []
-        for (ax, ay), (bx, by) in zip(points, points[1:]):
-            n = max(1, math.ceil(max(abs(bx - ax), abs(by - ay)) / PIECE))
-            if n == 1:
-                boxes.append((min(ax, bx), min(ay, by), max(ax, bx), max(ay, by)))
-                continue
-            for k in range(n):
-                px, py = ax + (bx - ax) * k / n, ay + (by - ay) * k / n
-                qx, qy = ax + (bx - ax) * (k + 1) / n, ay + (by - ay) * (k + 1) / n
-                boxes.append((min(px, qx), min(py, qy), max(px, qx), max(py, qy)))
-        if len(points) == 1:
-            (x, y), = points
-            boxes.append((x, y, x, y))
-        self._put(obj, boxes)
+        self._put(obj, polyline_boxes(points))
+
+    def put_many(self, items: list[tuple[Hashable, list[tuple]]]) -> None:
+        """(object, its boxes) for many objects at once (new ones: in bulk)."""
+        new = []
+        for obj, boxes in items:
+            if obj in self.where:
+                self._put(obj, boxes)
+            else:
+                new.append((obj, boxes))
+        n = sum(len(boxes) for _, boxes in new)
+        if not n:
+            return
+        free = self._free
+        rows = [free.pop() for _ in range(min(n, len(free)))]
+        rest = n - len(rows)
+        while self._end + rest > self._cols.shape[1]:
+            self._grow()
+        rows += range(self._end, self._end + rest)
+        self._end += rest
+        k = 0
+        owner, where = self._owner, self.where
+        for obj, boxes in new:
+            mine = where[obj] = rows[k:k + len(boxes)]
+            for r in mine:
+                owner[r] = obj
+            k += len(boxes)
+        self._cols[:, rows] = np.array([box for _, boxes in new for box in boxes], np.float64).T
 
     def _put(self, obj: Hashable, boxes: list[tuple]) -> None:
         rows = self.where.get(obj)
@@ -72,16 +86,19 @@ class SpatialIndex:
             row = self._free.pop()
         else:
             if self._end == self._cols.shape[1]:
-                n = self._end
-                grown = np.full((4, 2 * n), np.inf)
-                grown[2:] = -np.inf
-                grown[:, :n] = self._cols
-                self._cols = grown
-                self._owner.extend([None] * n)
+                self._grow()
             row = self._end
             self._end += 1
         self._owner[row] = obj
         return row
+
+    def _grow(self) -> None:
+        n = self._cols.shape[1]
+        grown = np.full((4, 2 * n), np.inf)
+        grown[2:] = -np.inf
+        grown[:, :n] = self._cols
+        self._cols = grown
+        self._owner.extend([None] * n)
 
     def _release(self, row: int) -> None:
         self._cols[:2, row], self._cols[2:, row] = np.inf, -np.inf
@@ -127,6 +144,24 @@ class SpatialIndex:
 
     def near(self, x: float, y: float, r: float) -> set:
         return self.query(x - r, y - r, x + r, y + r)
+
+
+def polyline_boxes(points: list[Point]) -> list[tuple]:
+    """A line's boxes: one per piece (see PIECE)."""
+    boxes = []
+    for (ax, ay), (bx, by) in zip(points, points[1:]):
+        n = max(1, math.ceil(max(abs(bx - ax), abs(by - ay)) / PIECE))
+        if n == 1:
+            boxes.append((min(ax, bx), min(ay, by), max(ax, bx), max(ay, by)))
+            continue
+        for k in range(n):
+            px, py = ax + (bx - ax) * k / n, ay + (by - ay) * k / n
+            qx, qy = ax + (bx - ax) * (k + 1) / n, ay + (by - ay) * (k + 1) / n
+            boxes.append((min(px, qx), min(py, qy), max(px, qx), max(py, qy)))
+    if len(points) == 1:
+        (x, y), = points
+        boxes.append((x, y, x, y))
+    return boxes
 
 
 def ordered(views: Iterable, newest_first: bool = False) -> list:

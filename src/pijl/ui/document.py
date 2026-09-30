@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Iterable
 
 from ..sim import Pin, Wire
 from ..snapshot import EMPTY, EndRef, PartData, Snapshot, WireData
-from .views import PartView, Touched, WireView
+from .views import PartView, Touched, WireView, paused_gc
 
 if TYPE_CHECKING:
     from .editor import Editor
@@ -102,6 +102,11 @@ def internal_wires(editor: Editor, views: Iterable[PartView]) -> list[WireView]:
 def restore(editor: Editor, target: Snapshot, only: tuple[Iterable[int], Iterable[int]] | None = None) -> None:
     """Make the board match `target`, touching only what differs. `only`: the part and
     wire uids to look at (an undo step's); everything else is known to match already."""
+    with paused_gc():
+        _restore(editor, target, only)
+
+
+def _restore(editor: Editor, target: Snapshot, only: tuple[Iterable[int], Iterable[int]] | None) -> None:
     c = editor.circuit
     if only is None:
         part_uids = c.part_by_uid.keys() | target.parts.keys()
@@ -127,14 +132,16 @@ def restore(editor: Editor, target: Snapshot, only: tuple[Iterable[int], Iterabl
         data = target.wires.get(uid)
         if data is None or (_ref(wire.src), _ref(wire.dst)) != data[:2]:
             wire_uids.update(w.uid for w in editor.remove_wire(editor.wire_views[wire]))
-    # 3. parts: add missing, update moved/relabeled/re-propped
+    # 3. parts: add missing (all at once), update moved/relabeled/re-propped
     moved = set()
+    missing = []
     for uid in part_uids & target.parts.keys():
         kind, label, x, y, props = target.parts[uid]
         view = view_of(uid)
         if view is None:
-            view = editor.add_part(kind, x, y, uid=uid)
-        elif (view.x, view.y) != (x, y):
+            missing.append((kind, x, y, uid, label, props))
+            continue
+        if (view.x, view.y) != (x, y):
             view.move_to(x, y)
             moved.add(view.part)
         if view.part.label != label:
@@ -144,23 +151,25 @@ def restore(editor: Editor, target: Snapshot, only: tuple[Iterable[int], Iterabl
         if view.part.props != props:
             view.part.props = copy.deepcopy(props)
             Touched.part(uid)
-    # 4. wires, parents first: add missing, update bends / junction points
+    editor.add_parts(missing)
+    # 4. wires, parents first: add missing (their views all at once), update bends / junction points
     changed: list[WireView] = []
-    for uid in sorted(wire_uids & target.wires.keys()):
-        src_ref, dst_ref, bends, src_pt, dst_pt = target.wires[uid]
-        wire = c.wire_by_uid.get(uid)
-        if wire is None:
-            src = _resolve(src_ref, c.part_by_uid, c.wire_by_uid)
-            dst = _resolve(dst_ref, c.part_by_uid, c.wire_by_uid)
-            editor.connect(src, dst, list(bends), src_pt, dst_pt, uid=uid, color=target.wire_colors.get(uid),
-                           check=False)
-            continue
-        view = editor.wire_views[wire]
-        view.color = target.wire_colors.get(uid)  # paint() redoes the gradients
-        if tuple(view.bends) != bends or (src_pt and view.src != src_pt) or (dst_pt and view.dst != dst_pt):
-            view.src, view.dst = src_pt or view.src, dst_pt or view.dst
-            view.set_bends(list(bends))
-            changed.append(view)
+    with editor.wire_batch():
+        for uid in sorted(wire_uids & target.wires.keys()):
+            src_ref, dst_ref, bends, src_pt, dst_pt = target.wires[uid]
+            wire = c.wire_by_uid.get(uid)
+            if wire is None:
+                src = _resolve(src_ref, c.part_by_uid, c.wire_by_uid)
+                dst = _resolve(dst_ref, c.part_by_uid, c.wire_by_uid)
+                editor.connect(src, dst, list(bends), src_pt, dst_pt, uid=uid,
+                               color=target.wire_colors.get(uid), check=False)
+                continue
+            view = editor.wire_views[wire]
+            view.color = target.wire_colors.get(uid)  # paint() redoes the gradients
+            if tuple(view.bends) != bends or (src_pt and view.src != src_pt) or (dst_pt and view.dst != dst_pt):
+                view.src, view.dst = src_pt or view.src, dst_pt or view.dst
+                view.set_bends(list(bends))
+                changed.append(view)
     # 5. re-attach ends: wires on moved parts, changed wires, and whatever hangs off them.
     #    Only those: touching every wire made undoing one moved part on a 2000-part
     #    board take ~80 ms.
@@ -170,22 +179,23 @@ def restore(editor: Editor, target: Snapshot, only: tuple[Iterable[int], Iterabl
 def instantiate(editor: Editor, clip: Snapshot, live: bool = True) -> tuple[list[PartView], list[WireView]]:
     """Add a copy of `clip` at its original coordinates, with fresh uids (for paste).
     `live=False`: the parts are ghosts until the caller opens them (see Circuit.open_part)."""
-    new: dict[int, PartView] = {}
-    for uid, (kind, label, x, y, props) in clip.parts.items():
-        view = new[uid] = editor.add_part(kind, x, y, live=live)
-        view.part.props = copy.deepcopy(props)  # (a new part: already reported as touched)
-        if label:
-            view.part.label = label
-            view.refresh_name()
-            view.name.move_to(*view.name_pos())
+    with paused_gc():
+        return _instantiate(editor, clip, live)
+
+
+def _instantiate(editor: Editor, clip: Snapshot, live: bool) -> tuple[list[PartView], list[WireView]]:
+    views = editor.add_parts([(kind, x, y, None, label, props)
+                              for kind, label, x, y, props in clip.parts.values()], live=live)
+    new = dict(zip(clip.parts, views))
     new_parts = {uid: view.part for uid, view in new.items()}
     new_wires: dict[int, Wire] = {}
-    for uid in sorted(clip.wires):
-        src_ref, dst_ref, bends, src_pt, dst_pt = clip.wires[uid]
-        src = _resolve(src_ref, new_parts, new_wires)
-        dst = _resolve(dst_ref, new_parts, new_wires)
-        new_wires[uid] = editor.connect(src, dst, list(bends), src_pt, dst_pt, color=clip.wire_colors.get(uid),
-                                        check=False)
+    with editor.wire_batch():
+        for uid in sorted(clip.wires):
+            src_ref, dst_ref, bends, src_pt, dst_pt = clip.wires[uid]
+            src = _resolve(src_ref, new_parts, new_wires)
+            dst = _resolve(dst_ref, new_parts, new_wires)
+            new_wires[uid] = editor.connect(src, dst, list(bends), src_pt, dst_pt,
+                                            color=clip.wire_colors.get(uid), check=False)
     return list(new.values()), [editor.wire_views[w] for w in new_wires.values()]
 
 

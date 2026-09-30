@@ -204,9 +204,47 @@ class SDFText:
         """Width `text` would have at `size` (monospace: just the character count)."""
         return len(text) * self.atlas.advance * size * 96 / 72 / EM_PX
 
+    def cap_height(self, size: float) -> float:
+        """A label's cap_height at `size`, before making it."""
+        return self.atlas.cap_height * (size * 96 / 72 / EM_PX)
+
     def label(self, text: str, x: float, y: float, size: float,
               color: tuple[int, int, int, int], anchor_x: str = "center") -> SDFLabel:
         return SDFLabel(self, text, x, y, size, color, anchor_x)
+
+    def labels(self, specs: list[tuple]) -> list[SDFLabel]:
+        """label() for each (text, x, y, size, color, anchor_x), all at once: the glyphs
+        get the slots they would have got one label at a time, written per field."""
+        out, rels, uvs, counts, offsets = [], [], [], [], []
+        for text, x, y, size, color, anchor_x in specs:
+            label = SDFLabel.__new__(SDFLabel)
+            label._init(self, x, y, size, color, anchor_x)
+            label.text, label._rel, uv = _layout(self.atlas, text, label.scale)
+            out.append(label)
+            if len(uv):
+                rels.append(label._rel)
+                uvs.append(uv)
+                counts.append(len(uv))
+                offsets.append((label._left(), y, 0.0, 0.0))
+        total = sum(counts)
+        if total:
+            buf = self.buf
+            slots = buf.alloc_many(total)
+            f = buf.f
+            f["uv"][slots] = np.concatenate(uvs)
+            f["color"][slots] = np.repeat(np.array([label._color for label in out if label._rel.size], np.uint8),
+                                          counts, axis=0)
+            f["lift"][slots] = 0.0
+            # (float64, like move_to's rel + (left, y, 0, 0), then stored as float32)
+            f["rect"][slots] = np.concatenate(rels).astype(np.float64) + np.repeat(np.array(offsets), counts, axis=0)
+            buf.mark_many(slots)
+            k = 0
+            for label in out:
+                if label._rel.size:
+                    n = len(label._rel)
+                    label.slots = slots[k:k + n]
+                    k += n
+        return out
 
 
 _layouts: dict[tuple[str, float], tuple[str, np.ndarray, np.ndarray]] = {}
@@ -239,6 +277,12 @@ class SDFLabel:
 
     def __init__(self, owner: SDFText, text: str, x: float, y: float, size: float,
                  color: tuple[int, int, int, int], anchor_x: str = "center") -> None:
+        self._init(owner, x, y, size, color, anchor_x)
+        self.set_text(text)
+
+    def _init(self, owner: SDFText, x: float, y: float, size: float,
+              color: tuple[int, int, int, int], anchor_x: str) -> None:
+        """Everything but the text (see set_text, SDFText.labels)."""
         self.owner = owner
         self.atlas = owner.atlas
         self.buf = owner.buf
@@ -251,7 +295,6 @@ class SDFLabel:
         # per glyph: its quad relative to (left edge, capitals' center), world units; moving is one add
         self._rel = np.empty((0, 4), np.float32)
         self.text = ""
-        self.set_text(text)
 
     def set_text(self, text: str) -> None:
         self.text, self._rel, uv = _layout(self.atlas, text, self.scale)

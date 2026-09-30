@@ -73,10 +73,12 @@ Controls
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import sys
 import time
+from contextlib import contextmanager
 from enum import Enum, auto
 
 import pyglet
@@ -109,7 +111,7 @@ from .selection import Selection
 from .spatial import SpatialIndex, ordered
 from .status_bar import BAR_H, StatusBar
 from .views import (PartView, Layers, Point, Polyline, Touched, WireView, arc_length_at, points_before,
-                    delete_views, lift, project_onto, put_down, theme_color)
+                    delete_views, lift, paused_gc, project_onto, put_down, theme_color)
 from .wire_edit import WireEditSession
 
 SIM_STEPS_PER_FRAME = 1
@@ -166,6 +168,7 @@ class Editor(pyglet.window.Window):
         self._bind_project(project)
         self.pin_label_mode = PIN_LABELS_HOVER  # Tab cycles it
         self.hover_view: PartView | None = None  # the part whose pin names hover shows
+        self._wire_batch: dict | None = None  # wires waiting for their views (see wire_batch)
         self.camera = Camera()
         self.grid = Grid()
         self.keys = key.KeyStateHandler()  # live "is this key down?" lookups
@@ -252,11 +255,28 @@ class Editor(pyglet.window.Window):
 
     def add_part(self, kind: str, x: float, y: float, uid: int | None = None, live: bool = True) -> PartView:
         """`live=False`: a ghost, for carrying on the cursor (see _carry / _commit_placing)."""
-        part = self.circuit.add_part(kind, uid, live)
-        view = PartView(part, x, y, self.world, self.layers, self.text,
-                        pin_labels=self.pin_label_mode == PIN_LABELS_ALWAYS, index=self.part_index)
-        self.part_views[part] = view
-        return view
+        return self.add_parts([(kind, x, y, uid, "", None)], live)[0]
+
+    def add_parts(self, specs: list[tuple], live: bool = True) -> list[PartView]:
+        """add_part for each (kind, x, y, uid, label, props) -- label "" and props None
+        leave the new part's own -- with the views made all at once (undo, loading, paste)."""
+        parts = []
+        with paused_gc():
+            try:
+                for kind, _x, _y, uid, label, props in specs:
+                    part = self.circuit.add_part(kind, uid, live)  # (KeyError: no such kind)
+                    if label:
+                        part.label = label
+                    if props is not None:
+                        part.props = copy.deepcopy(props) if props else {}
+                    parts.append(part)
+            finally:  # (what did get added gets its view, even if a later kind was missing)
+                views = PartView.many([(p, s[1], s[2]) for p, s in zip(parts, specs)], self.world, self.layers,
+                                      self.text, pin_labels=self.pin_label_mode == PIN_LABELS_ALWAYS,
+                                      index=self.part_index)
+                for part, view in zip(parts, views):
+                    self.part_views[part] = view
+        return views
 
     def remove_part(self, view: PartView) -> list[Wire]:
         """Returns the wires that went with it."""
@@ -274,7 +294,28 @@ class Editor(pyglet.window.Window):
         return removed
 
     def _drop_wire_view(self, wire: Wire) -> None:
+        if self._wire_batch is not None and wire in self._wire_batch:
+            del self._wire_batch[wire]  # (connected and gone again in the same batch: no view yet)
+            return
         self._drop_views([], [wire])
+
+    @contextmanager
+    def wire_batch(self):
+        """Wires connected inside get their views when it ends, all at once (undo,
+        loading, paste). Until then wire_views doesn't have them."""
+        if self._wire_batch is not None:  # (nested: the outer one makes them)
+            yield
+            return
+        self._wire_batch = {}
+        try:
+            with paused_gc():
+                yield
+        finally:
+            pending, self._wire_batch = self._wire_batch, None
+            with paused_gc():
+                views = WireView.many(list(pending.values()), self.world, self.layers, index=self.wire_index)
+            for wire, view in zip(pending, views):
+                self.wire_views[wire] = view
 
     def _drop_views(self, parts: list[PartView], wires: list[Wire]) -> None:
         """Forget and delete these part views and the views of these (removed) wires."""
@@ -297,8 +338,11 @@ class Editor(pyglet.window.Window):
                 bends, a_pos, b_pos = list(reversed(bends)), b_pos, a_pos
             src = self.pin_pos(wire.src) if isinstance(wire.src, Pin) else a_pos
             dst = self.pin_pos(wire.dst) if isinstance(wire.dst, Pin) else b_pos
-            self.wire_views[wire] = WireView(wire, src, list(bends), dst, self.world, self.layers, color,
-                                             index=self.wire_index)
+            if self._wire_batch is not None:
+                self._wire_batch[wire] = (wire, src, list(bends), dst, color)
+            else:
+                self.wire_views[wire] = WireView(wire, src, list(bends), dst, self.world, self.layers, color,
+                                                 index=self.wire_index)
         return wire
 
     def remove_wire(self, view: WireView) -> list[Wire]:
@@ -1418,6 +1462,10 @@ class Editor(pyglet.window.Window):
         """Write what views reported changed (views.Touched) into the undo history, as a
         new step (or folded into the last one), and rework the colors around it (paint.py).
         Returns whether there was a change to record."""
+        with paused_gc():  # (a big edit is many entries: see paused_gc)
+            return self._record_touched(amend)
+
+    def _record_touched(self, amend: bool) -> bool:
         parts, wires, paint_parts, paint_wires = Touched.take()
         now = changes(self, parts, wires)
         # parts at the ends of a changed wire, before and after: their pins' colors may change

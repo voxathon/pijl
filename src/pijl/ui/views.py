@@ -8,8 +8,10 @@ colors are only worked out again when they change (paint.py's tints, gradients).
 
 from __future__ import annotations
 
+import gc
 import itertools
 import math
+from contextlib import contextmanager
 
 import numpy as np
 import pyglet
@@ -19,9 +21,9 @@ from ..sim import Part, Pin, Wire
 from . import theme as T
 from .canvas import Canvas
 from .paint import Pair, Rgb, sample, with_hue
-from .sdf_shapes import SEGMENT, Dot, Rect, Segment, WireDot
+from .sdf_shapes import DOT, RECT, SEGMENT, Dot, Rect, Segment, WireDot, _rgba
 from .sdf_text import SDFLabel, SDFText
-from .spatial import SpatialIndex
+from .spatial import SpatialIndex, polyline_boxes
 
 Point = tuple[float, float]
 
@@ -52,6 +54,18 @@ class Touched:
     def wire(cls, uid: int) -> None:
         cls.wires.add(uid)
         cls.paint_wires.add(uid)
+
+    @classmethod
+    def part_many(cls, uids) -> None:
+        uids = set(uids)
+        cls.parts |= uids
+        cls.paint_parts |= uids
+
+    @classmethod
+    def wire_many(cls, uids) -> None:
+        uids = set(uids)
+        cls.wires |= uids
+        cls.paint_wires |= uids
 
     @classmethod
     def take(cls) -> tuple[set[int], set[int], set[int], set[int]]:
@@ -113,6 +127,11 @@ class Polyline:
 
     def __init__(self, points: list[Point], color, canvas: Canvas,
                  group: pyglet.graphics.Group, thickness: float = T.WIRE_THICKNESS) -> None:
+        self._init(color, canvas, group, thickness)
+        self.set_points(points)
+
+    def _init(self, color, canvas: Canvas, group: pyglet.graphics.Group, thickness: float) -> None:
+        """Everything but the points and segments."""
         self.canvas, self.group, self.thickness = canvas, group, thickness
         self.buf = canvas.buffer(SEGMENT, group)
         self._pair: Pair = (color, color)
@@ -129,7 +148,6 @@ class Polyline:
         self._plain = True  # laid out for one color (no gradient, or nothing to spread it over)
         self._vfracs: list[float] = []  # fraction of the length at each segment vertex
         self._colors: dict[tuple, tuple[list, list]] = {}  # stops -> (off, on) color per vertex, this layout
-        self.set_points(points)
 
     def set_points(self, points: list[Point]) -> None:
         self.points = list(points)
@@ -371,6 +389,25 @@ class PartView:
                  layers: Layers, text: SDFText, pin_labels: bool = True,
                  index: SpatialIndex | None = None) -> None:
         """`index`: where to register for hit testing; kept up to date as it moves."""
+        self._init(part, x, y, canvas, layers, text, index)
+        _make_part_shapes([self], pin_labels)
+
+    @classmethod
+    def many(cls, placed: list[tuple[Part, float, float]], canvas: Canvas, layers: Layers, text: SDFText,
+             pin_labels: bool = True, index: SpatialIndex | None = None) -> list[PartView]:
+        """A view for each (part, x, y): the same as making them one by one, in order, but
+        their shapes are made all at once (undo, loading, pasting thousands of parts)."""
+        views = []
+        for part, x, y in placed:
+            view = cls.__new__(cls)
+            view._init(part, x, y, canvas, layers, text, index)
+            views.append(view)
+        _make_part_shapes(views, pin_labels)
+        return views
+
+    def _init(self, part: Part, x: float, y: float, canvas: Canvas, layers: Layers, text: SDFText,
+              index: SpatialIndex | None) -> None:
+        """Everything but the shapes (see _make_part_shapes)."""
         self.part = part
         self.seq = next(_seq)
         self.index = index
@@ -385,28 +422,21 @@ class PartView:
             need = text.measure(title, title_size) + 2 * T.TITLE_PAD
             self.w = max(self.w, math.ceil(need / (2 * T.GRID)) * 2 * T.GRID)
         self.h = (n + 1) * T.PIN_SPACING  # multiple of GRID, see theme.py
-
-        self.body = Rect(x, y, self.w, self.h, T.PART_BORDER, *theme_color(look.body), canvas, layers.bodies)
-        self.kind_text = text.label(title, 0, 0, size=title_size, color=T.PART_TEXT)
+        self.title, self.title_size = title, title_size
         self.canvas, self.layers = canvas, layers
         self.pin_tags: list = []  # (background, SDF label) per pin, while shown (see set_pin_labels)
         self.opacity = 255
         self.lifted = False  # being dragged: drawn at the canvas's offset (see set_lifted)
-        # The user's label sits outside the body: left of IN switches, right of
-        # OUT LEDs (so it reads like a pin name at the board edge), below gates.
-        anchor = {"left": "right", "right": "left"}.get(look.label, "center")
-        self.name = text.label(part.label, 0, 0, size=T.LABEL_SIZE, color=T.LABEL_TEXT, anchor_x=anchor)
-        self.pin_dots = [Dot(0, 0, T.PIN_RADIUS, T.PIN_OFF, canvas, layers.pins) for _ in part.pins]
         # Selection outline: a ring just outside the body, drawn under it and the pins.
         self.outline: Rect | None = None  # only while selected (see set_selected)
         self._last_state: tuple[bool, ...] | None = None
-        self.pin_tints: list[Rgb | None] = [None] * len(self.pin_dots)  # hue for each lit pin (paint.py)
+        self.pin_tints: list[Rgb | None] = [None] * len(part.pins)  # hue for each lit pin (paint.py)
         self.body_tint: Rgb | None = None  # hue for a lit body (switches, LEDs)
-        self._recolor()
-        self.set_pin_labels(pin_labels)
-        self.move_to(x, y)
-        Touched.part(part.uid)  # new: its own color (props) needs painting
-        self.sync()
+        # Made by _make_part_shapes:
+        self.body: Rect
+        self.kind_text: SDFLabel
+        self.name: SDFLabel  # the user's label
+        self.pin_dots: list[Dot]
 
     @property
     def pin_labels_shown(self) -> bool:
@@ -423,28 +453,27 @@ class PartView:
             label.delete()
         self.pin_tags = []
         if on:
-            t = self.part.type
-            for pin in self.part.pins:
-                name = (t.ins if pin.is_input else t.outs)[pin.index]
-                label = self.text.label(name, 0, 0, size=T.PIN_LABEL_SIZE, color=T.LABEL_TEXT,
-                                        anchor_x="right" if pin.is_input else "left")
-                label.opacity = self.opacity
-                bg = Rect(0, 0, 1, 1, 0, T.PIN_TAG_BG, T.PIN_TAG_BG, self.canvas, self.layers.tags)
-                bg.opacity = self.opacity
-                bg.lifted = label.lifted = self.lifted
-                self.pin_tags.append((bg, label))
-            self._place_pin_tags()
+            _make_pin_tags([(self, self.text.labels(self._tag_specs()))])
+
+    def _tag_specs(self) -> list[tuple]:
+        """SDFText.labels specs for the pin name tags' text, in place (see _tag_at)."""
+        t = self.part.type
+        color = (*T.LABEL_TEXT[:3], self.opacity)
+        return [((t.ins if pin.is_input else t.outs)[pin.index], *self._tag_at(pin), T.PIN_LABEL_SIZE, color,
+                 "right" if pin.is_input else "left") for pin in self.part.pins]
+
+    def _tag_at(self, pin: Pin) -> Point:
+        """Where a pin's tag text is anchored: inputs' to the left of the pin, outputs' right."""
+        px, py = self.pin_pos(pin)
+        off = T.PIN_RADIUS + T.PIN_TAG_GAP + T.PIN_TAG_PAD[0]
+        return (px - off if pin.is_input else px + off), py
 
     def _place_pin_tags(self) -> None:
-        pad_x, pad_y = T.PIN_TAG_PAD
-        off = T.PIN_RADIUS + T.PIN_TAG_GAP + pad_x
         for (bg, label), pin in zip(self.pin_tags, self.part.pins):
-            px, py = self.pin_pos(pin)
-            x = px - off if pin.is_input else px + off  # inputs: tag to the left; outputs: right
-            label.move_to(x, py)
-            h = label.cap_height + 2 * pad_y
-            bg.width, bg.height = label.width + 2 * pad_x, h
-            bg.position = (x - label.width - pad_x if pin.is_input else x - pad_x, py - h / 2)
+            label.move_to(*self._tag_at(pin))
+            x, y, w, h = _tag_backing(label, pin)
+            bg.width, bg.height = w, h
+            bg.position = (x, y)
 
     @property
     def selected(self) -> bool:
@@ -492,7 +521,7 @@ class PartView:
             return self.x - T.LABEL_GAP, self.y + self.h / 2
         if self.look.label == "right":
             return self.x + self.w + T.LABEL_GAP, self.y + self.h / 2
-        return self.x + self.w / 2, self.y - T.LABEL_GAP - self.name.cap_height / 2
+        return self.x + self.w / 2, self.y - T.LABEL_GAP - self.text.cap_height(T.LABEL_SIZE) / 2
 
     def refresh_name(self) -> None:
         """Show part.label (after it was edited)."""
@@ -517,9 +546,13 @@ class PartView:
         lift([self], [], on)
 
     def _register(self) -> None:
-        if self.index is not None:  # the body, and the pins sticking out of its sides
-            r = T.PIN_RADIUS
-            self.index.put_rect(self, self.x - r, self.y, self.x + self.w + r, self.y + self.h)
+        if self.index is not None:
+            self.index.put_rect(self, *self._index_box())
+
+    def _index_box(self) -> tuple[float, float, float, float]:
+        """What the spatial index knows it by: the body, and the pins sticking out of its sides."""
+        r = T.PIN_RADIUS
+        return self.x - r, self.y, self.x + self.w + r, self.y + self.h
 
     def set_ghost(self, ghost: bool) -> None:
         """Semi-transparent while being carried around before placement."""
@@ -574,26 +607,42 @@ class WireView:
     def __init__(self, wire: Wire, src: Point, bends: list[Point], dst: Point,
                  canvas: Canvas, layers: Layers, color: str | None = None,
                  index: SpatialIndex | None = None) -> None:
+        self._init(wire, src, bends, dst, canvas, layers, color, index)
+        _make_wire_shapes([self])
+
+    @classmethod
+    def many(cls, specs: list[tuple], canvas: Canvas, layers: Layers,
+             index: SpatialIndex | None = None) -> list[WireView]:
+        """A view for each (wire, src, bends, dst, color): like making them one by one, in
+        order, with the shapes made all at once."""
+        views = []
+        for wire, src, bends, dst, color in specs:
+            view = cls.__new__(cls)
+            view._init(wire, src, bends, dst, canvas, layers, color, index)
+            views.append(view)
+        _make_wire_shapes(views)
+        return views
+
+    def _init(self, wire: Wire, src: Point, bends: list[Point], dst: Point, canvas: Canvas, layers: Layers,
+              color: str | None, index: SpatialIndex | None) -> None:
+        """Everything but the shapes (see _make_wire_shapes)."""
         self.wire = wire
         self.seq = next(_seq)
         self.index = index
         self.src, self.dst = src, dst
         self.bends = list(bends)
-        self.color = color  # a T.WIRE_COLORS name; None = Default (inherit from the ends)
+        self._color = color  # a T.WIRE_COLORS name; None = Default (inherit from the ends)
         self.stops: list[tuple[float, Pair]] = []  # empty: neutral, the classic grey / red
         self.canvas, self.layers = canvas, layers
-        self.line = Polyline([], T.WIRE_OFF, canvas, layers.wires)  # (laid out by _redraw, below)
+        self.line = Polyline.__new__(Polyline)  # (its segments: _make_wire_shapes)
+        self.line._init(T.WIRE_OFF, canvas, layers.wires, T.WIRE_THICKNESS)
         self.highlight: Polyline | None = None  # selection glow, only while selected
         # A dot on each end that attaches to another wire (a junction), like on schematics.
         # (In the wires layer, right after the line: a wire crossing the junction covers it.)
-        self.dots = {end: WireDot(0, 0, T.JUNCTION_RADIUS, T.WIRE_OFF, canvas, layers.wires)
-                     for end in ("src", "dst") if not isinstance(getattr(wire, end), Pin)}
+        self.dots: dict[str, WireDot] = {}
         self._last_state: tuple[bool, bool] | None = None
         self._conflict = False
         self.lifted = False  # see set_lifted
-        self._redraw()
-        self._recolor()
-        self.sync((False, False))
 
     @property
     def points(self) -> list[Point]:
@@ -706,6 +755,219 @@ class WireView:
 
     def delete(self) -> None:
         delete_views([], [self])
+
+
+# ---- making views ------------------------------------------------------------------
+# Views are made in batches (a batch of one for the constructors): per shape role, the
+# slots they would have got one view at a time, then each field written as one array.
+# Loading or undoing thousands of parts one constructor at a time was seconds.
+
+
+@contextmanager
+def paused_gc():
+    """No cycle collection meanwhile: a big batch makes hundreds of thousands of objects,
+    and Python's collector would walk the whole heap again and again as it did (half the
+    time of undoing a 20k-part delete). Whatever became garbage is collected after."""
+    was = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was:
+            gc.enable()
+
+
+def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
+    """Bodies, titles, user labels, pin dots, colors, placement: a new view's shapes."""
+    if not views:
+        return
+    v0 = views[0]
+    canvas, layers, text = v0.canvas, v0.layers, v0.text
+    pins = [v.part.pins for v in views]
+    # the pins' states, in one gather
+    flat = [p for ps in pins for p in ps]
+    on_flat = v0.part.pins[0]._store.states[[p.slot for p in flat]].tolist() if flat else []
+    states, k = [], 0
+    for ps in pins:
+        states.append(tuple(on_flat[k:k + len(ps)]))
+        k += len(ps)
+    looks: dict[int, tuple] = {}  # what a look decides (anchor, body colors), worked out once per look
+    # titles and user labels (a view's title, then its label: the one-at-a-time order),
+    # and pin name tags if shown
+    specs, tagged = [], []
+    for v in views:
+        look = looks.get(id(v.look))
+        if look is None:
+            look = looks[id(v.look)] = _look_data(v.look)
+        specs.append((v.title, v.x + v.w / 2, v.y + v.h / 2, v.title_size, T.PART_TEXT, "center"))
+        specs.append((v.part.label, *v.name_pos(), T.LABEL_SIZE, T.LABEL_TEXT, look[0]))
+        if pin_labels and v.look.pin_labels:
+            specs += v._tag_specs()
+    labels = iter(text.labels(specs))
+    for v, ps in zip(views, pins):
+        v.kind_text, v.name = next(labels), next(labels)
+        if pin_labels and v.look.pin_labels:
+            tagged.append((v, [next(labels) for _ in ps]))
+    _make_pin_tags(tagged)
+    # bodies: the look's colors; lit ones (switches, LEDs) also on-colors, on per the first pin
+    rows, colors, on = [], [], []
+    for v, state in zip(views, states):
+        _, row, lit = looks[id(v.look)]
+        rows.append((v.x, v.y, v.w, v.h))
+        colors.append(row)
+        on.append(255 if lit and state and state[0] else 0)
+    buf = canvas.buffer(RECT, layers.bodies)
+    slots = buf.alloc_many(len(views))
+    f = buf.f
+    f["rect"][slots] = rows
+    f["border"][slots] = T.PART_BORDER
+    colors = np.array(colors, np.uint8)
+    for k, name in enumerate(("fill", "fill_on", "edge", "edge_on")):
+        f[name][slots] = colors[:, k]
+    f["flags"][slots] = 0, 255, 0, 0
+    f["flags"][slots, 0] = on
+    f["lift"][slots] = 0.0
+    buf.mark_many(slots)
+    for v, body in zip(views, Rect.adopt(buf, slots.tolist())):
+        v.body = body
+    # pin dots
+    centers = [v.pin_pos(pin) for v, ps in zip(views, pins) for pin in ps]
+    buf = canvas.buffer(DOT, layers.pins)
+    slots = buf.alloc_many(len(centers))
+    if len(centers):
+        f = buf.f
+        f["center"][slots] = centers
+        f["radius"][slots] = T.PIN_RADIUS
+        f["color"][slots] = _rgba(T.PIN_OFF)
+        f["color_on"][slots] = _rgba(with_hue(T.PIN_ON, None))
+        f["flags"][slots] = 0, 255, 0, 0
+        f["flags"][slots, 0] = np.array(on_flat, np.uint8) * 255
+        f["lift"][slots] = 0.0
+        buf.mark_many(slots)
+    dots = Dot.adopt(buf, slots.tolist())
+    k = 0
+    for v, ps, state in zip(views, pins, states):
+        v.pin_dots = dots[k:k + len(ps)]
+        k += len(ps)
+        v._last_state = state
+    _index_many([(v, [v._index_box()]) for v in views])
+    Touched.part_many(v.part.uid for v in views)  # new: its own color (props) needs painting
+
+
+def _look_data(look) -> tuple:
+    """(user label anchor, body colors as (fill, fill_on, edge, edge_on) rgba, lit?) for a look."""
+    # The user's label sits outside the body: left of IN switches, right of
+    # OUT LEDs (so it reads like a pin name at the board edge), below gates.
+    anchor = {"left": "right", "right": "left"}.get(look.label, "center")
+    fill, edge = theme_color(look.body)
+    if look.lit:  # (untinted: paint.py tints them)
+        (fill, edge), (fill_on, edge_on) = (theme_color(name) for name in look.lit)
+    else:
+        fill_on, edge_on = fill, edge
+    return anchor, (_rgba(fill), _rgba(fill_on), _rgba(edge), _rgba(edge_on)), bool(look.lit)
+
+
+def _index_many(items: list[tuple]) -> None:
+    """Register (view, boxes) in the views' spatial indexes, in bulk."""
+    by_index: dict[int, tuple] = {}
+    for v, boxes in items:
+        if v.index is not None:
+            by_index.setdefault(id(v.index), (v.index, []))[1].append((v, boxes))
+    for index, members in by_index.values():
+        index.put_many(members)
+
+
+def _tag_backing(label: SDFLabel, pin: Pin) -> tuple[float, float, float, float]:
+    """(x, y, width, height) of the dark backing behind a pin tag's text."""
+    pad_x, pad_y = T.PIN_TAG_PAD
+    h = label.cap_height + 2 * pad_y
+    x = label.x - label.width - pad_x if pin.is_input else label.x - pad_x
+    return x, label.y - h / 2, label.width + 2 * pad_x, h
+
+
+def _make_pin_tags(made: list[tuple[PartView, list[SDFLabel]]]) -> None:
+    """Pin name tags for these views, from their tag texts (made from _tag_specs):
+    the backings, all at once, and the views' pin_tags."""
+    rows, alpha, lift = [], [], []
+    for v, labels in made:
+        rows += [_tag_backing(label, pin) for label, pin in zip(labels, v.part.pins)]
+        alpha += [v.opacity] * len(labels)
+        lift += [1.0 if v.lifted else 0.0] * len(labels)
+    if not rows:
+        return
+    v0 = made[0][0]
+    buf = v0.canvas.buffer(RECT, v0.layers.tags)
+    slots = buf.alloc_many(len(rows))
+    f = buf.f
+    f["rect"][slots] = rows
+    f["border"][slots] = 0.0
+    for name in ("fill", "fill_on", "edge", "edge_on"):
+        f[name][slots] = _rgba(T.PIN_TAG_BG)
+    f["flags"][slots] = 0, 255, 0, 0
+    f["flags"][slots, 1] = alpha
+    f["lift"][slots] = lift
+    buf.mark_many(slots)
+    backings = iter(Rect.adopt(buf, slots.tolist()))
+    for v, labels in made:
+        v.pin_tags = [(next(backings), label) for label in labels]
+        if v.lifted:
+            for label in labels:
+                label.lifted = True
+
+
+def _make_wire_shapes(views: list[WireView]) -> None:
+    """The segments of a new wire's line (and its junction dots), placed and colored."""
+    if not views:
+        return
+    v0 = views[0]
+    buf = v0.line.buf
+    a, b, radius, caps, kinds = [], [], [], [], []
+    for v in views:
+        v.dots = {end: None for end in ("src", "dst") if not isinstance(getattr(v.wire, end), Pin)}
+        pts = v.points
+        last = len(pts) - 2  # corners (round caps): the points between the ends
+        for k in range(len(pts) - 1):
+            a.append(pts[k])
+            b.append(pts[k + 1])
+            caps.append((255 if k >= 1 else 0, 255 if k + 1 <= last else 0))
+        radius += [T.WIRE_THICKNESS / 2] * (len(pts) - 1)
+        kinds += [Segment] * (len(pts) - 1)
+        for end in v.dots:  # right after its line: a wire crossing the junction covers it
+            p = getattr(v, end)
+            a.append(p)
+            b.append(p)
+            caps.append((255, 255))
+            radius.append(T.JUNCTION_RADIUS)
+            kinds.append(WireDot)
+    slots = buf.alloc_many(len(a))
+    if len(a):
+        f = buf.f
+        f["a"][slots] = a
+        f["b"][slots] = b
+        f["radius"][slots] = radius
+        f["ca"][slots] = f["cb"][slots] = _rgba(T.WIRE_OFF)  # neutral: paint.py gives gradients
+        f["ca_on"][slots] = f["cb_on"][slots] = _rgba(T.WIRE_ON)
+        f["flags"][slots] = 0, 255, 0, 0
+        f["flags"][slots, 2:] = caps
+        f["lift"][slots] = 0.0
+        buf.mark_many(slots)
+    k = 0
+    slot_list = slots.tolist()
+    for v in views:
+        line, pts = v.line, v.points
+        n = max(len(pts) - 1, 0)
+        line.segments = Segment.adopt(buf, slot_list[k:k + n])
+        line._slots = slots[k:k + n]
+        k += n
+        for end in v.dots:
+            v.dots[end], = WireDot.adopt(buf, slot_list[k:k + 1])
+            k += 1
+        line.points = list(pts)
+        line._pair = (T.WIRE_OFF, T.WIRE_ON)
+        line._layout_key, line._plain, line._vfracs = None, True, [0.0] * len(pts)
+        v._last_state = (False, False)
+    _index_many([(v, polyline_boxes(v.points)) for v in views])
+    Touched.wire_many(v.wire.uid for v in views)
 
 
 # ---- many at once ---------------------------------------------------------------

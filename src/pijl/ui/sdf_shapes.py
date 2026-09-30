@@ -196,6 +196,17 @@ class _Shape:
         self.slot: int | None = self.buf.alloc()
         self._set("flags", (0, 255, 0, 0))
 
+    @classmethod
+    def adopt(cls, buf, slots) -> list:
+        """Shape objects for slots already allocated (and written) in `buf`: for making
+        many at once. The caller writes every field, flags included (see __init__)."""
+        out = []
+        for slot in slots:
+            shape = cls.__new__(cls)
+            shape.buf, shape.slot = buf, slot
+            out.append(shape)
+        return out
+
     def _set(self, field: str, value) -> None:
         self.buf.f[field][self.slot] = value
         self.buf.mark(self.slot)
