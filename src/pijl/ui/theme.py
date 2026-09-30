@@ -107,11 +107,6 @@ PIN_TAG_GAP = 4        # between the pin dot's edge and its tag
 TITLE_PAD = 12         # a part's title keeps this much room on each side
 TITLE_SIZE, IO_TITLE_SIZE = 12, 10
 
-# pyglet picks circle smoothness from the radius at creation, which is far too
-# coarse once zoomed in. These stay smooth up to the max zoom (8x).
-PIN_SEGMENTS = 48
-JOINT_SEGMENTS = 24
-
 # Screen-space sizes
 HIT_SLOP_PX = 4  # how forgiving pin/wire clicks are, in screen pixels
 DRAG_THRESHOLD_PX = 4  # mouse must move this far before a press becomes a drag

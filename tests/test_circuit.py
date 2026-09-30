@@ -174,3 +174,21 @@ def test_wire_uids_are_stable():
     assert again.uid == w.uid
     b = c.add_part("NOT")
     assert c.connect(a.outputs[0], b.inputs[0])[0].uid == w.uid + 1
+
+
+def test_take_changes_reports_only_what_changed():
+    c = Circuit()
+    a, g, out, idle = c.add_part("IN"), c.add_part("NOT"), c.add_part("OUT"), c.add_part("NOT")
+    w1, _ = c.connect(a.outputs[0], g.inputs[0])
+    w2, _ = c.connect(g.outputs[0], out.inputs[0])
+    assert c.take_changes() == (True, set(), [])  # new wiring: redraw everything
+    settle(c)
+    c.take_changes()
+    settle(c)
+    assert c.take_changes() == (False, set(), [])  # settled: nothing to redraw
+    c.click(a)
+    settle(c)
+    everything, parts, wires = c.take_changes()
+    assert not everything
+    assert parts == {a, g, out}  # not `idle`
+    assert set(wires) == {w1, w2}

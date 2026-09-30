@@ -1241,10 +1241,20 @@ class Editor(pyglet.window.Window):
         self._tally(dt, time.perf_counter() - t0)
         while self.circuit.errors:
             self._report(self.circuit.errors.pop(0))
-        for view in self.part_views.values():
-            view.sync()
-        for wire, view in self.wire_views.items():
-            view.sync(self.circuit.wire_state(wire))
+        # Only what the sim says changed: touching every view each frame costs ~13 ms per 10k parts.
+        everything, parts, wires = self.circuit.take_changes()
+        if everything:
+            for view in self.part_views.values():
+                view.sync()
+            for wire, view in self.wire_views.items():
+                view.sync(self.circuit.wire_state(wire))
+            return
+        for part in parts:
+            if view := self.part_views.get(part):  # (hidden parts inside macros have none)
+                view.sync()
+        for wire in wires:
+            if view := self.wire_views.get(wire):
+                view.sync(self.circuit.wire_state(wire))
 
     def on_resize(self, width, height):
         super().on_resize(width, height)  # keeps the projection matrix in sync

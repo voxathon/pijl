@@ -134,6 +134,11 @@ class Circuit:
         self._net_of_wire: dict[Wire, int] = {}
         self.net_value: list[bool] = []
         self.net_conflict: list[bool] = []
+        self._wires_of_net: list[list[Wire]] = []  # board wires only
+        # What changed since the UI last asked (take_changes), so it can redraw just that.
+        self._changed_all = True
+        self._changed_parts: set[Part] = set()
+        self._changed_nets: set[int] = set()
 
     # ---- editing -------------------------------------------------------
 
@@ -213,6 +218,7 @@ class Circuit:
             t = p.type
             if t.has("open") and t.kind not in self.faults:
                 self._guard(t, "open", lambda: t.open(p))
+                self._changed_parts.add(p)  # hooks may set pins directly
 
     def close_part(self, part: Part) -> None:
         for p in self._tree(part):
@@ -235,6 +241,7 @@ class Circuit:
             return False
         if t.kind not in self.faults:
             self._guard(t, "click", lambda: t.click(part))
+            self._changed_parts.add(part)  # e.g. IN flips its output pin right here
         return True
 
     def remove_part(self, part: Part) -> list[Wire]:
@@ -376,6 +383,9 @@ class Circuit:
                 index[find(id(w))] = len(self._nets)
                 self._nets.append(([], []))
         self._net_of_wire = {w: index[find(id(w))] for w in wires}
+        self._wires_of_net = [[] for _ in self._nets]
+        for w in self.wires:
+            self._wires_of_net[self._net_of_wire[w]].append(w)
         for part in parts:
             for pin in part.pins:
                 if id(pin) in parent:
@@ -387,6 +397,7 @@ class Circuit:
         self.net_value = [False] * len(self._nets)
         self.net_conflict = [False] * len(self._nets)
         self._nets_dirty = False
+        self._changed_all = True  # net numbers mean something else now; pins were reset
 
     def wire_state(self, wire: Wire) -> tuple[bool, bool]:
         """(value, conflict) of the net this wire belongs to, as of the last step."""
@@ -394,6 +405,19 @@ class Circuit:
             self._rebuild_nets()
         i = self._net_of_wire[wire]
         return self.net_value[i], self.net_conflict[i]
+
+    def take_changes(self) -> tuple[bool, set[Part], list[Wire]]:
+        """What changed since the last call: (everything?, parts whose pins changed,
+        board wires whose net changed). With everything=True, the rest is empty."""
+        if self._nets_dirty:
+            self._rebuild_nets()
+        if self._changed_all:
+            result = True, set(), []
+        else:
+            result = False, self._changed_parts, [w for i in self._changed_nets for w in self._wires_of_net[i]]
+        self._changed_all = False
+        self._changed_parts, self._changed_nets = set(), set()
+        return result
 
     # ---- simulation ----------------------------------------------------
 
@@ -419,17 +443,18 @@ class Circuit:
             if outs is not _FAILED:
                 results.append((group, outs))
         rng = self.rng
+        changed = self._changed_parts
         for group, outs in results:
             if self._settling:  # settling parts take their new outputs only half the time
                 keep = [p.settle <= 0 or rng.random() < 0.5 for p in group]
-                for i, values in enumerate(outs):
-                    for part, value, k in zip(group, values, keep):
-                        if k:
-                            part.outputs[i].state = value
             else:
-                for i, values in enumerate(outs):
-                    for part, value in zip(group, values):
-                        part.outputs[i].state = value
+                keep = None
+            for i, values in enumerate(outs):
+                for j, (part, value) in enumerate(zip(group, values)):
+                    pin = part.outputs[i]
+                    if pin.state != value and (keep is None or keep[j]):
+                        pin.state = value
+                        changed.add(part)
 
         # Phase 2: every net resolves its drivers and hands the value to its readers.
         for i, (drivers, readers) in enumerate(self._nets):
@@ -440,10 +465,14 @@ class Circuit:
                 conflict = any(d.state != value for d in drivers[1:])
                 if conflict:
                     value = False  # placeholder until 4-state logic: X reads as 0
-            self.net_value[i] = value
-            self.net_conflict[i] = conflict
+            if value != self.net_value[i] or conflict != self.net_conflict[i]:
+                self.net_value[i] = value
+                self.net_conflict[i] = conflict
+                self._changed_nets.add(i)
             for pin in readers:
-                pin.state = value
+                if pin.state != value:
+                    pin.state = value
+                    changed.add(pin.part)
         self.tick += 1
         if self._settling:
             for p in self._settling:
@@ -458,6 +487,7 @@ class Circuit:
                 live = [p for p in group if p.live]
                 if live:
                     self._guard(t, "frame", lambda: t.frame(Ctx(live, self.tick, now)))
+                    self._changed_parts.update(live)
 
     # ---- part types --------------------------------------------------------
 
@@ -479,6 +509,7 @@ class Circuit:
                 detail = traceback.format_exc(limit=-1).strip().splitlines()[-1]
                 self.faults[t.kind] = msg = f"{t.kind}.{hook}: {detail}"
                 self.errors.append(msg)
+                self._changed_all = True
                 for part in self._by_kind().get(t, ()):
                     for pin in part.outputs:
                         pin.state = False
