@@ -160,6 +160,10 @@ def test_merge_splices_branch_onto_trunk():
     assert trunk.src is a.outputs[0] and trunk.dst is n2.inputs[0]
     assert twig.src is trunk and branch not in c.wires
     assert c.wires == [trunk, twig]  # parents still before children
+    # the lookups follow the splice
+    assert c.attachments(trunk) == [twig] and c.attachments(branch) == []
+    assert c.wires_at(n2.inputs[0]) == [trunk] and c.wires_at(n1.inputs[0]) == []
+    assert c.descendants(trunk) == [twig]
     a.outputs[0].state = True
     settle(c)
     assert n2.inputs[0].state and n3.inputs[0].state and not n1.inputs[0].state  # n1 was cut off
@@ -192,3 +196,15 @@ def test_take_changes_reports_only_what_changed():
     assert not everything
     assert parts == {a, g, out}  # not `idle`
     assert set(wires) == {w1, w2}
+
+
+def test_revision_counts_edits_not_clicks():
+    c = Circuit()
+    a, g = c.add_part("IN"), c.add_part("NOT")
+    w, _ = c.connect(a.outputs[0], g.inputs[0])
+    r = c.revision
+    c.click(a)
+    settle(c)
+    assert c.revision == r  # using the circuit isn't editing it
+    c.remove_wire(w)
+    assert c.revision > r

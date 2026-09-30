@@ -114,7 +114,7 @@ class Circuit:
         """`registry`: anything with get(kind) / `kind in` -- a Registry, or a
         macros.Catalog to have macros too."""
         self.registry = registry or builtin_registry()
-        self.parts: list[Part] = []   # what's on the board (macro insides are hidden_parts)
+        self._parts: dict[Part, None] = {}  # what's on the board (macro insides are hidden_parts)
         self.hidden_parts: list[Part] = []
         self.hidden_wires: list[Wire] = []
         self.settle_ticks = settle_ticks
@@ -125,7 +125,9 @@ class Circuit:
         self.errors: list[str] = []       # new fault messages, for the UI to pick up
         self._kinds_dirty = True
         self._kinds: dict[PartType, list[Part]] = {}  # instances grouped by type
-        self.wires: list[Wire] = []  # creation order: a wire always comes after the wires it attaches to
+        self._wires: dict[Wire, None] = {}  # creation order: a wire always comes after the wires it attaches to
+        self._at: dict[Endpoint, list[Wire]] = {}  # pin or wire -> the board wires with an end on it
+        self.revision = 0  # bumped by every edit of the board's parts and wiring
         self._next_uid = 1
         self._next_wire_uid = 1
         # Nets are derived from the wiring and cached until the wiring changes.
@@ -140,6 +142,16 @@ class Circuit:
         self._changed_parts: set[Part] = set()
         self._changed_nets: set[int] = set()
 
+    @property
+    def parts(self) -> list[Part]:
+        """The board's parts, in the order they were added (a copy)."""
+        return list(self._parts)
+
+    @property
+    def wires(self) -> list[Wire]:
+        """The board's wires in creation order: parents before children (a copy)."""
+        return list(self._wires)
+
     # ---- editing -------------------------------------------------------
 
     def add_part(self, kind: str, uid: int | None = None, live: bool = True) -> Part:
@@ -151,7 +163,8 @@ class Circuit:
             uid = self._next_uid
         self._next_uid = max(self._next_uid, uid + 1)
         part = self._make(t, uid)
-        self.parts.append(part)
+        self._parts[part] = None
+        self.revision += 1
         if live:
             self.open_part(part)
         return part
@@ -249,10 +262,11 @@ class Circuit:
         those. Returns all removed wires."""
         self.close_part(part)
         removed: list[Wire] = []
-        for w in [w for w in self.wires if any(isinstance(e, Pin) and e.part is part for e in w.ends)]:
-            if w in self.wires:  # may already be gone as a branch of an earlier one
+        for w in _by_uid({w for pin in part.pins for w in self._at.get(pin, ())}):
+            if w in self._wires:  # may already be gone as a branch of an earlier one
                 removed += self.remove_wire(w)
-        self.parts.remove(part)
+        del self._parts[part]
+        self.revision += 1
         if part.inner:  # a macro instance: its insides go too
             dead = set(self._tree(part))
             dead_wires = {w for p in dead for w in p.inner_wires}
@@ -301,16 +315,31 @@ class Circuit:
             uid = self._next_wire_uid
         self._next_wire_uid = max(self._next_wire_uid, uid + 1)
         wire = Wire(a, b, uid)
-        self.wires.append(wire)
+        self._wires[wire] = None
+        self._link(wire)
         self._nets_dirty = True
+        self.revision += 1
         return wire, replaced
+
+    def _link(self, wire: Wire) -> None:
+        for end in wire.ends:
+            self._at.setdefault(end, []).append(wire)
+
+    def _unlink(self, wire: Wire) -> None:
+        for end in wire.ends:
+            attached = self._at[end]
+            attached.remove(wire)
+            if not attached:
+                del self._at[end]
 
     def remove_wire(self, wire: Wire) -> list[Wire]:
         """Removes the wire and everything attached to it. Returns them, parents first."""
         removed = [wire, *self.descendants(wire)]
-        dead = set(removed)
-        self.wires = [w for w in self.wires if w not in dead]
+        for w in removed:
+            del self._wires[w]
+            self._unlink(w)
         self._nets_dirty = True
+        self.revision += 1
         return removed
 
     def merge(self, keep: Wire, absorb: Wire) -> None:
@@ -325,30 +354,42 @@ class Circuit:
         to it), so everything that now attaches to keep still comes after it.
         """
         far = absorb.dst if absorb.src is keep else absorb.src
+        self._unlink(keep)
         keep.dst = far
-        for w in self.wires:
+        for w in list(self._at.get(absorb, ())):
+            self._unlink(w)
             if w.src is absorb:
                 w.src = keep
             if w.dst is absorb:
                 w.dst = keep
-        self.wires.remove(absorb)
+            self._link(w)
+        self._unlink(absorb)
+        del self._wires[absorb]
+        self._link(keep)
         self._nets_dirty = True
+        self.revision += 1
 
     def attachments(self, wire: Wire) -> list[Wire]:
         """Wires with an end on `wire` (branches, stubs, extra drivers)."""
-        return [w for w in self.wires if wire in w.ends]
+        return _by_uid(self._at.get(wire, ()))
 
     def wires_at(self, pin: Pin) -> list[Wire]:
-        return [w for w in self.wires if pin in w.ends]
+        return _by_uid(self._at.get(pin, ()))
 
-    def descendants(self, wire: Wire) -> list[Wire]:
-        """Wires attached to `wire`, wires attached to those, and so on (in creation order)."""
-        found = {wire}
-        for w in self.wires:  # creation order means parents are seen before children
-            if w.src in found or w.dst in found:
-                found.add(w)
-        found.discard(wire)
-        return [w for w in self.wires if w in found]
+    def ends_on(self, end: Endpoint) -> tuple[Wire, ...] | list[Wire]:
+        """The wires with an end on this pin or wire, in no particular order (fast; don't modify)."""
+        return self._at.get(end, ())
+
+    def descendants(self, *wires: Wire) -> list[Wire]:
+        """Wires attached to these, wires attached to those, and so on (in creation order)."""
+        found: set[Wire] = set()
+        todo = list(wires)
+        while todo:
+            for w in self._at.get(todo.pop(), ()):
+                if w not in found:
+                    found.add(w)
+                    todo.append(w)
+        return _by_uid(found.difference(wires))
 
     # ---- nets -------------------------------------------------------------
 
@@ -514,6 +555,12 @@ class Circuit:
                     for pin in part.outputs:
                         pin.state = False
             return _FAILED
+
+
+def _by_uid(wires) -> list[Wire]:
+    """Creation order: uids grow as wires are made, and a wire's parents are always older
+    (a merge keeps the older wire), so this also puts parents before children."""
+    return sorted(wires, key=lambda w: w.uid)
 
 
 def _outputs(t: PartType, raw: Any, n: int) -> list[list[bool]]:

@@ -5,7 +5,7 @@ props, wire endpoints and bends -- keyed by stable uids.
 
 Undo doesn't rebuild the board from scratch. `restore` diffs the target
 snapshot against what's on screen and only adds/removes/moves what changed,
-because creating pyglet shapes is the slow part (~0.8 ms per part). A side
+because creating views (shapes, labels) is the slow part. A side
 effect: parts that survive an undo keep their switch states.
 
 Wire uids grow in creation order and a wire is always created after the wires
@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Iterable
 
 from ..sim import Pin, Wire
 from ..snapshot import EMPTY, EndRef, Snapshot
-from .views import PartView, WireView
+from .views import PartView, Revision, WireView
 
 if TYPE_CHECKING:
     from .editor import Editor
@@ -32,9 +32,8 @@ def capture(editor: Editor, views: Iterable[PartView] | None = None) -> Snapshot
     """The whole board, or just `views` plus every wire fully inside that set
     (both ends on those parts, or on wires that are themselves inside)."""
     views = list(editor.part_views.values() if views is None else views)
-    uids = {v.part.uid for v in views}
     parts = {v.part.uid: (v.part.kind, v.part.label, v.x, v.y, copy.deepcopy(v.part.props)) for v in views}
-    inside = internal_wires(editor, uids)
+    inside = internal_wires(editor, views)
     wires, colors = {}, {}
     for view in inside:
         w = view.wire
@@ -46,12 +45,19 @@ def capture(editor: Editor, views: Iterable[PartView] | None = None) -> Snapshot
     return Snapshot(parts, wires, colors)
 
 
-def internal_wires(editor: Editor, part_uids: set[int]) -> list[WireView]:
+def internal_wires(editor: Editor, views: Iterable[PartView]) -> list[WireView]:
     """Wire views whose every end lands on those parts or on other internal wires."""
+    c = editor.circuit
+    parts = {v.part for v in views}
+    if 2 * len(parts) > len(editor.part_views):
+        candidates = c.wires  # most of the board: just go through all of them
+    else:  # only wires reachable from those parts' pins can qualify
+        near = {w for part in parts for pin in part.pins for w in c.ends_on(pin)}
+        candidates = sorted(near.union(c.descendants(*near)), key=lambda w: w.uid)
     inside: set[Wire] = set()
     result = []
-    for w in editor.circuit.wires:  # creation order: parents first
-        if all(e.part.uid in part_uids if isinstance(e, Pin) else e in inside for e in w.ends):
+    for w in candidates:  # creation order: parents first
+        if all(e.part in parts if isinstance(e, Pin) else e in inside for e in w.ends):
             inside.add(w)
             result.append(editor.wire_views[w])
     return result
@@ -88,6 +94,7 @@ def restore(editor: Editor, target: Snapshot) -> None:
             view.name.move_to(*view.name_pos())
         if view.part.props != props:
             view.part.props = copy.deepcopy(props)
+            Revision.bump()
     # 4. wires, parents first: add missing, update bends / junction points
     wire_by_uid = {v.wire.uid: v.wire for v in editor.wire_views.values()}
     changed: list[WireView] = []
@@ -119,7 +126,7 @@ def instantiate(editor: Editor, clip: Snapshot, live: bool = True) -> tuple[list
     new: dict[int, PartView] = {}
     for uid, (kind, label, x, y, props) in clip.parts.items():
         view = new[uid] = editor.add_part(kind, x, y, live=live)
-        view.part.props = copy.deepcopy(props)
+        view.part.props = copy.deepcopy(props)  # (a new part: the circuit counted that as an edit)
         if label:
             view.part.label = label
             view.refresh_name()

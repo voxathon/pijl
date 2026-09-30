@@ -33,6 +33,7 @@ from pyglet import shapes
 
 from . import theme as T
 from .camera import Camera
+from .canvas import Canvas
 from .views import Layers, Point, Polyline, WireView, project_onto
 
 BEND_PX = 10          # square side
@@ -94,13 +95,13 @@ class _Handle:
 
 
 class WireEditSession:
-    def __init__(self, view: WireView, camera: Camera, batch: pyglet.graphics.Batch, layers: Layers,
+    def __init__(self, view: WireView, camera: Camera, canvas: Canvas, layers: Layers,
                  parents: dict[End, WireView], branches: list[tuple[WireView, End]]) -> None:
         """`parents`: the wire each of this wire's junction ends sits on.
         `branches`: the (wire, end) pairs whose junction sits on this wire."""
         self.view = view
         self.camera = camera
-        self.batch = batch
+        self.batch = canvas.batch  # the handles are plain pyglet shapes, over everything
         self.group = layers.overlay
         self.original = list(view.bends)
         self.original_ends = view.src, view.dst
@@ -111,7 +112,7 @@ class WireEditSession:
         self.branch_original = [(b, b.src, b.dst) for b, _ in branches]
         self.anchors: dict[int, Anchor] = {j: _anchor_of(view.points, getattr(w, end))
                                           for j, (w, end, rail) in enumerate(self.junctions) if rail is view}
-        self.halo = Polyline(view.points, T.WIRE_HALO, batch, layers.wire_halo,
+        self.halo = Polyline(view.points, T.WIRE_HALO, canvas, layers.wire_halo,
                              thickness=T.WIRE_THICKNESS + 6)
         self.bend_handles: list[_Handle] = []
         self.add_handles: list[_Handle] = []

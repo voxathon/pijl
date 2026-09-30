@@ -25,9 +25,9 @@ from pathlib import Path
 
 import numpy as np
 import pyglet
-from pyglet import gl
-from pyglet.graphics.shader import Shader, ShaderProgram
 from scipy.ndimage import distance_transform_edt
+
+from .canvas import UNIFORMS, Canvas, Kind
 
 FONT_NAME = "Consolas"
 EM_PT = 48               # rasterization size in points
@@ -39,40 +39,45 @@ CHARS = "".join(chr(c) for c in range(33, 127))  # printable ASCII except space
 ATLAS_W = 1024
 _FORMAT_VERSION = 1  # bump when the cache layout or SDF math changes
 
-_VERTEX = """#version 150 core
-in vec2 position;
-in vec2 tex_coords;
-in vec4 colors;
-out vec2 uv;
-out vec4 color;
-uniform WindowBlock { mat4 projection; mat4 view; } window;
-void main() {
-    gl_Position = window.projection * window.view * vec4(position, 0.0, 1.0);
-    uv = tex_coords;
-    color = colors;
-}
+_VERTEX = f"""#version 150 core
+in vec4 rect;   // x, y, width, height of the glyph's quad
+in vec4 uv;     // u0, v0, u1, v1 in the atlas
+in vec4 color;
+out vec2 tex;
+flat out vec4 c;
+{UNIFORMS}
+void main() {{
+    vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));
+    tex = mix(uv.xy, uv.zw, corner);
+    c = color;
+    gl_Position = window.projection * window.view * vec4(rect.xy + corner * rect.zw, 0.0, 1.0);
+}}
 """
 
 _FRAGMENT = """#version 150 core
-in vec2 uv;
-in vec4 color;
+in vec2 tex;
+flat in vec4 c;
 out vec4 final_color;
 uniform sampler2D sdf;
 const float SPREAD = %(spread)s;
 void main() {
-    float d = texture(sdf, uv).r;       // 0.5 = on the outline, >0.5 = inside
+    float d = texture(sdf, tex).r;      // 0.5 = on the outline, >0.5 = inside
     // How many atlas texels one screen pixel covers. Taken from the UV derivatives
     // rather than fwidth(d): at heavy minification d itself turns to noise.
-    vec2 texel = uv * vec2(textureSize(sdf, 0));
+    vec2 texel = tex * vec2(textureSize(sdf, 0));
     float texels_per_px = max(length(dFdx(texel)), length(dFdy(texel)));
     float w = texels_per_px / (2.0 * SPREAD);   // SDF value change per screen pixel
     float a = smoothstep(0.5 - 0.7 * w, 0.5 + 0.7 * w, d);
     // Fade out when glyphs get too small to read (em under ~5-10 screen px).
     a *= clamp((0.8 - w) / 0.4, 0.0, 1.0);
-    final_color = vec4(color.rgb, color.a * a);
+    final_color = vec4(c.rgb, c.a * a);
     if (final_color.a < 0.01) discard;
 }
 """ % {"spread": float(SPREAD)}
+
+GLYPH = Kind("glyph", 0, _VERTEX, _FRAGMENT,
+             np.dtype([("rect", "f4", 4), ("uv", "f4", 4), ("color", "u1", 4)]),
+             texture=lambda: _get_atlas().texture)
 
 
 @dataclass
@@ -91,7 +96,8 @@ class _Atlas:
         self.glyphs = {ch: _Glyph(*row[:4], uv=tuple(row[4:])) for ch, row in zip(CHARS, table.tolist())}
         rgba = np.repeat(atlas[:, :, None], 4, axis=2)
         self.texture = pyglet.image.ImageData(ATLAS_W, h, "RGBA", rgba.tobytes()).get_texture()
-        self.program = ShaderProgram(Shader(_VERTEX, "vertex"), Shader(_FRAGMENT, "fragment"))
+        # per character: its quad relative to the pen (source px) and its atlas uv, for numpy layout
+        self.boxes = {ch: (g.left, g.bottom, g.right - g.left, g.top - g.bottom) for ch, g in self.glyphs.items()}
 
 
 def _cache_path() -> Path:
@@ -186,33 +192,12 @@ def _get_atlas() -> _Atlas:
     return _atlas
 
 
-class _SDFGroup(pyglet.graphics.Group):
-    def __init__(self, atlas: _Atlas, order: int) -> None:
-        super().__init__(order=order)
-        self.atlas = atlas
-
-    def set_state(self) -> None:
-        self.atlas.program.use()
-        gl.glActiveTexture(gl.GL_TEXTURE0)
-        gl.glBindTexture(self.atlas.texture.target, self.atlas.texture.id)
-        gl.glEnable(gl.GL_BLEND)
-        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
-
-    def unset_state(self) -> None:
-        gl.glDisable(gl.GL_BLEND)
-        self.atlas.program.stop()
-
-    __eq__ = object.__eq__
-    __hash__ = object.__hash__
-
-
 class SDFText:
-    """Factory for world-space labels that all share one atlas and one draw call."""
+    """Factory for world-space labels that all share one atlas and one instance buffer."""
 
-    def __init__(self, batch: pyglet.graphics.Batch, order: int) -> None:
-        self.batch = batch
+    def __init__(self, canvas: Canvas, layer) -> None:
         self.atlas = _get_atlas()
-        self.group = _SDFGroup(self.atlas, order)
+        self.buf = canvas.buffer(GLYPH, layer)
 
     def measure(self, text: str, size: float) -> float:
         """Width `text` would have at `size` (monospace: just the character count)."""
@@ -226,36 +211,38 @@ class SDFText:
 class SDFLabel:
     """One line of text anchored at (x, y): vertically centered on the capitals,
     horizontally per `anchor_x` ("left", "center", "right"). `size` is in points
-    at zoom 1, like pyglet's font_size. Characters outside the atlas are dropped."""
+    at zoom 1, like pyglet's font_size. Characters outside the atlas are dropped.
+    Each visible character is one glyph instance."""
 
     def __init__(self, owner: SDFText, text: str, x: float, y: float, size: float,
                  color: tuple[int, int, int, int], anchor_x: str = "center") -> None:
         self.owner = owner
         self.atlas = owner.atlas
+        self.buf = owner.buf
         self.scale = size * 96 / 72 / EM_PX  # atlas px -> world units
         self.anchor_x = anchor_x
         self.x, self.y = x, y
         self._color = tuple(color)
-        self.vlist = None
+        self.slots = np.empty(0, np.intp)
+        # per glyph: its quad relative to (left edge, capitals' center), world units; moving is one add
+        self._rel = np.empty((0, 4), np.float32)
         self.text = ""
         self.set_text(text)
 
     def set_text(self, text: str) -> None:
         self.text = "".join(c for c in text if c == " " or c in self.atlas.glyphs)
-        if self.vlist is not None:
-            self.vlist.delete()
-            self.vlist = None
-        chars = [c for c in self.text if c != " "]
-        n = len(chars)
-        if n:
-            self.vlist = self.atlas.program.vertex_list_indexed(
-                n * 4, gl.GL_TRIANGLES,
-                [i * 4 + k for i in range(n) for k in (0, 1, 2, 0, 2, 3)],
-                self.owner.batch, self.owner.group,
-                position=("f", [0.0] * n * 8),
-                tex_coords=("f", [c for ch in chars for c in _quad_uv(self.atlas.glyphs[ch].uv)]),
-                colors=("Bn", self._color * n * 4),
-            )
+        self._free()
+        visible = [(i, c) for i, c in enumerate(self.text) if c != " "]
+        if visible:
+            buf, a, s = self.buf, self.atlas, self.scale
+            self.slots = np.array([buf.alloc() for _ in visible], np.intp)
+            boxes = np.array([a.boxes[c] for _, c in visible], np.float32)
+            pens = np.array([i for i, _ in visible], np.float32)
+            self._rel = np.column_stack((pens * a.advance + boxes[:, 0], boxes[:, 1] - a.cap_height / 2,
+                                         boxes[:, 2], boxes[:, 3])) * s
+            buf.f["uv"][self.slots] = [a.glyphs[c].uv for _, c in visible]
+            buf.f["color"][self.slots] = self._color
+            buf.mark_many(self.slots)
         self.move_to(self.x, self.y)
 
     @property
@@ -275,19 +262,10 @@ class SDFLabel:
 
     def move_to(self, x: float, y: float) -> None:
         self.x, self.y = x, y
-        if self.vlist is None:
+        if not self.slots.size:
             return
-        a, s = self.atlas, self.scale
-        pen = self._left()
-        base = y - a.cap_height * s / 2  # center capitals vertically
-        pos: list[float] = []
-        for ch in self.text:
-            g = a.glyphs.get(ch)
-            if g is not None:
-                l, b, r, t = pen + g.left * s, base + g.bottom * s, pen + g.right * s, base + g.top * s
-                pos += (l, b, r, b, r, t, l, t)
-            pen += a.advance * s
-        self.vlist.position[:] = pos
+        self.buf.f["rect"][self.slots] = self._rel + (self._left(), y, 0.0, 0.0)
+        self.buf.mark_many(self.slots)
 
     @property
     def opacity(self) -> int:
@@ -296,15 +274,14 @@ class SDFLabel:
     @opacity.setter
     def opacity(self, value: int) -> None:
         self._color = (*self._color[:3], value)
-        if self.vlist is not None:
-            self.vlist.colors[:] = self._color * (len(self.vlist.colors) // 4)
+        if self.slots.size:
+            self.buf.f["color"][self.slots, 3] = value
+            self.buf.mark_many(self.slots)
+
+    def _free(self) -> None:
+        for slot in self.slots.tolist():
+            self.buf.free(slot)
+        self.slots = np.empty(0, np.intp)
 
     def delete(self) -> None:
-        if self.vlist is not None:
-            self.vlist.delete()
-            self.vlist = None
-
-
-def _quad_uv(uv: tuple[float, float, float, float]) -> tuple[float, ...]:
-    u0, v0, u1, v1 = uv
-    return (u0, v0, u1, v0, u1, v1, u0, v1)
+        self._free()

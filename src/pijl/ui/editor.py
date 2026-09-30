@@ -92,6 +92,7 @@ from ..sim import Part, Circuit, Pin, Wire
 from ..snapshot import MACRO  # library entries (and part kinds) of saved macros: "macro:<name>"
 from . import theme as T
 from .camera import MIN_LEVEL, STEPS_PER_OCTAVE, Camera
+from .canvas import Canvas
 from .controls import ControlsSheet
 from .document import EMPTY, History, Snapshot, capture, instantiate, internal_wires, restore
 from .duplicate import DOWN, RIGHT, Cell, Tiling
@@ -104,9 +105,10 @@ from .picker import PartPicker, Row
 from .prompt import Prompt
 from .sdf_text import SDFText
 from .selection import Selection
+from .spatial import SpatialHash, ordered
 from .status_bar import BAR_H, StatusBar
-from .views import (PartView, Layers, Point, Polyline, WireView, arc_length_at, points_before, project_onto,
-                    theme_color)
+from .views import (PartView, Layers, Point, Polyline, Revision, WireView, arc_length_at, points_before,
+                    project_onto, theme_color)
 from .wire_edit import WireEditSession
 
 SIM_STEPS_PER_FRAME = 1
@@ -150,6 +152,7 @@ def _make_config() -> pyglet.gl.Config | None:
 class Editor(pyglet.window.Window):
     def __init__(self) -> None:
         self.history: History | None = None  # set up by _start_document; checked by dispatch_event
+        self._captured: tuple = ()  # _board_revision() as of the last snapshot
         super().__init__(1280, 720, caption="pijl", resizable=True, vsync=True, config=_make_config())
         # the open document: a macro, or an untitled board (set early: the picker asks about it)
         self.doc: str | None = None          # its name; None = untitled
@@ -168,7 +171,7 @@ class Editor(pyglet.window.Window):
         self.keys = key.KeyStateHandler()  # live "is this key down?" lookups
         self.push_handlers(self.keys)
 
-        self.world = pyglet.graphics.Batch()
+        self.world = Canvas(pyglet.graphics.Batch())  # parts and wires; see canvas.py
         self.layers = Layers()
         self.text = SDFText(self.world, self.layers.text_order)
         self.hud = pyglet.graphics.Batch()
@@ -189,6 +192,9 @@ class Editor(pyglet.window.Window):
 
         self.part_views: dict[Part, PartView] = {}
         self.wire_views: dict[Wire, WireView] = {}
+        # Where every view is, for hit testing without looking at all of them (views keep it current)
+        self.part_index = SpatialHash()
+        self.wire_index = SpatialHash()
 
         # interaction state
         self.mode = Mode.IDLE
@@ -245,7 +251,7 @@ class Editor(pyglet.window.Window):
         """`live=False`: a ghost, for carrying on the cursor (see _carry / _commit_placing)."""
         part = self.circuit.add_part(kind, uid, live)
         view = PartView(part, x, y, self.world, self.layers, self.text,
-                        pin_labels=self.pin_label_mode == PIN_LABELS_ALWAYS)
+                        pin_labels=self.pin_label_mode == PIN_LABELS_ALWAYS, index=self.part_index)
         self.part_views[part] = view
         return view
 
@@ -276,7 +282,8 @@ class Editor(pyglet.window.Window):
                 bends, a_pos, b_pos = list(reversed(bends)), b_pos, a_pos
             src = self.pin_pos(wire.src) if isinstance(wire.src, Pin) else a_pos
             dst = self.pin_pos(wire.dst) if isinstance(wire.dst, Pin) else b_pos
-            self.wire_views[wire] = WireView(wire, src, list(bends), dst, self.world, self.layers, color)
+            self.wire_views[wire] = WireView(wire, src, list(bends), dst, self.world, self.layers, color,
+                                             index=self.wire_index)
         return wire
 
     def remove_wire(self, view: WireView) -> None:
@@ -327,7 +334,7 @@ class Editor(pyglet.window.Window):
         for gone in (w, splice):
             self._drop_wire_view(gone)
         self.wire_views[w] = WireView(w, src_pos, bends, self.end_pos(w.dst, far_pos), self.world, self.layers,
-                                      color)
+                                      color, index=self.wire_index)
         self.refresh_wires([self.wire_views[w]])
 
     def _attach_point(self, x: Wire, parent: Wire) -> Point:
@@ -351,8 +358,8 @@ class Editor(pyglet.window.Window):
         return self.part_views[pin.part].pin_pos(pin)
 
     def wires_touching(self, parts: set[Part]) -> list[WireView]:
-        return [v for w, v in self.wire_views.items()
-                if any(isinstance(e, Pin) and e.part in parts for e in w.ends)]
+        wires = {w for part in parts for pin in part.pins for w in self.circuit.ends_on(pin)}
+        return [self.wire_views[w] for w in wires]
 
     def refresh_wires_touching(self, parts: set[Part]) -> None:
         self.refresh_wires(self.wires_touching(parts))
@@ -364,11 +371,9 @@ class Editor(pyglet.window.Window):
         todo = {v.wire for v in views}
         if not todo:
             return
-        for wire in self.circuit.wires:  # creation order: parents before children
-            if wire in todo or any(e in todo for e in wire.ends):
-                todo.add(wire)
-                view = self.wire_views[wire]
-                view.set_ends(self.end_pos(wire.src, view.src), self.end_pos(wire.dst, view.dst))
+        for wire in sorted(todo.union(self.circuit.descendants(*todo)), key=lambda w: w.uid):  # parents first
+            view = self.wire_views[wire]
+            view.set_ends(self.end_pos(wire.src, view.src), self.end_pos(wire.dst, view.dst))
 
     def end_pos(self, end: Pin | Wire, near: Point) -> Point:
         if isinstance(end, Pin):
@@ -397,7 +402,7 @@ class Editor(pyglet.window.Window):
         return T.HIT_SLOP_PX / self.camera.zoom
 
     def pin_at(self, wx: float, wy: float) -> Pin | None:
-        for view in reversed(self.part_views.values()):
+        for view in ordered(self.part_index.near(wx, wy, self.slop), newest_first=True):
             if self.mode is Mode.PLACING_PART and view in self.placing_views:
                 continue  # parts on the cursor aren't targets
             if pin := view.pin_at(wx, wy, self.slop):
@@ -405,12 +410,15 @@ class Editor(pyglet.window.Window):
         return None
 
     def part_at(self, wx: float, wy: float) -> PartView | None:
-        return next((v for v in reversed(self.part_views.values()) if v.contains(wx, wy)), None)
+        return next((v for v in ordered(self.part_index.near(wx, wy, 0), newest_first=True)
+                     if v.contains(wx, wy)), None)
 
     def wire_at(self, wx: float, wy: float) -> WireView | None:
+        """The nearest wire within reach (the older one on a tie, e.g. right on a junction)."""
         limit = T.WIRE_THICKNESS / 2 + self.slop
-        best = min(self.wire_views.values(), key=lambda v: v.distance_to(wx, wy), default=None)
-        return best if best is not None and best.distance_to(wx, wy) <= limit else None
+        near = ((v.distance_to(wx, wy), v.seq, v) for v in self.wire_index.near(wx, wy, limit))
+        d, _, best = min(near, default=(math.inf, 0, None))
+        return best if d <= limit else None
 
     def wire_target(self, wx: float, wy: float) -> tuple[Pin | Wire, Point] | None:
         """What a wire being drawn would connect to here: a pin (preferred) or a
@@ -810,6 +818,7 @@ class Editor(pyglet.window.Window):
             view.part.props.pop("color", None)
         else:
             view.part.props["color"] = color
+        Revision.bump()
 
     def _close_menu(self) -> None:
         self.menu.close()
@@ -820,7 +829,7 @@ class Editor(pyglet.window.Window):
         self.mode = Mode.EDITING_WIRE
         parents = {end: self.wire_views[e] for end, e in zip(("src", "dst"), view.wire.ends)
                    if isinstance(e, Wire)}
-        branches = [(self.wire_views[w], end) for w in self.circuit.wires
+        branches = [(self.wire_views[w], end) for w in self.circuit.attachments(view.wire)
                     for end, e in zip(("src", "dst"), w.ends) if e is view.wire]
         self.wire_edit = WireEditSession(view, self.camera, self.world, self.layers, parents, branches)
         self.wire_edit.set_hover(self._wire_edit_target(*self.mouse))
@@ -861,7 +870,7 @@ class Editor(pyglet.window.Window):
         self.mode = Mode.EDITING_LABEL
         self.edit_view = view
         self.edit = LineEdit(view.part.label, LABEL_MAX)
-        self.caret = shapes.Rectangle(0, 0, 1, 1, color=T.CARET, batch=self.world, group=self.layers.overlay)
+        self.caret = shapes.Rectangle(0, 0, 1, 1, color=T.CARET, batch=self.world.batch, group=self.layers.overlay)
         pyglet.clock.schedule_interval(self._blink_caret, 0.5)
         self._update_edit()
 
@@ -986,7 +995,7 @@ class Editor(pyglet.window.Window):
             return
         if not self._tiling_active():
             unit = list(self.selection.parts)
-            wires = internal_wires(self, {v.part.uid for v in unit})
+            wires = internal_wires(self, unit)
             self.tiling = Tiling(capture(self, unit), unit, wires)
         t = self.tiling
         t.grow(t.next_axis(), lambda: Cell.of(*instantiate(self, t.unit)))
@@ -1064,12 +1073,11 @@ class Editor(pyglet.window.Window):
         if grabbed not in self.selection:
             self.selection.set(parts=[grabbed])
         group = self.selection.parts
-        parts = {v.part for v in group}
         self.drag_group = [(v, v.x, v.y) for v in group]
         # Wires with BOTH ends in the group move rigidly with it, bends included.
         # Wires with one end outside keep their bends; only that end follows.
         self.drag_wires = [(v, list(v.bends), v.src, v.dst)
-                           for v in internal_wires(self, {c.uid for c in parts})]
+                           for v in internal_wires(self, group)]
         self.drag_origin = (grabbed.x, grabbed.y)
         self.mode = Mode.DRAGGING_PART
 
@@ -1107,8 +1115,8 @@ class Editor(pyglet.window.Window):
         (wx0, wy0), (wx1, wy1) = self.camera.screen_to_world(x0, y0), self.camera.screen_to_world(x1, y1)
         base_parts, base_wires = self.box_base
         self.selection.set(
-            base_parts | {v for v in self.part_views.values() if v.intersects(wx0, wy0, wx1, wy1)},
-            base_wires | {v for v in self.wire_views.values() if v.inside(wx0, wy0, wx1, wy1)})
+            base_parts | {v for v in self.part_index.query(wx0, wy0, wx1, wy1) if v.intersects(wx0, wy0, wx1, wy1)},
+            base_wires | {v for v in self.wire_index.query(wx0, wy0, wx1, wy1) if v.inside(wx0, wy0, wx1, wy1)})
 
     def _end_box(self) -> None:
         if self.box_shapes is not None:
@@ -1213,9 +1221,14 @@ class Editor(pyglet.window.Window):
         """After any click/release/key that leaves the editor idle, snapshot the board
         and record it if it changed. So every action -- including ones added later --
         is undoable without writing inverse operations, and no-ops (a click on
-        empty space, a switch toggle) don't clutter the history."""
+        empty space, a switch toggle) don't clutter the history.
+
+        Snapshotting a big board takes a while, so it only happens if something that
+        holds board data says it changed since the last one (see _board_revision)."""
         result = super().dispatch_event(event_type, *args)
-        if event_type in self._EDIT_EVENTS and self.history is not None and self.mode is Mode.IDLE:
+        if (event_type in self._EDIT_EVENTS and self.history is not None and self.mode is Mode.IDLE
+                and self._board_revision() != self._captured):
+            self._captured = self._board_revision()
             snap = capture(self)
             self.history.commit(snap)
             self._repaint(snap)
@@ -1353,8 +1366,14 @@ class Editor(pyglet.window.Window):
             paint(self)
             self._painted = snap
 
+    def _board_revision(self) -> tuple:
+        """Changes whenever the board may have been edited (the circuit's parts and wiring,
+        and what the views hold: positions, bends, labels, colors, props)."""
+        return id(self.circuit), self.circuit.revision, Revision.value
+
     def _reset_history(self, doc: str | None) -> None:
         """A fresh undo timeline for what's on the board now, which counts as saved."""
+        self._captured = self._board_revision()
         self.history = History(capture(self))
         self._repaint(self.history.current)
         self.saved = self.history.current
