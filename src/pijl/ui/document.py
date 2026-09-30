@@ -152,6 +152,11 @@ class History:
         self.current = snap
         return True
 
+    def amend(self, snap: Snapshot) -> None:
+        """Replace the newest state instead of adding one (a run of small tweaks = one undo step)."""
+        self.redo_stack.clear()
+        self.current = snap
+
     def undo(self) -> Snapshot | None:
         if not self.undo_stack:
             return None

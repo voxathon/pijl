@@ -49,6 +49,10 @@ Controls
   Ctrl+C / Ctrl+X         copy / cut the selected parts (+ wires running between them)
   Ctrl+V                   paste: the copy follows the cursor like a new part; click to place
                            (shift+click: place and keep another copy), Esc/right-click cancels
+  Ctrl+D                   duplicate into a block: each press doubles it, right then down
+                           (1, 2x1, 2x2, 4x2...). While it's still selected, Ctrl+scroll spaces
+                           it out along the last doubling, Ctrl+Shift+scroll the other way.
+                           See duplicate.py.
   Ctrl+S                   save the board as a macro (the first save asks for a name)
   Ctrl+Shift+S             save under another name
   Ctrl+O                   open a macro: type to filter, arrows + Enter (or click); saved macros
@@ -87,6 +91,7 @@ from ..snapshot import MACRO  # library entries (and part kinds) of saved macros
 from . import theme as T
 from .camera import MIN_LEVEL, STEPS_PER_OCTAVE, Camera
 from .document import EMPTY, History, Snapshot, capture, instantiate, internal_wires, restore
+from .duplicate import DOWN, RIGHT, Cell, Tiling
 from .grid import Grid
 from .library import Library
 from .line_edit import LineEdit
@@ -168,7 +173,7 @@ class Editor(pyglet.window.Window):
                                  disabled=self._unplaceable)
         self.menu = ContextMenu(self.hud)
         self.help = pyglet.text.Label(
-            "click pin: wire | click: select | drag empty: box select | Del: delete | Ctrl+C/X/V | "
+            "click pin: wire | click: select | drag empty: box select | Del: delete | Ctrl+C/X/V/D | "
             "Ctrl+Z/Y | Ctrl+S/O/N: save/open/new | Tab: pin names | right-click: menu | middle-drag: pan | "
             "scroll: zoom | hold Ctrl: snap",
             font_name="Consolas", font_size=10, color=T.HELP_TEXT,
@@ -211,6 +216,7 @@ class Editor(pyglet.window.Window):
         self.place_again = None               # shift+click: start another of the same
         self.placing_kind: str | None = None  # the picker part on the cursor (None for a paste)
         self.clipboard: Snapshot | None = None
+        self.tiling: Tiling | None = None  # the Ctrl+D block being grown (see duplicate.py)
         # selection
         self.selection = Selection()
         self.drag_group: list[tuple[PartView, float, float]] = []  # parts moving + their start origins
@@ -669,6 +675,9 @@ class Editor(pyglet.window.Window):
             if self.mode is not Mode.PICKER_DRAG:
                 self.picker.set_hover(self.picker.hit(x, y))
             return
+        if scroll_y and self.snapping and self.mode is Mode.IDLE and self._tiling_active():
+            self._space_tiling(scroll_y)
+            return
         self.camera.scroll(x, y, scroll_y)
         self._follow_cursor()
 
@@ -739,6 +748,8 @@ class Editor(pyglet.window.Window):
                     self.delete_selection()
         elif modifiers & key.MOD_CTRL and symbol == key.V and self.mode is Mode.IDLE and self.clipboard:
             self._start_paste()
+        elif modifiers & key.MOD_CTRL and symbol == key.D and self.mode is Mode.IDLE:
+            self._duplicate()
         elif symbol == key.BACKSPACE and self.mode is Mode.WIRING:
             self._pop_bend_or_cancel()
         elif symbol == key.TAB:
@@ -954,6 +965,49 @@ class Editor(pyglet.window.Window):
         paint(self)  # the ghosts show their colors too
         self._carry(views, wires, again=self._start_paste)
         self.placing_kind = None
+
+    def _selection_signature(self):
+        """What the selection is and where it sits: a Ctrl+D block keeps growing only
+        while this is unchanged since its last step."""
+        return (frozenset((v, v.x, v.y) for v in self.selection.parts), frozenset(self.selection.wires))
+
+    def _tiling_active(self) -> bool:
+        return self.tiling is not None and self.tiling.signature == self._selection_signature()
+
+    def _duplicate(self) -> None:
+        if not self.selection.parts:
+            return
+        if not self._tiling_active():
+            unit = list(self.selection.parts)
+            wires = internal_wires(self, {v.part.uid for v in unit})
+            self.tiling = Tiling(capture(self, unit), unit, wires)
+        t = self.tiling
+        t.grow(t.next_axis(), lambda: Cell.of(*instantiate(self, t.unit)))
+        t.adjusting = False  # this press is its own undo step (committed by dispatch_event)
+        self._place_tiling()
+
+    def _space_tiling(self, scroll_y: float) -> None:
+        t = self.tiling
+        if t.last is None:
+            return
+        shift = self.keys[key.LSHIFT] or self.keys[key.RSHIFT]
+        axis = t.last if not shift else (DOWN if t.last == RIGHT else RIGHT)
+        if not t.adjust(axis, 1 if scroll_y > 0 else -1):
+            return
+        self._place_tiling()
+        snap = capture(self)
+        if t.adjusting:
+            self.history.amend(snap)  # a run of Ctrl+scroll notches undoes as one step
+        else:
+            t.adjusting = self.history.commit(snap)
+        self._repaint(snap)
+
+    def _place_tiling(self) -> None:
+        t = self.tiling
+        wires = t.layout()
+        self.refresh_wires([*self.wires_touching({v.part for v in t.all_parts()}), *wires])
+        self.selection.set(t.all_parts(), t.all_wires())
+        t.signature = self._selection_signature()
 
     def _carry(self, views: list[PartView], wires: list[WireView], again) -> None:
         """Attach new (ghost) parts + wires to the cursor, centered on it, until a click."""
@@ -1267,6 +1321,7 @@ class Editor(pyglet.window.Window):
     def _clear_board(self) -> None:
         self._cancel()
         self.selection.clear()
+        self.tiling = None
         restore(self, EMPTY)  # removes (and closes) everything
 
     def _load(self, name: str) -> None:
