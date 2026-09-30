@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -270,6 +271,30 @@ class MacroStore:
             ).unlink()  # same name, new capitalization: rename, don't keep the old spelling
         self.folder.mkdir(parents=True, exist_ok=True)
         write_atomic(self.path(name), dumps(encode(snap, types)))
+
+    def remove(self, name: str, trash: Path | None) -> Path | None:
+        """Delete a macro's file: moved into the folder `trash` (made if needed; a
+        numbered name if that's taken), or gone for good if `trash` is None.
+        Returns where it went. OSError if it can't."""
+        src = self.path(name)
+        if trash is None:
+            src.unlink()
+            return None
+        trash.mkdir(parents=True, exist_ok=True)
+        dest, n = trash / src.name, 1
+        while dest.exists():
+            n += 1
+            dest = trash / f"{src.stem} ({n}){src.suffix}"
+        os.replace(src, dest)
+        return dest
+
+    def put_back(self, name: str, trashed: Path) -> None:
+        """Undo remove(): the file at `trashed` becomes macro `name` again.
+        FileExistsError if there's a macro by that name now; OSError if it can't."""
+        if self.find(name) is not None:
+            raise FileExistsError(f"there's a macro called {self.find(name)} now")
+        self.folder.mkdir(parents=True, exist_ok=True)
+        os.replace(trashed, self.path(name))
 
     def load(self, name: str, types: Registry) -> Loaded:
         """FormatError / OSError if the file can't be used at all."""

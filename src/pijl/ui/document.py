@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "EMPTY",
+    "STAMPS",
     "Change",
     "History",
     "Snapshot",
@@ -43,6 +44,10 @@ __all__ = [
     "internal_wires",
     "restore",
 ]
+
+# Undo step ids, shared by every History (and the library's, see Editor._undo): so
+# they grow across boards and the two timelines can be told apart by which came last.
+STAMPS = itertools.count(1)
 
 # One undo step: for parts, wires and wire colors, uid -> (before, after). None = absent.
 Change = tuple[dict[int, tuple], dict[int, tuple], dict[int, tuple]]
@@ -279,7 +284,6 @@ class History:
         ] = []  # (change, state before, state after)
         self.redo_stack: list[tuple[Change, int, int]] = []
         self.limit = limit
-        self._ids = itertools.count(1)
         self.state = 0
 
     def _sections(self) -> tuple[dict, dict, dict]:
@@ -303,7 +307,7 @@ class History:
         if not any(change):
             return False
         _apply(self._sections(), change, 1)
-        after = next(self._ids)
+        after = next(STAMPS)
         self.undo_stack.append((change, self.state, after))
         del self.undo_stack[: -self.limit]
         self.redo_stack.clear()
@@ -339,7 +343,7 @@ class History:
                     into.pop(uid, None)
                 else:
                     into[uid] = (first, new)
-        self.state = next(self._ids)
+        self.state = next(STAMPS)
         self.undo_stack[-1] = (merged, before, self.state)
         self.redo_stack.clear()
         return True

@@ -192,6 +192,36 @@ def test_names_match_ignoring_case_and_resaving_renames(tmp_path):
     assert store.load("Adder", REG).snapshot == Snapshot({}, {})
 
 
+def test_remove_moves_to_the_trash_without_clobbering(tmp_path):
+    store, trash = MacroStore(tmp_path / "macros"), tmp_path / "trash"
+    store.save("adder", board())
+    assert store.remove("adder", trash) == trash / "adder.json"
+    store.save("adder", Snapshot({}, {}))
+    assert store.remove("adder", trash) == trash / "adder (2).json"
+    assert store.names() == []
+    assert MacroStore(trash).load("adder", REG).snapshot == board()
+
+
+def test_put_back_undoes_remove_unless_the_name_is_taken(tmp_path):
+    store, trash = MacroStore(tmp_path / "macros"), tmp_path / "trash"
+    store.save("adder", board())
+    trashed = store.remove("adder", trash)
+    store.put_back("adder", trashed)
+    assert store.load("adder", REG).snapshot == board() and not trashed.exists()
+    trashed = store.remove("adder", trash)
+    store.save("ADDER", Snapshot({}, {}))
+    with pytest.raises(FileExistsError):
+        store.put_back("adder", trashed)
+    assert trashed.exists()
+
+
+def test_remove_without_a_trash_deletes_for_good(tmp_path):
+    store = MacroStore(tmp_path)
+    store.save("adder", board())
+    assert store.remove("adder", None) is None
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_broken_file_raises_format_error(tmp_path):
     store = MacroStore(tmp_path)
     (tmp_path / "bad.json").write_text("{ not json")

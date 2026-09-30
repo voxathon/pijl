@@ -6,6 +6,7 @@ bar's cogwheel menu. The one open last is reopened on start (settings.json).
 
     <data root>/                  %APPDATA%\\pijl on Windows (PIJL_DATA overrides)
       settings.json               app-wide: which project was open last
+      .trashbin/<project>/        deleted macros (not Shift+deleted ones), to fish back by hand
       projects/
         default/
           project.json            marks the folder as a project; format version
@@ -110,6 +111,11 @@ class Project:
     @property
     def library_file(self) -> Path:
         return self.path / "library.json"
+
+    @property
+    def trash_dir(self) -> Path:
+        """Where this project's deleted macros go (see MacroStore.remove)."""
+        return self.path.parent.parent / ".trashbin" / self.name
 
     @property
     def meta_file(self) -> Path:

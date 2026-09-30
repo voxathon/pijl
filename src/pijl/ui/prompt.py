@@ -1,13 +1,16 @@
 """A small modal box near the top of the window: a title, an optional text field,
 an optional list that the field filters, and a hint line.
 
-Used for naming a macro, the Ctrl+O quick-open and "unsaved changes?". Screen
+Used for naming a macro, the Ctrl+O quick-open, "unsaved changes?" and
+"really delete?". Screen
 space (HUD batch), drawn over everything with the board dimmed behind it. This
 module only lays out, draws and hit-tests; what Enter and other keys *mean* is
 up to the editor (see Editor._open_prompt).
 """
 
 from __future__ import annotations
+
+import textwrap
 
 import pyglet
 from pyglet import shapes
@@ -19,6 +22,7 @@ from .views import Box
 S = T.UI_SCALE
 W, PAD = 440 * S, 12 * S
 TITLE_H, FIELD_H, ROW_H, HINT_H = 26 * S, 30 * S, 24 * S, 24 * S
+MESSAGE_H = 18 * S  # per line
 MAX_ROWS = 10
 TOP_MARGIN = 80 * S  # from the top of the window to the box
 FONT, SIZE, SMALL = "Consolas", 11 * S, 10 * S
@@ -37,7 +41,10 @@ class Prompt:
         items: list[str] | None = None,
         hint: str = "",
         empty: str = "nothing here yet",
+        message: str = "",
+        danger: bool = False,
     ) -> None:
+        """`message`: a few lines under the title (wrapped); `danger` draws it red."""
         self.batch = batch
         self.edit = LineEdit(text, max_len) if text is not None else None
         self.items = items
@@ -51,9 +58,29 @@ class Prompt:
             pyglet.graphics.Group(order=o) for o in (20, 21, 22, 23)
         )
         n_rows = MAX_ROWS if items is not None else 0
+        # Wrapped here, one label per line: pyglet's multiline layout drops spaces.
+        # (The font is monospaced, so a line's width is its length.)
+        char_w = (
+            pyglet.text.Label("M" * 10, font_name=FONT, font_size=SMALL).content_width
+            / 10
+        )
+        self.message = [
+            pyglet.text.Label(
+                line,
+                font_name=FONT,
+                font_size=SMALL,
+                color=T.MENU_DANGER if danger else T.PART_TEXT,
+                anchor_y="center",
+                batch=batch,
+                group=text_g,
+            )
+            for line in textwrap.wrap(message, int((W - 2 * PAD) / char_w))
+        ]
+        self.message_h = len(self.message) * MESSAGE_H + PAD / 2 if self.message else 0
         self.h = (
             PAD
             + TITLE_H
+            + self.message_h
             + (FIELD_H + PAD / 2 if self.edit else 0)
             + n_rows * ROW_H
             + HINT_H
@@ -114,6 +141,11 @@ class Prompt:
         y = top - PAD
         self.title.position = (left + PAD, y - TITLE_H / 2, 0)
         y -= TITLE_H
+        for line in self.message:
+            line.position = (left + PAD, y - MESSAGE_H / 2, 0)
+            y -= MESSAGE_H
+        if self.message:
+            y -= PAD / 2
         if self.field is not None:
             self.field.position = (left + PAD, y - FIELD_H)
             self.field_text.position = (left + PAD + 8 * S, y - FIELD_H / 2, 0)
@@ -238,6 +270,8 @@ class Prompt:
         self.panel.delete()
         self.title.delete()
         self.hint.delete()
+        for line in self.message:
+            line.delete()
         if self.field is not None:
             self.field.delete()
             self.field_text.delete()

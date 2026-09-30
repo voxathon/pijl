@@ -25,6 +25,10 @@ def test_default_project_is_created_on_first_open(data_dir):
     assert not list(p.path.glob("*.tmp"))
 
 
+def test_trash_is_per_project_outside_the_projects(data_dir):
+    assert Project.open("x").trash_dir == data_dir / ".trashbin" / "x"
+
+
 def test_reopening_keeps_what_is_there():
     p = Project.open()
     (p.macros_dir / "adder.json").write_text("{}")

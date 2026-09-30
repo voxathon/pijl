@@ -50,8 +50,12 @@ def test_new_collections_get_unique_names_and_delete_frees_parts():
     lib.move_part("AND", a)
     lib.delete_collection(a)
     assert a not in lib.collections and lib.loose == ["XOR", "AND"]
-    lib.delete_collection(lib.collections[0])  # builtin: refused
-    assert lib.collections[0].name == "I/O"
+    lib.delete_collection(b)
+    lib.delete_collection(lib.collections[0])  # builtins too: their parts stay
+    assert [c.name for c in lib.collections] == ["GATES"]
+    assert lib.loose == ["XOR", "AND", "IN", "OUT"]
+    lib.sync(PARTS)  # and they aren't made again
+    assert [c.name for c in lib.collections] == ["GATES"]
 
 
 def test_move_collection_and_rename():
@@ -105,3 +109,34 @@ def test_from_dict_forgives_junk_and_duplicates():
     assert (
         lib.where("OR").name == "GATES"
     )  # the duplicate "A" was skipped, so OR got its default
+
+
+def test_restore_keeps_collections_that_are_still_there():
+    lib = Library(PARTS)
+    io, gates = lib.collections
+    before = lib.to_dict()
+    gates.open = False
+    lib.move_part("NAND", io)
+    lib.delete_collection(io)
+    lib.restore(before, PARTS)
+    assert (
+        lib.collections[1] is gates and not gates.open
+    )  # same object, still collapsed
+    assert lib.collections[0].name == "I/O" and "NAND" in gates.parts
+
+
+def test_history_steps_skip_expanding_and_rebase():
+    from itertools import count
+
+    from pijl.ui.library import LibraryHistory
+
+    lib = Library(PARTS)
+    h = LibraryHistory(lib.to_dict(), count(1).__next__)
+    lib.collections[0].open = False
+    assert not h.record(lib.to_dict())  # collapsing isn't a step
+    lib.move_part("XOR", lib.collections[0])
+    assert h.record(lib.to_dict())
+    step = h.undo()
+    assert step.after["collections"][0]["parts"][-1] == "XOR" and h.redo() is step
+    h.rebase(Library(PARTS).to_dict())
+    assert h.undo_stack == [step]

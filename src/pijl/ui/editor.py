@@ -89,6 +89,7 @@ import json
 import math
 import sys
 import time
+from pathlib import Path
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -119,6 +120,7 @@ from .canvas import Canvas
 from .controls import ControlsSheet
 from .document import (
     EMPTY,
+    STAMPS,
     Change,
     History,
     Snapshot,
@@ -131,7 +133,7 @@ from .document import (
 )
 from .duplicate import DOWN, RIGHT, Cell, Tiling
 from .grid import Grid
-from .library import Library
+from .library import Library, LibraryHistory, Step
 from .line_edit import LineEdit
 from .menu import RAINBOW, ContextMenu, MenuItem
 from .minimap import Panels
@@ -751,8 +753,11 @@ class Editor(pyglet.window.Window):
             self._close_menu()
             if button == mouse.LEFT and item is not None:
                 # Done: the cursor goes back to where you right-clicked (what the menu was
-                # about, and where the lens still looks), so e.g. Branch starts from there
-                self._warp(*self.menu.anchor)
+                # about, and where the lens still looks), so e.g. Branch starts from there.
+                # Only for board menus: the library's and the status bar's stay put.
+                ax, ay = self.menu.anchor
+                if not self.picker.contains(ax, ay) and not self.bar.contains(ax, ay):
+                    self._warp(ax, ay)
                 item.action()  # after closing: may start another mode (e.g. label editing)
                 return
             if button == mouse.MIDDLE:
@@ -1202,9 +1207,9 @@ class Editor(pyglet.window.Window):
             if self.mode is not Mode.IDLE:
                 self._cancel()  # mid-action: undo means "never mind", not "and the step before"
             elif symbol == key.Y or modifiers & key.MOD_SHIFT:
-                self._apply(self.history.redo())
+                self._redo()
             else:
-                self._apply(self.history.undo())
+                self._undo()
         elif (
             modifiers & key.MOD_CTRL
             and symbol in (key.C, key.X)
@@ -1636,10 +1641,6 @@ class Editor(pyglet.window.Window):
             lib.move_part(part, c)
             self._start_rename(c, fresh=True)
 
-        def delete(c):
-            lib.delete_collection(c)
-            self.picker.refresh()
-
         if isinstance(hit, Row) and hit.what in ("section", "empty"):
             c = hit.collection
             any_open = any(x.open for x in lib.collections)
@@ -1654,8 +1655,11 @@ class Editor(pyglet.window.Window):
                     lambda: self.picker.set_all_open(not any_open),
                 ),
             ]
-            if not c.builtin:
-                items.append(MenuItem("Delete", lambda: delete(c), danger=True))
+            items.append(
+                MenuItem(
+                    "Delete", lambda: self._delete_collection_dialog(c), danger=True
+                )
+            )
         elif isinstance(hit, Row) and hit.what == "part":
             p, at = (
                 hit.part,
@@ -1671,10 +1675,200 @@ class Editor(pyglet.window.Window):
                 )
             if hit.collection is not None:
                 items.append(MenuItem("Remove from collection", lambda: move(p, None)))
+            if p.startswith(MACRO):  # part scripts (shipped or the user's own) never
+                items.append(
+                    MenuItem(
+                        "Delete",
+                        lambda: self._delete_macros_dialog([p.removeprefix(MACRO)]),
+                        danger=True,
+                    )
+                )
         else:
             items = [MenuItem("New collection", new_collection)]
         if items:
             self._open_menu(x, y, items)
+
+    # ---- deleting macros and collections -------------------------------------------
+    # Delete moves macro files to the project's trash folder (see Project.trash_dir),
+    # undoably; Shift held while clicking Delete removes them for good. Part scripts
+    # can't be deleted from here: a collection's are orphaned, whatever else goes.
+
+    def _shift(self) -> bool:
+        return self.keys[key.LSHIFT] or self.keys[key.RSHIFT]
+
+    def _delete_macros_dialog(self, names: list[str]) -> None:
+        forever = self._shift()
+        what = names[0] if len(names) == 1 else f"{len(names)} macros"
+        self._confirm_delete(
+            f"Delete {what}{' permanently' if forever else ''}?",
+            [self._usage(names), _where_to(forever)],
+            lambda: self._delete_macros(names, forever),
+        )
+
+    def _delete_collection_dialog(self, c) -> None:
+        with_parts = self._shift()
+        macros = [p.removeprefix(MACRO) for p in c.parts if p.startswith(MACRO)]
+        others = len(c.parts) - len(macros)
+        if with_parts and macros:
+            lines = [
+                f"Its {_n(len(macros), 'macro')} will be deleted too"
+                + (
+                    f"; its {_n(others, 'other part')} will be orphaned."
+                    if others
+                    else "."
+                ),
+                self._usage(macros),
+                f"{'It goes' if len(macros) == 1 else 'They go'} to the trash folder.",
+            ]
+        elif c.parts:
+            lines = [
+                f"Its {_n(len(c.parts), 'part')} will be orphaned (become loose)."
+                + (" Shift+Delete deletes its macros too." if macros else "")
+            ]
+        else:
+            lines = ["It's empty."]
+        self._confirm_delete(
+            f"Delete collection {c.name}{' and its macros' if with_parts and macros else ''}?",
+            lines,
+            lambda: self._delete_collection(c, macros if with_parts else []),
+        )
+
+    def _confirm_delete(self, title: str, lines: list[str], then) -> None:
+        def enter(p: Prompt) -> None:
+            self._close_prompt()
+            then()
+
+        p = Prompt(
+            self.hud,
+            self.width,
+            self.height,
+            title,
+            message="Are you sure? " + " ".join(line for line in lines if line),
+            danger=True,
+            hint="Enter: delete   Esc: cancel",
+        )
+        self._open_prompt(p, enter)
+
+    def _usage(self, names: list[str]) -> str:
+        """What else the macros `names` are in: other saved macros (at any depth) and
+        the open board. "" if nothing."""
+        gone = {n.casefold() for n in names}
+        users = [
+            outer
+            for outer in self.store.names()
+            if outer.casefold() not in gone
+            and any(self.catalog.book.contains(outer, n) for n in names)
+        ]
+        they = "This macro is" if len(names) == 1 else "They are"
+        out = []
+        if users:
+            out.append(
+                f"{they} used in "
+                f"{_n(len(users), 'other macro')}"
+                + (f" ({', '.join(users)})" if len(users) <= 3 else "")
+                + "; those lose their copies when next opened."
+            )
+        elif names:
+            out.append(f"{they} not used in any other macro.")
+        kinds = {MACRO + n for n in names}
+        on_board = sum(d[0] in kinds for d in self.history.current.parts.values())
+        if on_board and (self.doc is None or self.doc.casefold() not in gone):
+            out.append(f"The open board has {_n(on_board, 'copy', 'copies')}.")
+        return " ".join(out)
+
+    def _delete_macros(self, names: list[str], forever: bool) -> bool:
+        """Trash (or with `forever`, delete) those macros' files: one undo step,
+        together with whatever the library went through since the last one."""
+        trash = None if forever else self.project.trash_dir
+        trashed = []
+        for name in names:
+            try:
+                where = self.store.remove(name, trash)
+            except OSError as e:
+                self._report(f"couldn't delete {name}: {e}")
+                continue
+            trashed.append([name, str(where)])
+        done = [name for name, _ in trashed]
+        self._forget_doc(done)
+        self.catalog.book.forget()
+        self._sync_library(None if forever else trashed)
+        if done and len(done) == len(names):
+            what = done[0] if len(done) == 1 else _n(len(done), "macro")
+            self._notice(
+                f"deleted {what}"
+                if forever
+                else f"moved {what} to the trash (Ctrl+Z puts it back)"
+            )
+        return len(done) == len(names)
+
+    def _forget_doc(self, names: list[str]) -> None:
+        """If the open board's file is one of these (just deleted), it stays up as an
+        unsaved untitled board (Ctrl+S brings it back)."""
+        if self.doc is not None and self.doc.casefold() in {
+            n.casefold() for n in names
+        }:
+            self.doc, self.saved_state = None, -1
+            self.project.remember_open(None)
+
+    def _delete_collection(self, c, macros: list[str]) -> None:
+        self.library.delete_collection(c)  # orphans what's in it...
+        if macros:
+            self._delete_macros(macros, forever=False)  # ...then the macros go away
+        else:
+            self.picker.refresh()  # (the undo step is recorded after the key press)
+
+    # ---- undo / redo: the board's and the library's, as one timeline ------------------
+    # Each keeps its own steps; their stamps (document.STAMPS) say which came last.
+
+    def _undo(self) -> None:
+        board = self.history.undo_stack[-1][2] if self.history.undo_stack else 0
+        lib = self.lib_history.undo_stack
+        if lib and lib[-1].stamp > board:
+            self._apply_library(self.lib_history.undo(), undo=True)
+        else:
+            self._apply(self.history.undo())
+
+    def _redo(self) -> None:
+        board = self.history.redo_stack[-1][2] if self.history.redo_stack else None
+        lib = self.lib_history.redo_stack
+        if lib and (board is None or lib[-1].stamp < board):
+            self._apply_library(self.lib_history.redo(), undo=False)
+        else:
+            self._apply(self.history.redo())
+
+    def _library_checkpoint(self) -> None:
+        """Record what the user did to the library since the last step, if anything."""
+        if self.lib_history.record(self.library.to_dict()):
+            self.history.redo_stack.clear()  # (see _record_touched)
+
+    def _apply_library(self, step: Step, undo: bool) -> None:
+        """Take the library back to before `step` (or forward to after it), trashed
+        macro files included."""
+        moved = []
+        for entry in step.trashed:
+            name, where = entry
+            try:
+                if undo:
+                    self.store.put_back(name, Path(where))
+                else:
+                    entry[1] = str(self.store.remove(name, self.project.trash_dir))
+                    self._forget_doc([name])
+            except OSError as e:
+                self._report(f"couldn't {'put back' if undo else 'delete'} {name}: {e}")
+                continue
+            moved.append(name)
+        self.catalog.book.forget()
+        self.library.restore(
+            step.before if undo else step.after, self._library_entries()
+        )
+        self.lib_history.rebase(self.library.to_dict())
+        self.picker.refresh()
+        self._save_library()
+        if moved:
+            what = moved[0] if len(moved) == 1 else _n(len(moved), "macro")
+            self._notice(
+                f"put {what} back" if undo else f"moved {what} to the trash again"
+            )
 
     def _start_rename(self, c, fresh: bool = False) -> None:
         self.picker.start_rename(c, fresh)
@@ -2097,6 +2291,8 @@ class Editor(pyglet.window.Window):
         ):
             self._record()
         if event_type in self._EDIT_EVENTS and self.history is not None:
+            if self.mode is Mode.IDLE:  # (not halfway through naming a collection)
+                self._library_checkpoint()
             self._save_library()  # picker rearrangements are saved as they happen (no-op if unchanged)
         return result
 
@@ -2327,6 +2523,8 @@ class Editor(pyglet.window.Window):
         before = self.history.current.wires
         ends = _pin_part_uids((before.get(uid), now[1][uid]) for uid in paint_wires)
         recorded = (self.history.amend if amend else self.history.record)(*now)
+        if recorded:  # one timeline: something new done means nothing left to redo
+            self.lib_history.redo_stack.clear()
         if paint_parts or paint_wires:
             paint(self, paint_parts | ends, paint_wires)
         return recorded
@@ -2665,11 +2863,19 @@ class Editor(pyglet.window.Window):
                 f"library.json unreadable ({e}); using the default layout"
             )
         self._library_saved = lib.to_dict()
+        self.lib_history = LibraryHistory(lib.to_dict(), lambda: next(STAMPS))
         return lib
 
-    def _sync_library(self) -> None:
-        """After macros were added / renamed: bring the picker up to date."""
+    def _sync_library(self, trashed: list[list] | None = None) -> None:
+        """After macros were added / renamed / deleted: bring the picker up to date.
+        With `trashed` (see Step), that's an undo step; otherwise it's just how
+        things are now."""
         self.library.sync(self._library_entries())
+        if trashed:
+            self.lib_history.record(self.library.to_dict(), trashed)
+            self.history.redo_stack.clear()
+        else:
+            self.lib_history.rebase(self.library.to_dict())
         self.picker.refresh()
         self._save_library()
 
@@ -2735,6 +2941,19 @@ class _NumberEdit:
         None  # each part's value when the drag started; None: not dragging
     )
     pending: object = None  # the slider's latest value, not written yet (see update)
+
+
+def _n(n: int, one: str, many: str | None = None) -> str:
+    """ "1 macro", "3 macros"."""
+    return f"{n} {one if n == 1 else many or one + 's'}"
+
+
+def _where_to(forever: bool) -> str:
+    return (
+        "This can't be undone."
+        if forever
+        else "It goes to the trash folder (Shift+Delete: permanently)."
+    )
 
 
 def _count(views) -> str:
