@@ -33,9 +33,11 @@ from .line_edit import LineEdit
 from .views import Box
 
 S = T.UI_SCALE
-PANEL_W, COLLAPSED_W = round(190 * S), round(24 * S)
 HEADER_H, SECTION_H, ROW_H = 36 * S, 26 * S, 24 * S
 BUTTON = 24 * S      # header buttons are squares this big
+BUTTON_GAP = 4 * S   # around the toggle button, which sits at the panel's right edge
+PANEL_W = round(190 * S)
+COLLAPSED_W = round(BUTTON + 2 * BUTTON_GAP)  # what's left on screen when tucked away: the toggle's column
 PAD, INDENT = 8 * S, 14 * S  # left padding; extra indent for parts inside a collection
 SWATCH = 10 * S      # little color chip in front of each part name
 LOOSE_GAP = 12 * S   # space between the last collection and the loose parts (holds the divider)
@@ -299,7 +301,6 @@ class PartPicker:
         self.panel_group = pyglet.graphics.Group(order=2)
         self.header_bg = pyglet.graphics.Group(order=5)
         self.header_fg = pyglet.graphics.Group(order=6)
-        self.strip_group = pyglet.graphics.Group(order=7)
         self.drag_layer = Layer(0, pyglet.graphics.Group(order=9))  # not clipped: can leave the panel
 
         self.measure = pyglet.text.Label("", font_name=FONT, font_size=FONT_SIZE)
@@ -310,7 +311,7 @@ class PartPicker:
                                    batch=batch, group=self.marker_group)
         self.drop_box.visible = False
         self.chrome: list = []           # panel + header: (shape, base x), slid by x_off
-        self.strip: list = []            # the collapsed strip
+        self.chevron: list[shapes.Line] = []  # the toggle's «, turning into » as the panel tucks away
         self.buttons: dict[str, tuple[float, float, float, float]] = {}
         self.button_bgs: dict[str, shapes.Rectangle] = {}
         self._build_chrome()
@@ -324,13 +325,14 @@ class PartPicker:
 
     @property
     def x_off(self) -> float:
-        """How far the panel is slid out to the left (0 = fully open)."""
-        return -(1 - self.open_t) * PANEL_W
+        """How far the panel is slid out to the left: 0 = fully open. Tucked away, only
+        its right edge is still on screen (COLLAPSED_W, the toggle button's column)."""
+        return -(1 - self.open_t) * (PANEL_W - COLLAPSED_W)
 
     @property
     def width(self) -> float:
         """How much of the window's left edge the picker covers right now."""
-        return max(COLLAPSED_W, PANEL_W + self.x_off)
+        return PANEL_W + self.x_off
 
     @property
     def list_top(self) -> float:
@@ -338,7 +340,7 @@ class PartPicker:
         return self.win_h - HEADER_H
 
     def contains(self, sx: float, sy: float) -> bool:
-        return 0 <= sx < (self.width if self.open else COLLAPSED_W) and 0 <= sy <= self.win_h
+        return 0 <= sx < self.width and 0 <= sy <= self.win_h
 
     def to_list(self, sy: float) -> float:
         """Screen y -> distance from the list top."""
@@ -356,7 +358,7 @@ class PartPicker:
         if not self.contains(sx, sy):
             return None
         if not self.open:
-            return "toggle"  # the whole collapsed strip opens it
+            return "toggle"  # the whole tucked-away edge opens it
         if sy >= self.list_top:
             for name, (x, y, w, h) in self.buttons.items():
                 if x + self.x_off <= sx <= x + self.x_off + w and y <= sy <= y + h:
@@ -654,13 +656,12 @@ class PartPicker:
     def _place_all(self) -> None:
         r = self.pixel_ratio
         x_off = self.x_off
-        self.clip.rect = (0, 0, max(0, int((PANEL_W + x_off) * r)), int(max(self.list_top, 0) * r))
+        # The rows disappear under the edge that stays behind: it's empty once tucked away.
+        right = self.width - (1 - self.open_t) * COLLAPSED_W
+        self.clip.rect = (0, 0, max(0, int(right * r)), int(max(self.list_top, 0) * r))
         for shape, base_x in self.chrome:
             shape.x = base_x + x_off
-        strip = round(255 * (1 - self.open_t))
-        for s in self.strip:
-            s.opacity = strip
-            s.visible = strip > 2
+        self._place_chevron()
         for w in self.widgets.values():
             w.place(self.cursor)
         self.divider.position = (x_off + PAD, self.list_top - self.divider_top + self.scroll)
@@ -670,10 +671,8 @@ class PartPicker:
             self.drop_box.position = (x + 2 * S, y + S)
 
     def _build_chrome(self) -> None:
-        """Panel background, header with its buttons, and the collapsed strip."""
+        """Panel background, and the header with its buttons."""
         for s, _ in self.chrome:
-            s.delete()
-        for s in self.strip:
             s.delete()
         self.chrome, self.buttons, self.button_bgs = [], {}, {}
         b, h = self.batch, self.win_h
@@ -698,12 +697,33 @@ class PartPicker:
         rect(PANEL_W - line, 0, line, h, T.PICKER_BORDER, self.header_fg)
         label("PARTS", PAD + 2 * S, h - HEADER_H / 2, self.header_fg, color=T.HELP_TEXT)
         by = h - HEADER_H + (HEADER_H - BUTTON) / 2
-        for i, (name, glyph) in enumerate((("toggle", "«"), ("new", "+"))):
-            bx = PANEL_W - 6 * S - (i + 1) * BUTTON - i * 2 * S
+        for i, name in enumerate(("toggle", "new")):
+            bx = PANEL_W - BUTTON_GAP - (i + 1) * BUTTON - i * 2 * S
             self.buttons[name] = (bx, by, BUTTON, BUTTON)
             self.button_bgs[name] = rect(bx, by, BUTTON, BUTTON, T.PICKER_HEADER, self.header_bg)
-            label(glyph, bx + BUTTON / 2, by + BUTTON / 2, self.header_fg, anchor_x="center")
-        self.strip = [rect(0, 0, COLLAPSED_W, h, T.PICKER_BG, self.strip_group, chrome=False),
-                      rect(COLLAPSED_W - line, 0, line, h, T.PICKER_BORDER, self.strip_group, chrome=False),
-                      label("»", COLLAPSED_W / 2, h - HEADER_H / 2, pyglet.graphics.Group(1, self.strip_group),
-                            chrome=False, anchor_x="center")]
+        label("+", *self._button_center("new"), self.header_fg, anchor_x="center")
+        # The toggle's « is drawn, not typed, so it can turn around its own center (see _place_all).
+        for s in self.chevron:
+            s.delete()
+        self.chevron = [shapes.Line(0, 0, 0, 0, thickness=1.25 * S, color=T.PART_TEXT[:3], batch=b,
+                                    group=self.header_fg) for _ in range(4)]
+
+    def _button_center(self, name: str) -> tuple[float, float]:
+        """A header button's center, with the panel fully open."""
+        x, y, w, h = self.buttons[name]
+        return x + w / 2, y + h / 2
+
+    def _place_chevron(self) -> None:
+        """The toggle's «: pointing left when open, turned half a turn (») once tucked away."""
+        cx, cy = self._button_center("toggle")
+        cx += self.x_off
+        a = math.pi * (1 - self.open_t)
+        ca, sa = math.cos(a), math.sin(a)
+        arm_x, arm_y, apart = 2.5 * S, 4 * S, 5 * S  # each chevron: < with its tip at -arm_x
+        lines = iter(self.chevron)
+        for dx in (-apart / 2, apart / 2):
+            tip = (dx - arm_x, 0.0)
+            for end in ((dx + arm_x, arm_y), (dx + arm_x, -arm_y)):
+                line = next(lines)
+                (line.x, line.y), (line.x2, line.y2) = ((cx + px * ca - py * sa, cy + px * sa + py * ca)
+                                                        for px, py in (tip, end))
