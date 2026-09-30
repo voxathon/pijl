@@ -9,7 +9,12 @@ def settle(c: Circuit, steps: int = 10) -> None:
 
 def test_nand_truth_table():
     c = Circuit()
-    a, b, g, out = c.add_part("IN"), c.add_part("IN"), c.add_part("NAND"), c.add_part("OUT")
+    a, b, g, out = (
+        c.add_part("IN"),
+        c.add_part("IN"),
+        c.add_part("NAND"),
+        c.add_part("OUT"),
+    )
     c.connect(a.outputs[0], g.inputs[0])
     c.connect(g.inputs[1], b.outputs[0])  # reversed order must work too
     c.connect(g.outputs[0], out.inputs[0])
@@ -25,7 +30,7 @@ def test_invalid_connections_rejected():
     a, b = c.add_part("IN"), c.add_part("IN")
     g = c.add_part("NOT")
     assert c.connect(a.outputs[0], b.outputs[0]) == (None, [])  # out -> out
-    assert c.connect(g.inputs[0], g.outputs[0]) == (None, [])   # same part
+    assert c.connect(g.inputs[0], g.outputs[0]) == (None, [])  # same part
     assert c.wires == []
 
 
@@ -63,7 +68,10 @@ def test_sr_latch_from_nands_holds_state():
     c.connect(n2.outputs[0], n1.inputs[1])
     q = n1.outputs[0]
 
-    s.outputs[0].state, r.outputs[0].state = True, True  # hold, fresh: nothing says which way
+    s.outputs[0].state, r.outputs[0].state = (
+        True,
+        True,
+    )  # hold, fresh: nothing says which way
     settle(c)
     assert q.state is X
     s.outputs[0].state, r.outputs[0].state = False, True  # set
@@ -111,10 +119,12 @@ def test_two_drivers_agreeing_is_fine_disagreeing_is_a_conflict():
     a, b, led = c.add_part("IN"), c.add_part("IN"), c.add_part("OUT")
     w, _ = c.connect(a.outputs[0], led.inputs[0])
     w2, _ = c.connect(b.outputs[0], w)  # second driver onto the same net
-    for va, vb, expect_value, expect_conflict in [(False, False, ZERO, False),
-                                                  (True, True, ONE, False),
-                                                  (True, False, X, True),
-                                                  (False, True, X, True)]:
+    for va, vb, expect_value, expect_conflict in [
+        (False, False, ZERO, False),
+        (True, True, ONE, False),
+        (True, False, X, True),
+        (False, True, X, True),
+    ]:
         a.outputs[0].state, b.outputs[0].state = va, vb
         settle(c)
         assert led.inputs[0].state is expect_value
@@ -124,7 +134,9 @@ def test_two_drivers_agreeing_is_fine_disagreeing_is_a_conflict():
 def test_undriven_net_floats():
     c = Circuit()
     n1, n2 = c.add_part("NOT"), c.add_part("NOT")
-    assert not c.can_connect(n1.inputs[0], n2.inputs[0])  # in -> in pin-to-pin is still rejected...
+    assert not c.can_connect(
+        n1.inputs[0], n2.inputs[0]
+    )  # in -> in pin-to-pin is still rejected...
     a = c.add_part("IN")
     trunk, _ = c.connect(a.outputs[0], n1.inputs[0])
     c.connect(trunk, n2.inputs[0])
@@ -139,7 +151,12 @@ def test_undriven_net_floats():
 
 def test_removing_a_wire_removes_its_branches():
     c = Circuit()
-    a, n1, n2, n3 = c.add_part("IN"), c.add_part("NOT"), c.add_part("NOT"), c.add_part("NOT")
+    a, n1, n2, n3 = (
+        c.add_part("IN"),
+        c.add_part("NOT"),
+        c.add_part("NOT"),
+        c.add_part("NOT"),
+    )
     trunk, _ = c.connect(a.outputs[0], n1.inputs[0])
     b1, _ = c.connect(trunk, n2.inputs[0])
     b2, _ = c.connect(b1, n3.inputs[0])  # branch of a branch
@@ -160,7 +177,12 @@ def test_replacing_input_wire_cannot_saw_off_own_branch():
 
 def test_merge_splices_branch_onto_trunk():
     c = Circuit()
-    a, n1, n2, n3 = c.add_part("IN"), c.add_part("NOT"), c.add_part("NOT"), c.add_part("NOT")
+    a, n1, n2, n3 = (
+        c.add_part("IN"),
+        c.add_part("NOT"),
+        c.add_part("NOT"),
+        c.add_part("NOT"),
+    )
     trunk, _ = c.connect(a.outputs[0], n1.inputs[0])
     branch, _ = c.connect(trunk, n2.inputs[0])
     twig, _ = c.connect(branch, n3.inputs[0])  # hangs off the branch
@@ -174,7 +196,9 @@ def test_merge_splices_branch_onto_trunk():
     assert c.descendants(trunk) == [twig]
     a.outputs[0].state = True
     settle(c)
-    assert n2.inputs[0].state and n3.inputs[0].state and not n1.inputs[0].state  # n1 was cut off
+    assert (
+        n2.inputs[0].state and n3.inputs[0].state and not n1.inputs[0].state
+    )  # n1 was cut off
 
 
 def test_wire_uids_are_stable():
@@ -190,7 +214,12 @@ def test_wire_uids_are_stable():
 
 def test_take_changes_reports_only_what_changed():
     c = Circuit()
-    a, g, out, idle = c.add_part("IN"), c.add_part("NOT"), c.add_part("OUT"), c.add_part("NOT")
+    a, g, out, idle = (
+        c.add_part("IN"),
+        c.add_part("NOT"),
+        c.add_part("OUT"),
+        c.add_part("NOT"),
+    )
     w1, _ = c.connect(a.outputs[0], g.inputs[0])
     w2, _ = c.connect(g.outputs[0], out.inputs[0])
     assert c.take_changes() == (True, set(), [])  # new wiring: redraw everything
@@ -221,8 +250,13 @@ def test_revision_counts_edits_not_clicks():
 def test_rebuilding_wiring_skips_the_drawing_rules():
     c = Circuit()
     g = c.add_part("NAND")
-    assert c.connect(g.outputs[0], g.inputs[0]) == (None, [])  # can't be drawn by hand ...
-    w, _ = c.connect(g.outputs[0], g.inputs[0], check=False)   # ... but undo must bring it back
+    assert c.connect(g.outputs[0], g.inputs[0]) == (
+        None,
+        [],
+    )  # can't be drawn by hand ...
+    w, _ = c.connect(
+        g.outputs[0], g.inputs[0], check=False
+    )  # ... but undo must bring it back
     assert w is not None and c.wires_at(g.inputs[0]) == [w]
 
 
@@ -236,8 +270,12 @@ def test_known_values_match_a_plain_bool_simulation():
     boards, feedback loops included."""
     import random
 
-    fns = {"NAND": lambda a, b: not (a and b), "AND": lambda a, b: a and b,
-           "OR": lambda a, b: a or b, "NOT": lambda a: not a}
+    fns = {
+        "NAND": lambda a, b: not (a and b),
+        "AND": lambda a, b: a and b,
+        "OR": lambda a, b: a or b,
+        "NOT": lambda a: not a,
+    }
     arity = {"NAND": 2, "AND": 2, "OR": 2, "NOT": 1}
     for seed in range(30):
         rng = random.Random(seed)
@@ -248,7 +286,9 @@ def test_known_values_match_a_plain_bool_simulation():
         feed = {}  # input pin -> the output pin that drives it
         for g in gates:
             for pin in g.inputs:
-                feed[pin] = src = rng.choice(sources)  # (can be the gate's own output: a loop)
+                feed[pin] = src = rng.choice(
+                    sources
+                )  # (can be the gate's own output: a loop)
                 c.connect(src, pin, check=False)
         for g in gates:
             for pin in g.pins:
@@ -261,7 +301,12 @@ def test_known_values_match_a_plain_bool_simulation():
                 ref[s] = not ref[s]
                 s.state = ref[s]
             c.step()
-            new = {g.outputs[0]: fns[g.kind](*(ref[p] for p in g.inputs)) for g in gates}
+            new = {
+                g.outputs[0]: fns[g.kind](*(ref[p] for p in g.inputs)) for g in gates
+            }
             ref.update(new)
             ref.update({pin: ref[src] for pin, src in feed.items()})
-            assert all(pin.state is (ONE if v else ZERO) for pin, v in ref.items()), (seed, tick)
+            assert all(pin.state is (ONE if v else ZERO) for pin, v in ref.items()), (
+                seed,
+                tick,
+            )

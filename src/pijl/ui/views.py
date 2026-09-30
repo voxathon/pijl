@@ -21,14 +21,27 @@ from ..sim import Part, Pin, Wire
 from . import theme as T
 from .canvas import Canvas
 from .paint import Pair, Rgb, sample, with_hue
-from .sdf_shapes import (DOT, RECT, SEGMENT, SHOW_BY_CODE, SHOW_OFF, Dot, Rect, Segment, WireDot, _rgba,
-                         show)
+from .sdf_shapes import (
+    DOT,
+    RECT,
+    SEGMENT,
+    SHOW_BY_CODE,
+    SHOW_OFF,
+    Dot,
+    Rect,
+    Segment,
+    WireDot,
+    _rgba,
+    show,
+)
 from .sdf_text import SDFLabel, SDFText
 from .spatial import SpatialIndex, polyline_boxes
 
 Point = tuple[float, float]
 
-_seq = itertools.count()  # creation order of views: newer ones are drawn (and hit) on top
+_seq = (
+    itertools.count()
+)  # creation order of views: newer ones are drawn (and hit) on top
 
 
 class Touched:
@@ -40,6 +53,7 @@ class Touched:
     `paint_parts` / `paint_wires`: the ones among them whose change can change colors
     (paint.py), i.e. everything but moving a part and shifting a wire whole. Colors
     follow the wiring and wire shapes, and a rigid move changes neither."""
+
     parts: set[int] = set()
     wires: set[int] = set()
     paint_parts: set[int] = set()
@@ -72,7 +86,12 @@ class Touched:
     def take(cls) -> tuple[set[int], set[int], set[int], set[int]]:
         """(parts, wires, paint_parts, paint_wires), and start over."""
         out = cls.parts, cls.wires, cls.paint_parts, cls.paint_wires
-        cls.parts, cls.wires, cls.paint_parts, cls.paint_wires = set(), set(), set(), set()
+        cls.parts, cls.wires, cls.paint_parts, cls.paint_wires = (
+            set(),
+            set(),
+            set(),
+            set(),
+        )
         return out
 
 
@@ -81,12 +100,18 @@ class Layers:
     buffers by these; the few pyglet shapes left (overlay) draw after all of them."""
 
     def __init__(self) -> None:
-        self.wire_halo = pyglet.graphics.Group(order=-1)  # glow under selected / edited wires
+        self.wire_halo = pyglet.graphics.Group(
+            order=-1
+        )  # glow under selected / edited wires
         self.wires = pyglet.graphics.Group(order=0)
-        self.selection = pyglet.graphics.Group(order=1)   # part outlines, just under the bodies
+        self.selection = pyglet.graphics.Group(
+            order=1
+        )  # part outlines, just under the bodies
         self.bodies = pyglet.graphics.Group(order=2)
         self.pins = pyglet.graphics.Group(order=3)
-        self.tags = pyglet.graphics.Group(order=4)  # pin name tag backgrounds: over wires and parts
+        self.tags = pyglet.graphics.Group(
+            order=4
+        )  # pin name tag backgrounds: over wires and parts
         self.text_order = 5  # SDFText's layer
         self.overlay = pyglet.graphics.Group(order=6)
 
@@ -96,7 +121,9 @@ class _GradientLine(shapes.Line):
     For the HUD (menu swatches); wires use sdf_shapes.Segment."""
 
     def __init__(self, *args, **kwargs) -> None:
-        self._rgba2: tuple[int, int, int] | None = None  # end color; None: same as the start
+        self._rgba2: tuple[int, int, int] | None = (
+            None  # end color; None: same as the start
+        )
         super().__init__(*args, **kwargs)
 
     def set_colors(self, start: tuple, end: tuple) -> None:
@@ -114,11 +141,15 @@ class _GradientLine(shapes.Line):
             super()._update_color()
             return
         a, b = self._rgba, (*self._rgba2, self._rgba[3])
-        self._vertex_list.colors[:] = a + b + b + a + b + a  # vertex order of shapes.Line: start, end, end, ...
+        self._vertex_list.colors[:] = (
+            a + b + b + a + b + a
+        )  # vertex order of shapes.Line: start, end, end, ...
 
 
 _STALE = object()  # Polyline._layout_key when the points changed: lay out again
-GRADIENT_STEPS = 8  # pieces per stretch between two gradient stops (OKLab isn't linear in RGB)
+GRADIENT_STEPS = (
+    8  # pieces per stretch between two gradient stops (OKLab isn't linear in RGB)
+)
 
 
 class Polyline:
@@ -127,29 +158,45 @@ class Polyline:
     length (set_gradient). Colors are (off, on) pairs; `state` picks which one shows
     (or a pattern: X, Z, a conflict; see sdf_shapes.show)."""
 
-    def __init__(self, points: list[Point], color, canvas: Canvas,
-                 group: pyglet.graphics.Group, thickness: float = T.WIRE_THICKNESS) -> None:
+    def __init__(
+        self,
+        points: list[Point],
+        color,
+        canvas: Canvas,
+        group: pyglet.graphics.Group,
+        thickness: float = T.WIRE_THICKNESS,
+    ) -> None:
         self._init(color, canvas, group, thickness)
         self.set_points(points)
 
-    def _init(self, color, canvas: Canvas, group: pyglet.graphics.Group, thickness: float) -> None:
+    def _init(
+        self, color, canvas: Canvas, group: pyglet.graphics.Group, thickness: float
+    ) -> None:
         """Everything but the points and segments."""
         self.canvas, self.group, self.thickness = canvas, group, thickness
         self.buf = canvas.buffer(SEGMENT, group)
         self._pair: Pair = (color, color)
-        self._stops: list[tuple[float, Pair]] | None = None  # gradient: (fraction of the length, pair)
+        self._stops: list[tuple[float, Pair]] | None = (
+            None  # gradient: (fraction of the length, pair)
+        )
         self._on = SHOW_OFF  # the segments' state byte
         self._opacity = 255
         self._lift = 0.0
         self.segments: list[Segment] = []
-        self._slots = np.empty(0, np.intp)  # the segments' slots in `buf`, for state / opacity at once
+        self._slots = np.empty(
+            0, np.intp
+        )  # the segments' slots in `buf`, for state / opacity at once
         self.points: list[Point] = []
         # What the segments are laid out for, so a gradient that only changes colors
         # recolors them instead of laying them out again.
         self._layout_key: object = _STALE
-        self._plain = True  # laid out for one color (no gradient, or nothing to spread it over)
+        self._plain = (
+            True  # laid out for one color (no gradient, or nothing to spread it over)
+        )
         self._vfracs: list[float] = []  # fraction of the length at each segment vertex
-        self._colors: dict[tuple, tuple[list, list]] = {}  # stops -> (off, on) color per vertex, this layout
+        self._colors: dict[
+            tuple, tuple[list, list]
+        ] = {}  # stops -> (off, on) color per vertex, this layout
 
     def set_points(self, points: list[Point]) -> None:
         self.points = list(points)
@@ -170,8 +217,14 @@ class Polyline:
         stops = self._stops
         # The layout depends on where the stops are and which neighbors differ, not on
         # the colors themselves (see _lay_out).
-        key = None if stops is None else (tuple(f for f, _ in stops),
-                                          tuple(c0 != c1 for (_, c0), (_, c1) in zip(stops, stops[1:])))
+        key = (
+            None
+            if stops is None
+            else (
+                tuple(f for f, _ in stops),
+                tuple(c0 != c1 for (_, c0), (_, c1) in zip(stops, stops[1:])),
+            )
+        )
         if key != self._layout_key:
             self._lay_out()
             self._layout_key = key
@@ -205,8 +258,13 @@ class Polyline:
             for (f0, c0), (f1, c1) in zip(self._stops, self._stops[1:]):
                 cuts.add(f0)
                 if c0 != c1:
-                    cuts.update(f0 + (f1 - f0) * i / GRADIENT_STEPS for i in range(1, GRADIENT_STEPS))
-            cuts = sorted(f for f in cuts if 0 < f < 1 and all(abs(f - g) > 1e-9 for g in fracs))
+                    cuts.update(
+                        f0 + (f1 - f0) * i / GRADIENT_STEPS
+                        for i in range(1, GRADIENT_STEPS)
+                    )
+            cuts = sorted(
+                f for f in cuts if 0 < f < 1 and all(abs(f - g) > 1e-9 for g in fracs)
+            )
             verts, vfracs, k, corner_idx = [pts[0]], [0.0], 0, []
             for i, (a, b) in enumerate(zip(pts, pts[1:])):
                 while k < len(cuts) and cuts[k] < fracs[i + 1]:
@@ -224,7 +282,11 @@ class Polyline:
         if len(self.segments) != n_seg:
             while len(self.segments) < n_seg:
                 seg = Segment(self.thickness, self._pair[0], self.canvas, self.group)
-                seg.state, seg.opacity, seg.lifted = self._on, self._opacity, self._lift  # match the others
+                seg.state, seg.opacity, seg.lifted = (
+                    self._on,
+                    self._opacity,
+                    self._lift,
+                )  # match the others
                 self.segments.append(seg)
             while len(self.segments) > n_seg:
                 self.segments.pop().delete()
@@ -294,8 +356,13 @@ class Polyline:
             self.buf.mark_many(self._slots)
 
     def distance_to(self, wx: float, wy: float) -> float:
-        return min((_segment_distance(wx, wy, a, b) for a, b in zip(self.points, self.points[1:])),
-                   default=math.inf)
+        return min(
+            (
+                _segment_distance(wx, wy, a, b)
+                for a, b in zip(self.points, self.points[1:])
+            ),
+            default=math.inf,
+        )
 
     def delete(self) -> None:
         for s in self.segments:
@@ -308,7 +375,11 @@ def _segment_distance(px: float, py: float, a: Point, b: Point) -> float:
     (x1, y1), (x2, y2) = a, b
     dx, dy = x2 - x1, y2 - y1
     length_sq = dx * dx + dy * dy
-    t = 0.0 if length_sq == 0 else max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / length_sq))
+    t = (
+        0.0
+        if length_sq == 0
+        else max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / length_sq))
+    )
     return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
 
 
@@ -321,16 +392,47 @@ class Box:
     vertices, so its border smears into a gradient once you zoom in.)
     """
 
-    def __init__(self, w: float, h: float, border: float, fill, border_color,
-                 batch: pyglet.graphics.Batch, group: pyglet.graphics.Group) -> None:
+    def __init__(
+        self,
+        w: float,
+        h: float,
+        border: float,
+        fill,
+        border_color,
+        batch: pyglet.graphics.Batch,
+        group: pyglet.graphics.Group,
+    ) -> None:
         self.w, self.h, self.b = w, h, border
-        self.fill = shapes.Rectangle(0, 0, w - 2 * border, h - 2 * border, color=fill,
-                                     batch=batch, group=group)
+        self.fill = shapes.Rectangle(
+            0, 0, w - 2 * border, h - 2 * border, color=fill, batch=batch, group=group
+        )
         # bottom, top, left, right (left/right sit between top and bottom)
-        self.edges = [shapes.Rectangle(0, 0, w, border, color=border_color, batch=batch, group=group),
-                      shapes.Rectangle(0, 0, w, border, color=border_color, batch=batch, group=group),
-                      shapes.Rectangle(0, 0, border, h - 2 * border, color=border_color, batch=batch, group=group),
-                      shapes.Rectangle(0, 0, border, h - 2 * border, color=border_color, batch=batch, group=group)]
+        self.edges = [
+            shapes.Rectangle(
+                0, 0, w, border, color=border_color, batch=batch, group=group
+            ),
+            shapes.Rectangle(
+                0, 0, w, border, color=border_color, batch=batch, group=group
+            ),
+            shapes.Rectangle(
+                0,
+                0,
+                border,
+                h - 2 * border,
+                color=border_color,
+                batch=batch,
+                group=group,
+            ),
+            shapes.Rectangle(
+                0,
+                0,
+                border,
+                h - 2 * border,
+                color=border_color,
+                batch=batch,
+                group=group,
+            ),
+        ]
 
     @property
     def position(self) -> Point:
@@ -352,7 +454,9 @@ class Box:
         x, y = xy
         w, h, b = self.w, self.h, self.b
         self.fill.position = (x + b, y + b)
-        for edge, pos in zip(self.edges, ((x, y), (x, y + h - b), (x, y + b), (x + w - b, y + b))):
+        for edge, pos in zip(
+            self.edges, ((x, y), (x, y + h - b), (x, y + b), (x + w - b, y + b))
+        ):
             edge.position = pos
 
     @property
@@ -389,16 +493,31 @@ class Box:
 
 
 class PartView:
-    def __init__(self, part: Part, x: float, y: float, canvas: Canvas,
-                 layers: Layers, text: SDFText, pin_labels: bool = True,
-                 index: SpatialIndex | None = None) -> None:
+    def __init__(
+        self,
+        part: Part,
+        x: float,
+        y: float,
+        canvas: Canvas,
+        layers: Layers,
+        text: SDFText,
+        pin_labels: bool = True,
+        index: SpatialIndex | None = None,
+    ) -> None:
         """`index`: where to register for hit testing; kept up to date as it moves."""
         self._init(part, x, y, canvas, layers, text, index)
         _make_part_shapes([self], pin_labels)
 
     @classmethod
-    def many(cls, placed: list[tuple[Part, float, float]], canvas: Canvas, layers: Layers, text: SDFText,
-             pin_labels: bool = True, index: SpatialIndex | None = None) -> list[PartView]:
+    def many(
+        cls,
+        placed: list[tuple[Part, float, float]],
+        canvas: Canvas,
+        layers: Layers,
+        text: SDFText,
+        pin_labels: bool = True,
+        index: SpatialIndex | None = None,
+    ) -> list[PartView]:
         """A view for each (part, x, y): the same as making them one by one, in order, but
         their shapes are made all at once (undo, loading, pasting thousands of parts)."""
         views = []
@@ -409,8 +528,16 @@ class PartView:
         _make_part_shapes(views, pin_labels)
         return views
 
-    def _init(self, part: Part, x: float, y: float, canvas: Canvas, layers: Layers, text: SDFText,
-              index: SpatialIndex | None) -> None:
+    def _init(
+        self,
+        part: Part,
+        x: float,
+        y: float,
+        canvas: Canvas,
+        layers: Layers,
+        text: SDFText,
+        index: SpatialIndex | None,
+    ) -> None:
         """Everything but the shapes (see _make_part_shapes)."""
         self.part = part
         self.seq = next(_seq)
@@ -430,11 +557,15 @@ class PartView:
         self.canvas, self.layers = canvas, layers
         self.pin_tags: list = []  # (background, SDF label) per pin, while shown (see set_pin_labels)
         self.opacity = 255
-        self.lifted = False  # being dragged: drawn at the canvas's offset (see set_lifted)
+        self.lifted = (
+            False  # being dragged: drawn at the canvas's offset (see set_lifted)
+        )
         # Selection outline: a ring just outside the body, drawn under it and the pins.
         self.outline: Rect | None = None  # only while selected (see set_selected)
         self._last_state: tuple[bool, ...] | None = None
-        self.pin_tints: list[Rgb | None] = [None] * len(part.pins)  # hue for each lit pin (paint.py)
+        self.pin_tints: list[Rgb | None] = [None] * len(
+            part.pins
+        )  # hue for each lit pin (paint.py)
         self.body_tint: Rgb | None = None  # hue for a lit body (switches, LEDs)
         # Made by _make_part_shapes:
         self.body: Rect
@@ -463,8 +594,16 @@ class PartView:
         """SDFText.labels specs for the pin name tags' text, in place (see _tag_at)."""
         t = self.part.type
         color = (*T.LABEL_TEXT[:3], self.opacity)
-        return [((t.ins if pin.is_input else t.outs)[pin.index], *self._tag_at(pin), T.PIN_LABEL_SIZE, color,
-                 "right" if pin.is_input else "left") for pin in self.part.pins]
+        return [
+            (
+                (t.ins if pin.is_input else t.outs)[pin.index],
+                *self._tag_at(pin),
+                T.PIN_LABEL_SIZE,
+                color,
+                "right" if pin.is_input else "left",
+            )
+            for pin in self.part.pins
+        ]
 
     def _tag_at(self, pin: Pin) -> Point:
         """Where a pin's tag text is anchored: inputs' to the left of the pin, outputs' right."""
@@ -486,8 +625,17 @@ class PartView:
     def set_selected(self, on: bool) -> None:
         if on and self.outline is None:
             o = T.SELECT_OUTSET
-            self.outline = Rect(self.x - o, self.y - o, self.w + 2 * o, self.h + 2 * o, T.SELECT_THICKNESS,
-                                (*T.SELECT, 0), T.SELECT, self.canvas, self.layers.selection)
+            self.outline = Rect(
+                self.x - o,
+                self.y - o,
+                self.w + 2 * o,
+                self.h + 2 * o,
+                T.SELECT_THICKNESS,
+                (*T.SELECT, 0),
+                T.SELECT,
+                self.canvas,
+                self.layers.selection,
+            )
             self.outline.lifted = self.lifted
         elif not on and self.outline is not None:
             self.outline.delete()
@@ -495,7 +643,12 @@ class PartView:
 
     def intersects(self, x0: float, y0: float, x1: float, y1: float) -> bool:
         """Does the body overlap the world-space rectangle (x0, y0)-(x1, y1)?"""
-        return self.x <= x1 and x0 <= self.x + self.w and self.y <= y1 and y0 <= self.y + self.h
+        return (
+            self.x <= x1
+            and x0 <= self.x + self.w
+            and self.y <= y1
+            and y0 <= self.y + self.h
+        )
 
     # ---- geometry --------------------------------------------------------
 
@@ -525,7 +678,9 @@ class PartView:
             return self.x - T.LABEL_GAP, self.y + self.h / 2
         if self.look.label == "right":
             return self.x + self.w + T.LABEL_GAP, self.y + self.h / 2
-        return self.x + self.w / 2, self.y - T.LABEL_GAP - self.text.cap_height(T.LABEL_SIZE) / 2
+        return self.x + self.w / 2, self.y - T.LABEL_GAP - self.text.cap_height(
+            T.LABEL_SIZE
+        ) / 2
 
     def refresh_name(self) -> None:
         """Show part.label (after it was edited)."""
@@ -599,7 +754,10 @@ class PartView:
         for dot, tint in zip(self.pin_dots, self.pin_tints):
             dot.set_colors(T.PIN_OFF, with_hue(T.PIN_ON, tint))
         if self.look.lit:
-            off, on = ([with_hue(c, self.body_tint) for c in theme_color(name)] for name in self.look.lit)
+            off, on = (
+                [with_hue(c, self.body_tint) for c in theme_color(name)]
+                for name in self.look.lit
+            )
             self.body.set_colors(off[0], off[1], on[0], on[1])
 
     def delete(self) -> None:
@@ -614,15 +772,28 @@ class WireView:
     paint.py worked out from it and from what the wire connects to.
     """
 
-    def __init__(self, wire: Wire, src: Point, bends: list[Point], dst: Point,
-                 canvas: Canvas, layers: Layers, color: str | None = None,
-                 index: SpatialIndex | None = None) -> None:
+    def __init__(
+        self,
+        wire: Wire,
+        src: Point,
+        bends: list[Point],
+        dst: Point,
+        canvas: Canvas,
+        layers: Layers,
+        color: str | None = None,
+        index: SpatialIndex | None = None,
+    ) -> None:
         self._init(wire, src, bends, dst, canvas, layers, color, index)
         _make_wire_shapes([self])
 
     @classmethod
-    def many(cls, specs: list[tuple], canvas: Canvas, layers: Layers,
-             index: SpatialIndex | None = None) -> list[WireView]:
+    def many(
+        cls,
+        specs: list[tuple],
+        canvas: Canvas,
+        layers: Layers,
+        index: SpatialIndex | None = None,
+    ) -> list[WireView]:
         """A view for each (wire, src, bends, dst, color): like making them one by one, in
         order, with the shapes made all at once."""
         views = []
@@ -633,16 +804,29 @@ class WireView:
         _make_wire_shapes(views)
         return views
 
-    def _init(self, wire: Wire, src: Point, bends: list[Point], dst: Point, canvas: Canvas, layers: Layers,
-              color: str | None, index: SpatialIndex | None) -> None:
+    def _init(
+        self,
+        wire: Wire,
+        src: Point,
+        bends: list[Point],
+        dst: Point,
+        canvas: Canvas,
+        layers: Layers,
+        color: str | None,
+        index: SpatialIndex | None,
+    ) -> None:
         """Everything but the shapes (see _make_wire_shapes)."""
         self.wire = wire
         self.seq = next(_seq)
         self.index = index
         self.src, self.dst = src, dst
         self.bends = list(bends)
-        self._color = color  # a T.WIRE_COLORS name; None = Default (inherit from the ends)
-        self.stops: list[tuple[float, Pair]] = []  # empty: neutral, the classic grey / red
+        self._color = (
+            color  # a T.WIRE_COLORS name; None = Default (inherit from the ends)
+        )
+        self.stops: list[
+            tuple[float, Pair]
+        ] = []  # empty: neutral, the classic grey / red
         self.canvas, self.layers = canvas, layers
         self.line = Polyline.__new__(Polyline)  # (its segments: _make_wire_shapes)
         self.line._init(T.WIRE_OFF, canvas, layers.wires, T.WIRE_THICKNESS)
@@ -686,14 +870,15 @@ class WireView:
             dot.position = getattr(self, end)
         if self.index is not None:
             self.index.put_polyline(self, self.points)
-        Touched.wire(self.wire.uid)  # (its shape: colors of branches depend on where they attach)
+        Touched.wire(
+            self.wire.uid
+        )  # (its shape: colors of branches depend on where they attach)
 
     def set_lifted(self, on: bool) -> None:
         """Drawn shifted by the canvas's offset, like PartView.set_lifted: for wires that
         move rigidly with a dragged selection. Put it down with set_ends / set_bends,
         or put_down."""
         lift([], [self], on)
-
 
     def set_ghost(self, ghost: bool) -> None:
         """Semi-transparent while being carried around before placement (paste)."""
@@ -708,8 +893,13 @@ class WireView:
 
     def set_selected(self, on: bool) -> None:
         if on and self.highlight is None:
-            self.highlight = Polyline(self.points, T.SELECT_WIRE, self.canvas, self.layers.wire_halo,
-                                      thickness=T.WIRE_THICKNESS + 6)
+            self.highlight = Polyline(
+                self.points,
+                T.SELECT_WIRE,
+                self.canvas,
+                self.layers.wire_halo,
+                thickness=T.WIRE_THICKNESS + 6,
+            )
             self.highlight.lifted = self.lifted
         elif not on and self.highlight is not None:
             self.highlight.delete()
@@ -792,12 +982,16 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
     pins = [v.part.pins for v in views]
     # the pins' states, in one gather
     flat = [p for ps in pins for p in ps]
-    on_flat = v0.part.pins[0]._store.states[[p.slot for p in flat]].tolist() if flat else []
+    on_flat = (
+        v0.part.pins[0]._store.states[[p.slot for p in flat]].tolist() if flat else []
+    )
     states, k = [], 0
     for ps in pins:
-        states.append(tuple(on_flat[k:k + len(ps)]))
+        states.append(tuple(on_flat[k : k + len(ps)]))
         k += len(ps)
-    looks: dict[int, tuple] = {}  # what a look decides (anchor, body colors), worked out once per look
+    looks: dict[
+        int, tuple
+    ] = {}  # what a look decides (anchor, body colors), worked out once per look
     # titles and user labels (a view's title, then its label: the one-at-a-time order),
     # and pin name tags if shown
     specs, tagged = [], []
@@ -805,7 +999,9 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
         look = looks.get(id(v.look))
         if look is None:
             look = looks[id(v.look)] = _look_data(v.look)
-        specs.append((v.title, v.x + v.w / 2, v.y + v.h / 2, v.title_size, T.PART_TEXT, "center"))
+        specs.append(
+            (v.title, v.x + v.w / 2, v.y + v.h / 2, v.title_size, T.PART_TEXT, "center")
+        )
         specs.append((v.part.label, *v.name_pos(), T.LABEL_SIZE, T.LABEL_TEXT, look[0]))
         if pin_labels and v.look.pin_labels:
             specs += v._tag_specs()
@@ -853,11 +1049,13 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
     dots = Dot.adopt(buf, slots.tolist())
     k = 0
     for v, ps, state in zip(views, pins, states):
-        v.pin_dots = dots[k:k + len(ps)]
+        v.pin_dots = dots[k : k + len(ps)]
         k += len(ps)
         v._last_state = state
     _index_many([(v, [v._index_box()]) for v in views])
-    Touched.part_many(v.part.uid for v in views)  # new: its own color (props) needs painting
+    Touched.part_many(
+        v.part.uid for v in views
+    )  # new: its own color (props) needs painting
 
 
 def _look_data(look) -> tuple:
@@ -870,7 +1068,11 @@ def _look_data(look) -> tuple:
         (fill, edge), (fill_on, edge_on) = (theme_color(name) for name in look.lit)
     else:
         fill_on, edge_on = fill, edge
-    return anchor, (_rgba(fill), _rgba(fill_on), _rgba(edge), _rgba(edge_on)), bool(look.lit)
+    return (
+        anchor,
+        (_rgba(fill), _rgba(fill_on), _rgba(edge), _rgba(edge_on)),
+        bool(look.lit),
+    )
 
 
 def _index_many(items: list[tuple]) -> None:
@@ -929,7 +1131,11 @@ def _make_wire_shapes(views: list[WireView]) -> None:
     buf = v0.line.buf
     a, b, radius, caps, kinds = [], [], [], [], []
     for v in views:
-        v.dots = {end: None for end in ("src", "dst") if not isinstance(getattr(v.wire, end), Pin)}
+        v.dots = {
+            end: None
+            for end in ("src", "dst")
+            if not isinstance(getattr(v.wire, end), Pin)
+        }
         pts = v.points
         last = len(pts) - 2  # corners (round caps): the points between the ends
         for k in range(len(pts) - 1):
@@ -938,7 +1144,9 @@ def _make_wire_shapes(views: list[WireView]) -> None:
             caps.append((255 if k >= 1 else 0, 255 if k + 1 <= last else 0))
         radius += [T.WIRE_THICKNESS / 2] * (len(pts) - 1)
         kinds += [Segment] * (len(pts) - 1)
-        for end in v.dots:  # right after its line: a wire crossing the junction covers it
+        for (
+            end
+        ) in v.dots:  # right after its line: a wire crossing the junction covers it
             p = getattr(v, end)
             a.append(p)
             b.append(p)
@@ -951,7 +1159,9 @@ def _make_wire_shapes(views: list[WireView]) -> None:
         f["a"][slots] = a
         f["b"][slots] = b
         f["radius"][slots] = radius
-        f["ca"][slots] = f["cb"][slots] = _rgba(T.WIRE_OFF)  # neutral: paint.py gives gradients
+        f["ca"][slots] = f["cb"][slots] = _rgba(
+            T.WIRE_OFF
+        )  # neutral: paint.py gives gradients
         f["ca_on"][slots] = f["cb_on"][slots] = _rgba(T.WIRE_ON)
         f["flags"][slots] = 0, 255, 0, 0
         f["flags"][slots, 2:] = caps
@@ -962,11 +1172,11 @@ def _make_wire_shapes(views: list[WireView]) -> None:
     for v in views:
         line, pts = v.line, v.points
         n = max(len(pts) - 1, 0)
-        line.segments = Segment.adopt(buf, slot_list[k:k + n])
-        line._slots = slots[k:k + n]
+        line.segments = Segment.adopt(buf, slot_list[k : k + n])
+        line._slots = slots[k : k + n]
         k += n
         for end in v.dots:
-            v.dots[end], = WireDot.adopt(buf, slot_list[k:k + 1])
+            (v.dots[end],) = WireDot.adopt(buf, slot_list[k : k + 1])
             k += 1
         line.points = list(pts)
         line._pair = (T.WIRE_OFF, T.WIRE_ON)
@@ -997,7 +1207,10 @@ class _Slots:
     def shapes(self, shapes: list) -> None:
         """sdf_shapes instances: one slot each."""
         if shapes:
-            self._add(shapes[0].buf, np.fromiter((s.slot for s in shapes), np.intp, len(shapes)))
+            self._add(
+                shapes[0].buf,
+                np.fromiter((s.slot for s in shapes), np.intp, len(shapes)),
+            )
 
     def labels(self, labels: list[SDFLabel]) -> None:
         if labels:
@@ -1035,7 +1248,9 @@ def lift(parts: list[PartView], wires: list[WireView], on: bool) -> None:
         buf.set_lift(slots, on)
 
 
-def put_down(parts: list[PartView], wires: list[WireView], dx: float, dy: float) -> None:
+def put_down(
+    parts: list[PartView], wires: list[WireView], dx: float, dy: float
+) -> None:
     """Un-lift these and move them by (dx, dy): the parts as if by move_to, the wires
     whole (bends and junction ends too, no new layout). Dropping a dragged selection;
     every shape is written once. (A rigid move changes no colors: not reported to
@@ -1085,14 +1300,19 @@ def delete_views(parts: list[PartView], wires: list[WireView]) -> None:
 # What the views remember of their shapes (coordinates, lift), and the spatial index:
 # the rest of the bulk operations, next to the one write per buffer.
 
-def _lift_mirrors(parts: list[PartView], wires: list[WireView], on: bool) -> tuple[list, list]:
+
+def _lift_mirrors(
+    parts: list[PartView], wires: list[WireView], on: bool
+) -> tuple[list, list]:
     """Mark them (un)lifted; returns the ones that weren't already."""
     parts = [v for v in parts if v.lifted != on]
     wires = [v for v in wires if v.lifted != on]
     value = 1.0 if on else 0.0
     for v in parts:
         v.lifted = on
-        v.kind_text._lift = v.name._lift = value  # (what glyphs they get later start with)
+        v.kind_text._lift = v.name._lift = (
+            value  # (what glyphs they get later start with)
+        )
         for _, label in v.pin_tags:
             label._lift = value
     for v in wires:
@@ -1143,7 +1363,11 @@ def arc_length_at(points: list[Point], p: Point) -> float:
     for (x1, y1), (x2, y2) in zip(points, points[1:]):
         dx, dy = x2 - x1, y2 - y1
         seg = math.hypot(dx, dy)
-        t = 0.0 if seg == 0 else max(0.0, min(1.0, ((p[0] - x1) * dx + (p[1] - y1) * dy) / (seg * seg)))
+        t = (
+            0.0
+            if seg == 0
+            else max(0.0, min(1.0, ((p[0] - x1) * dx + (p[1] - y1) * dy) / (seg * seg)))
+        )
         d = math.hypot(x1 + t * dx - p[0], y1 + t * dy - p[1])
         if d < best_d:
             best_s, best_d = walked + t * seg, d
@@ -1171,7 +1395,11 @@ def project_onto(points: list[Point], p: Point) -> Point:
         (x1, y1), (x2, y2) = a, b
         dx, dy = x2 - x1, y2 - y1
         length_sq = dx * dx + dy * dy
-        t = 0.0 if length_sq == 0 else max(0.0, min(1.0, ((p[0] - x1) * dx + (p[1] - y1) * dy) / length_sq))
+        t = (
+            0.0
+            if length_sq == 0
+            else max(0.0, min(1.0, ((p[0] - x1) * dx + (p[1] - y1) * dy) / length_sq))
+        )
         q = (x1 + t * dx, y1 + t * dy)
         d = math.hypot(q[0] - p[0], q[1] - p[1])
         if d < best_d:

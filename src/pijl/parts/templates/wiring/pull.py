@@ -17,10 +17,15 @@ class Pull(PartType):
     ins = ("in",)
     outs = ("out",)
     joins = (("in", "out"),)  # one net through the part...
-    weak = ("out",)           # ...which it drives weakly
+    weak = ("out",)  # ...which it drives weakly
     # (the part's context menu) The strongest pull on a net wins; equally strong ones that disagree fight
-    settings = {"priority": Choice(range(10), 0,
-                                   labels=("0 (weakest)", *map(str, range(1, 9)), "9 (strongest)"))}
+    settings = {
+        "priority": Choice(
+            range(10),
+            0,
+            labels=("0 (weakest)", *map(str, range(1, 9)), "9 (strongest)"),
+        )
+    }
     pure = True
     category = "WIRING"
 

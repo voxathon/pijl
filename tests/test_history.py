@@ -28,7 +28,11 @@ def test_undo_redo_roundtrip():
     h = History(snap(0))
     for n in (1, 2, 3):
         h.commit(snap(n))
-    assert h.undo() == ({2: (None, ("NOT", "", 2.0, 0.0, {}))}, {}, {})  # the step: uid -> (before, after)
+    assert h.undo() == (
+        {2: (None, ("NOT", "", 2.0, 0.0, {}))},
+        {},
+        {},
+    )  # the step: uid -> (before, after)
     assert h.current == snap(2)
     h.undo()
     assert h.current == snap(1)

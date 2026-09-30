@@ -20,8 +20,11 @@ import math
 
 from pyglet.math import Mat4
 
-STEPS_PER_OCTAVE = 8           # scroll notches to double the zoom
-MIN_LEVEL, MAX_LEVEL = -26, 24  # ~0.1x .. 8x; a big board lowers the minimum (min_level)
+STEPS_PER_OCTAVE = 8  # scroll notches to double the zoom
+MIN_LEVEL, MAX_LEVEL = (
+    -26,
+    24,
+)  # ~0.1x .. 8x; a big board lowers the minimum (min_level)
 
 
 class Camera:
@@ -50,7 +53,9 @@ class Camera:
     def scroll(self, sx: float, sy: float, amount: float) -> bool:
         """Zoom by scroll-wheel notches around the cursor. Returns True if zoom changed."""
         self._scroll_accum += amount
-        steps = int(self._scroll_accum)  # truncates toward zero, keeps the fractional rest
+        steps = int(
+            self._scroll_accum
+        )  # truncates toward zero, keeps the fractional rest
         self._scroll_accum -= steps
         if not steps:
             return False
@@ -87,7 +92,4 @@ class Camera:
         z = self.zoom
         tx, ty = self.translation()
         # Column-major: scale on the diagonal, translation in the last column.
-        return Mat4(z, 0, 0, 0,
-                    0, z, 0, 0,
-                    0, 0, 1, 0,
-                    tx, ty, 0, 1)
+        return Mat4(z, 0, 0, 0, 0, z, 0, 0, 0, 0, 1, 0, tx, ty, 0, 1)

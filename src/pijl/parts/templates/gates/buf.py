@@ -6,4 +6,6 @@ API = 2
 
 
 def register(reg):
-    reg.add(part("BUF", ins=("a",), outs=("out",), eval=lambda a: a & 1, category="GATES"))
+    reg.add(
+        part("BUF", ins=("a",), outs=("out",), eval=lambda a: a & 1, category="GATES")
+    )

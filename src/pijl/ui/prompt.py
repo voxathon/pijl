@@ -25,36 +25,81 @@ FONT, SIZE, SMALL = "Consolas", 11 * S, 10 * S
 
 
 class Prompt:
-    def __init__(self, batch: pyglet.graphics.Batch, win_w: int, win_h: int, title: str, *,
-                 text: str | None = None, max_len: int = 40, items: list[str] | None = None,
-                 hint: str = "", empty: str = "nothing here yet") -> None:
+    def __init__(
+        self,
+        batch: pyglet.graphics.Batch,
+        win_w: int,
+        win_h: int,
+        title: str,
+        *,
+        text: str | None = None,
+        max_len: int = 40,
+        items: list[str] | None = None,
+        hint: str = "",
+        empty: str = "nothing here yet",
+    ) -> None:
         self.batch = batch
         self.edit = LineEdit(text, max_len) if text is not None else None
         self.items = items
         self.shown: list[str] = []  # items matching the field, best first
-        self.selected = 0           # index into shown
-        self.offset = 0             # first shown item on screen (the list scrolls)
-        self.empty = empty          # what the list says when nothing matches
+        self.selected = 0  # index into shown
+        self.offset = 0  # first shown item on screen (the list scrolls)
+        self.empty = empty  # what the list says when nothing matches
         self.caret_on, self._blink_t = True, 0.0
 
-        shade_g, bg, fg, text_g = (pyglet.graphics.Group(order=o) for o in (20, 21, 22, 23))
+        shade_g, bg, fg, text_g = (
+            pyglet.graphics.Group(order=o) for o in (20, 21, 22, 23)
+        )
         n_rows = MAX_ROWS if items is not None else 0
-        self.h = PAD + TITLE_H + (FIELD_H + PAD / 2 if self.edit else 0) + n_rows * ROW_H + HINT_H + PAD / 2
-        self.shade = shapes.Rectangle(0, 0, win_w, win_h, color=(0, 0, 0, 110), batch=batch, group=shade_g)
+        self.h = (
+            PAD
+            + TITLE_H
+            + (FIELD_H + PAD / 2 if self.edit else 0)
+            + n_rows * ROW_H
+            + HINT_H
+            + PAD / 2
+        )
+        self.shade = shapes.Rectangle(
+            0, 0, win_w, win_h, color=(0, 0, 0, 110), batch=batch, group=shade_g
+        )
         self.panel = Box(W, self.h, max(1, round(S)), *T.MENU_PANEL, batch, bg)
 
         def label(text="", color=T.PART_TEXT, size=SIZE):
-            return pyglet.text.Label(text, font_name=FONT, font_size=size, color=color,
-                                     anchor_y="center", batch=batch, group=text_g)
+            return pyglet.text.Label(
+                text,
+                font_name=FONT,
+                font_size=size,
+                color=color,
+                anchor_y="center",
+                batch=batch,
+                group=text_g,
+            )
 
         self.title = label(title)
         self.field = self.field_text = self.caret = None
         if self.edit is not None:
-            self.field = Box(W - 2 * PAD, FIELD_H, max(1, round(S)), T.PICKER_BG, T.SELECT, batch, fg)
+            self.field = Box(
+                W - 2 * PAD, FIELD_H, max(1, round(S)), T.PICKER_BG, T.SELECT, batch, fg
+            )
             self.field_text = label()
-            self.caret = shapes.Rectangle(0, 0, 1.5 * S, 16 * S, color=T.CARET, batch=batch, group=text_g)
-        self.rows = [(shapes.Rectangle(0, 0, W - 2 * PAD, ROW_H, color=T.MENU_PANEL[0], batch=batch, group=fg),
-                      label()) for _ in range(n_rows)]
+            self.caret = shapes.Rectangle(
+                0, 0, 1.5 * S, 16 * S, color=T.CARET, batch=batch, group=text_g
+            )
+        self.rows = [
+            (
+                shapes.Rectangle(
+                    0,
+                    0,
+                    W - 2 * PAD,
+                    ROW_H,
+                    color=T.MENU_PANEL[0],
+                    batch=batch,
+                    group=fg,
+                ),
+                label(),
+            )
+            for _ in range(n_rows)
+        ]
         self.hint = label(hint, color=T.HELP_TEXT, size=SMALL)
         self.layout(win_w, win_h)
         self._refilter()
@@ -84,15 +129,23 @@ class Prompt:
         """Bring the field, caret and list rows up to date."""
         if self.edit is not None:
             self.field_text.text = self.edit.text
-            before = pyglet.text.Label(self.edit.text[:self.edit.caret], font_name=FONT, font_size=SIZE)
-            self.caret.position = (self.field_text.x + before.content_width,
-                                   self.field_text.y - self.caret.height / 2)
+            before = pyglet.text.Label(
+                self.edit.text[: self.edit.caret], font_name=FONT, font_size=SIZE
+            )
+            self.caret.position = (
+                self.field_text.x + before.content_width,
+                self.field_text.y - self.caret.height / 2,
+            )
             self.caret.visible = self.caret_on
-        visible = self.shown[self.offset:self.offset + len(self.rows)]
+        visible = self.shown[self.offset : self.offset + len(self.rows)]
         for i, (row, text) in enumerate(self.rows):
             if i < len(visible):
                 text.text, text.color = visible[i], T.PART_TEXT
-                row.color = T.MENU_HOVER if self.offset + i == self.selected else T.MENU_PANEL[0]
+                row.color = (
+                    T.MENU_HOVER
+                    if self.offset + i == self.selected
+                    else T.MENU_PANEL[0]
+                )
             else:
                 text.text = self.empty if i == 0 and not self.shown else ""
                 text.color = T.PICKER_DIM_TEXT
@@ -129,7 +182,9 @@ class Prompt:
             return
         q = self.text.strip().casefold()
         hits = [i for i in self.items if q in i.casefold()]
-        self.shown = sorted(hits, key=lambda i: not i.casefold().startswith(q))  # prefix matches first
+        self.shown = sorted(
+            hits, key=lambda i: not i.casefold().startswith(q)
+        )  # prefix matches first
         self.selected, self.offset = 0, 0
         self._show()
 
@@ -147,8 +202,11 @@ class Prompt:
     def item_at(self, sx: float, sy: float) -> int | None:
         """Index into `shown` of the list row under the cursor."""
         for i, (row, _) in enumerate(self.rows):
-            if (self.offset + i < len(self.shown) and row.x <= sx <= row.x + row.width
-                    and row.y <= sy <= row.y + row.height):
+            if (
+                self.offset + i < len(self.shown)
+                and row.x <= sx <= row.x + row.width
+                and row.y <= sy <= row.y + row.height
+            ):
                 return self.offset + i
         return None
 

@@ -75,7 +75,10 @@ def test_settling_breaks_the_tie_and_then_holds():
         for _ in range(50):
             c.step()
             held.append((q.state, qb.state))
-        assert len(set(held)) == 1 and {*held[0]} == {ZERO, ONE}  # settled into a real state
+        assert len(set(held)) == 1 and {*held[0]} == {
+            ZERO,
+            ONE,
+        }  # settled into a real state
         outcomes.add(held[0])
     assert outcomes == {(ONE, ZERO), (ZERO, ONE)}  # either one, depending on the noise
 
@@ -89,6 +92,7 @@ def test_settling_is_reproducible():
             c.step()
             out.append((q.state, qb.state))
         return out
+
     assert run(7) == run(7)
 
 
@@ -98,14 +102,29 @@ def test_settling_is_reproducible():
 def half_adder() -> Snapshot:
     """Inputs a (top), b; outputs sum (XOR from NANDs), carry. Port uids 1, 2 / 10, 11."""
     parts = {
-        1: ("IN", "a", 0.0, 100.0, {}), 2: ("IN", "", 0.0, 0.0, {}),
-        3: ("NAND", "", 100.0, 50.0, {}), 4: ("NAND", "", 200.0, 100.0, {}),
-        5: ("NAND", "", 200.0, 0.0, {}), 6: ("NAND", "", 300.0, 50.0, {}), 7: ("NOT", "", 300.0, -50.0, {}),
-        10: ("OUT", "sum", 400.0, 50.0, {}), 11: ("OUT", "carry", 400.0, -50.0, {}),
+        1: ("IN", "a", 0.0, 100.0, {}),
+        2: ("IN", "", 0.0, 0.0, {}),
+        3: ("NAND", "", 100.0, 50.0, {}),
+        4: ("NAND", "", 200.0, 100.0, {}),
+        5: ("NAND", "", 200.0, 0.0, {}),
+        6: ("NAND", "", 300.0, 50.0, {}),
+        7: ("NOT", "", 300.0, -50.0, {}),
+        10: ("OUT", "sum", 400.0, 50.0, {}),
+        11: ("OUT", "carry", 400.0, -50.0, {}),
     }
-    wires = {1: w(1, 0, 3, 0), 2: w(2, 0, 3, 1), 3: w(1, 0, 4, 0), 4: w(3, 0, 4, 1), 5: w(3, 0, 5, 0),
-             6: w(2, 0, 5, 1), 7: w(4, 0, 6, 0), 8: w(5, 0, 6, 1), 9: w(6, 0, 10, 0), 10: w(3, 0, 7, 0),
-             11: w(7, 0, 11, 0)}
+    wires = {
+        1: w(1, 0, 3, 0),
+        2: w(2, 0, 3, 1),
+        3: w(1, 0, 4, 0),
+        4: w(3, 0, 4, 1),
+        5: w(3, 0, 5, 0),
+        6: w(2, 0, 5, 1),
+        7: w(4, 0, 6, 0),
+        8: w(5, 0, 6, 1),
+        9: w(6, 0, 10, 0),
+        10: w(3, 0, 7, 0),
+        11: w(7, 0, 11, 0),
+    }
     return Snapshot(parts, wires)
 
 
@@ -124,19 +143,35 @@ def test_a_macro_computes_like_its_body():
             ia, ib, m = c.add_part("IN"), c.add_part("IN"), c.add_part("macro:ha")
             s_led, c_led = c.add_part("OUT"), c.add_part("OUT")
             ia.outputs[0].state, ib.outputs[0].state = a, b
-            for src, dst in ((ia.outputs[0], m.inputs[0]), (ib.outputs[0], m.inputs[1]),
-                             (m.outputs[0], s_led.inputs[0]), (m.outputs[1], c_led.inputs[0])):
+            for src, dst in (
+                (ia.outputs[0], m.inputs[0]),
+                (ib.outputs[0], m.inputs[1]),
+                (m.outputs[0], s_led.inputs[0]),
+                (m.outputs[1], c_led.inputs[0]),
+            ):
                 c.connect(src, dst)
-            for _ in range(10):  # (exact tick-for-tick timing: see the wrapping test below)
+            for _ in range(
+                10
+            ):  # (exact tick-for-tick timing: see the wrapping test below)
                 c.step()
-            assert (s_led.inputs[0].state, c_led.inputs[0].state) == (level(a != b), level(a and b))
-            assert m.outputs[0].state is level(a != b)  # the instance's pins show the value too
+            assert (s_led.inputs[0].state, c_led.inputs[0].state) == (
+                level(a != b),
+                level(a and b),
+            )
+            assert m.outputs[0].state is level(
+                a != b
+            )  # the instance's pins show the value too
 
 
 def test_nested_macros_and_removal():
-    two = Snapshot({1: ("IN", "x", 0.0, 0.0, {}), 2: ("macro:ha", "", 50.0, 0.0, {}),
-                    3: ("OUT", "s", 100.0, 0.0, {})},
-                   {1: w(1, 0, 2, 0), 2: w(1, 0, 2, 1), 3: w(2, 0, 3, 0)})  # x XOR x = 0 ... then NOT it
+    two = Snapshot(
+        {
+            1: ("IN", "x", 0.0, 0.0, {}),
+            2: ("macro:ha", "", 50.0, 0.0, {}),
+            3: ("OUT", "s", 100.0, 0.0, {}),
+        },
+        {1: w(1, 0, 2, 0), 2: w(1, 0, 2, 1), 3: w(2, 0, 3, 0)},
+    )  # x XOR x = 0 ... then NOT it
     cat = catalog({"ha": half_adder(), "two": two})
     c = Circuit(cat)
     m = c.add_part("macro:two")
@@ -157,11 +192,15 @@ def test_nested_macros_and_removal():
 
 def test_a_macro_cannot_contain_itself():
     loop = Snapshot({1: ("macro:loop", "", 0.0, 0.0, {})}, {})
-    cat = catalog({"loop": loop, "outer": Snapshot({1: ("macro:loop", "", 0.0, 0.0, {})}, {})})
+    cat = catalog(
+        {"loop": loop, "outer": Snapshot({1: ("macro:loop", "", 0.0, 0.0, {})}, {})}
+    )
     assert "macro:loop" not in cat
     with pytest.raises(KeyError, match="contains itself"):
         cat.get("macro:loop")
-    assert cat.book.contains("outer", "loop") is False  # unloadable: treated as not containing
+    assert (
+        cat.book.contains("outer", "loop") is False
+    )  # unloadable: treated as not containing
 
 
 def test_contains_looks_all_the_way_down():
@@ -191,11 +230,19 @@ def test_hooks_reach_parts_inside_macros():
 
 def test_macro_instances_in_files_and_pins_by_port_uid():
     defs = {"ha": half_adder()}
-    board = Snapshot({1: ("IN", "", 0.0, 0.0, {}), 2: ("macro:ha", "", 100.0, 0.0, {}), 3: ("OUT", "", 200.0, 0.0, {})},
-                     {1: w(1, 0, 2, 1), 2: w(2, 1, 3, 0)})  # into b, carry out
+    board = Snapshot(
+        {
+            1: ("IN", "", 0.0, 0.0, {}),
+            2: ("macro:ha", "", 100.0, 0.0, {}),
+            3: ("OUT", "", 200.0, 0.0, {}),
+        },
+        {1: w(1, 0, 2, 1), 2: w(2, 1, 3, 0)},
+    )  # into b, carry out
     data = encode(board, catalog(defs))
     assert data["parts"][1] == {"uid": 2, "macro": "ha", "pos": [100, 0]}
-    assert data["wires"][0]["to"] == {"part": 2, "pin": 2} and data["wires"][1]["from"] == {"part": 2, "pin": 11}
+    assert data["wires"][0]["to"] == {"part": 2, "pin": 2} and data["wires"][1][
+        "from"
+    ] == {"part": 2, "pin": 11}
     assert decode(json.loads(dumps(data)), catalog(defs)).snapshot == board
 
     # Move b above a inside the macro: pin order flips, but the wires follow their pins.
@@ -214,7 +261,11 @@ def test_macro_instances_in_files_and_pins_by_port_uid():
 
 
 def test_missing_macro_is_dropped_with_a_warning():
-    data = {"pijl": 1, "parts": [{"uid": 1, "macro": "nope", "pos": [0, 0]}], "wires": []}
+    data = {
+        "pijl": 1,
+        "parts": [{"uid": 1, "macro": "nope", "pos": [0, 0]}],
+        "wires": [],
+    }
     loaded = decode(data, catalog({}))
     assert loaded.snapshot.parts == {} and "nope" in loaded.warnings[0]
 
@@ -225,11 +276,19 @@ def test_missing_macro_is_dropped_with_a_warning():
 def random_board(rng: random.Random, n_in: int, n_gates: int) -> Snapshot:
     parts = {i + 1: ("IN", "", 0.0, float(i * 40), {}) for i in range(n_in)}
     for u in range(n_in + 1, n_in + n_gates + 1):
-        parts[u] = (rng.choice(GATES), "", float(rng.randrange(100, 900)), float(rng.randrange(0, 900)), {})
+        parts[u] = (
+            rng.choice(GATES),
+            "",
+            float(rng.randrange(100, 900)),
+            float(rng.randrange(0, 900)),
+            {},
+        )
     wires, wu = {}, 1
     for u, (kind, *_rest) in parts.items():
         for i in range(ARITY.get(kind, 0)):
-            src = rng.choice([s for s in parts if s != u and parts[s][0] != "OUT"])  # feedback allowed
+            src = rng.choice(
+                [s for s in parts if s != u and parts[s][0] != "OUT"]
+            )  # feedback allowed
             wires[wu] = w(src, 0, u, i)
             wu += 1
     return Snapshot(parts, wires)
@@ -241,7 +300,7 @@ def wrap(snap: Snapshot, inside: set[int], name: str) -> tuple[Snapshot, Snapsho
     body_wires, outer_wires = {}, {}
     uid = max(snap.parts) + 1
     wid = max(snap.wires, default=0) + 1
-    ins: dict[tuple, int] = {}   # outside source pin -> IN port uid
+    ins: dict[tuple, int] = {}  # outside source pin -> IN port uid
     outs: dict[tuple, int] = {}  # inside source pin -> OUT port uid
     inst = uid + 1000
     for wuid, data in snap.wires.items():
@@ -255,8 +314,20 @@ def wrap(snap: Snapshot, inside: set[int], name: str) -> tuple[Snapshot, Snapsho
             if src not in ins:
                 ins[src] = port = uid
                 uid += 1
-                body_parts[port] = ("IN", "", -100.0, 10000.0 - 10 * len(ins), {})  # creation order = top to bottom
-                outer_wires[wid] = (src, ("p", inst, True, len(ins) - 1), (), None, None)
+                body_parts[port] = (
+                    "IN",
+                    "",
+                    -100.0,
+                    10000.0 - 10 * len(ins),
+                    {},
+                )  # creation order = top to bottom
+                outer_wires[wid] = (
+                    src,
+                    ("p", inst, True, len(ins) - 1),
+                    (),
+                    None,
+                    None,
+                )
                 wid += 1
             body_wires[wid] = (("p", ins[src], False, 0), dst, (), None, None)
             wid += 1
@@ -315,4 +386,6 @@ def test_wrapping_parts_in_macros_never_changes_behavior(seed):
         c_flat.step()
         c_wrap.step()
         for u in flat.parts:
-            assert [p.state for p in p_flat[u].pins] == [p.state for p in where(u).pins], (seed, tick, u)
+            assert [p.state for p in p_flat[u].pins] == [
+                p.state for p in where(u).pins
+            ], (seed, tick, u)

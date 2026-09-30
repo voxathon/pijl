@@ -47,7 +47,9 @@ float coverage(float d) {
 # flags: x = state (what it shows), y = opacity, z / w = per-kind extras. u8, normalized.
 # The state byte: off / on pick the shape's own colors; the rest are patterns.
 SHOW_OFF, SHOW_ON, SHOW_X, SHOW_Z, SHOW_FIGHT = 0, 255, 1, 2, 3
-SHOW_BY_CODE = np.array([SHOW_Z, SHOW_OFF, SHOW_ON, SHOW_X], np.uint8)  # by logic code (pijl.logic)
+SHOW_BY_CODE = np.array(
+    [SHOW_Z, SHOW_OFF, SHOW_ON, SHOW_X], np.uint8
+)  # by logic code (pijl.logic)
 
 
 def show(value, fight: bool = False) -> int:
@@ -110,7 +112,10 @@ def _rgba_of(color: tuple) -> tuple[int, int, int, int]:
 
 # ---- Rect ---------------------------------------------------------------------------
 
-RECT = Kind("rect", 0, f"""#version 150 core
+RECT = Kind(
+    "rect",
+    0,
+    f"""#version 150 core
 in vec4 rect;     // x, y, width, height
 in float border;  // inside the rectangle
 in vec4 fill; in vec4 fill_on; in vec4 edge; in vec4 edge_on;
@@ -138,7 +143,8 @@ void main() {{
     world = rect.xy + lift * lift_offset + local;
     gl_Position = window.projection * window.view * vec4(world, 0.0, 1.0);
 }}
-""", f"""#version 150 core
+""",
+    f"""#version 150 core
 in vec2 local;
 in vec2 world;
 flat in vec2 size;
@@ -162,13 +168,28 @@ void main() {{
     if (c.a <= 0.0) discard;
     final_color = c;
 }}
-""", np.dtype([("rect", "f4", 4), ("border", "f4"), ("fill", "u1", 4), ("fill_on", "u1", 4),
-               ("edge", "u1", 4), ("edge_on", "u1", 4), ("flags", "u1", 4), ("lift", "f4")]),
-            positions=("rect",))
+""",
+    np.dtype(
+        [
+            ("rect", "f4", 4),
+            ("border", "f4"),
+            ("fill", "u1", 4),
+            ("fill_on", "u1", 4),
+            ("edge", "u1", 4),
+            ("edge_on", "u1", 4),
+            ("flags", "u1", 4),
+            ("lift", "f4"),
+        ]
+    ),
+    positions=("rect",),
+)
 
 # ---- Dot ----------------------------------------------------------------------------
 
-DOT = Kind("dot", 1, f"""#version 150 core
+DOT = Kind(
+    "dot",
+    1,
+    f"""#version 150 core
 in vec2 center;
 in float radius;
 in vec4 color; in vec4 color_on;
@@ -188,7 +209,8 @@ void main() {{
     world = center + lift * lift_offset + local * radius;
     gl_Position = window.projection * window.view * vec4(world, 0.0, 1.0);
 }}
-""", f"""#version 150 core
+""",
+    f"""#version 150 core
 in vec2 local;
 in vec2 world;
 flat in vec4 c;
@@ -203,12 +225,26 @@ void main() {{
     vec4 k = patterned(show) ? pattern(show, world, wpp, c.a) : c;
     final_color = vec4(k.rgb, k.a * a);
 }}
-""", np.dtype([("center", "f4", 2), ("radius", "f4"), ("color", "u1", 4), ("color_on", "u1", 4),
-               ("flags", "u1", 4), ("lift", "f4")]), positions=("center",))
+""",
+    np.dtype(
+        [
+            ("center", "f4", 2),
+            ("radius", "f4"),
+            ("color", "u1", 4),
+            ("color_on", "u1", 4),
+            ("flags", "u1", 4),
+            ("lift", "f4"),
+        ]
+    ),
+    positions=("center",),
+)
 
 # ---- Segment ------------------------------------------------------------------------
 
-SEGMENT = Kind("segment", 2, f"""#version 150 core
+SEGMENT = Kind(
+    "segment",
+    2,
+    f"""#version 150 core
 in vec2 a;
 in vec2 b;
 in float radius;
@@ -244,7 +280,8 @@ void main() {{
     world = a + lift * lift_offset + dir * u + n * v;
     gl_Position = window.projection * window.view * vec4(world, 0.0, 1.0);
 }}
-""", f"""#version 150 core
+""",
+    f"""#version 150 core
 in vec2 uv;
 in vec2 world;
 flat in vec2 ext;
@@ -264,9 +301,22 @@ void main() {{
     if (patterned(show)) c = pattern(show, world, wpp, c.a);
     final_color = vec4(c.rgb, c.a * a);
 }}
-""", np.dtype([("a", "f4", 2), ("b", "f4", 2), ("radius", "f4"), ("ca", "u1", 4), ("ca_on", "u1", 4),
-               ("cb", "u1", 4), ("cb_on", "u1", 4), ("flags", "u1", 4), ("lift", "f4")]),
-               positions=("a", "b"))
+""",
+    np.dtype(
+        [
+            ("a", "f4", 2),
+            ("b", "f4", 2),
+            ("radius", "f4"),
+            ("ca", "u1", 4),
+            ("ca_on", "u1", 4),
+            ("cb", "u1", 4),
+            ("cb_on", "u1", 4),
+            ("flags", "u1", 4),
+            ("lift", "f4"),
+        ]
+    ),
+    positions=("a", "b"),
+)
 
 
 class _Shape:
@@ -340,8 +390,18 @@ class Rect(_Shape):
 
     kind = RECT
 
-    def __init__(self, x: float, y: float, w: float, h: float, border: float, fill, border_color,
-                 canvas: Canvas, layer) -> None:
+    def __init__(
+        self,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+        border: float,
+        fill,
+        border_color,
+        canvas: Canvas,
+        layer,
+    ) -> None:
         super().__init__(canvas, layer)
         self._set("rect", (x, y, w, h))
         self._set("border", border)
@@ -398,7 +458,9 @@ class Dot(_Shape):
 
     kind = DOT
 
-    def __init__(self, x: float, y: float, radius: float, color, canvas: Canvas, layer) -> None:
+    def __init__(
+        self, x: float, y: float, radius: float, color, canvas: Canvas, layer
+    ) -> None:
         super().__init__(canvas, layer)
         self._set("center", (x, y))
         self._set("radius", radius)
@@ -447,7 +509,9 @@ class Segment(_Shape):
         self._set("radius", thickness / 2)
         self.set_colors(color, color)
 
-    def place(self, a: Point, b: Point, cap_a: bool = False, cap_b: bool = False) -> None:
+    def place(
+        self, a: Point, b: Point, cap_a: bool = False, cap_b: bool = False
+    ) -> None:
         f, s = self.buf.f, self.slot
         f["a"][s] = a
         f["b"][s] = b
@@ -469,7 +533,9 @@ class WireDot(Segment):
     Junction dots are these, so they draw in their wire's place in the layer instead
     of above every wire. Same interface as Dot."""
 
-    def __init__(self, x: float, y: float, radius: float, color, canvas: Canvas, layer) -> None:
+    def __init__(
+        self, x: float, y: float, radius: float, color, canvas: Canvas, layer
+    ) -> None:
         super().__init__(2 * radius, color, canvas, layer)
         self.position = (x, y)
 

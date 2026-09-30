@@ -18,7 +18,9 @@ def level_of(bits: set[int]) -> Level:
 
 
 def reference(fn, *ins: Level) -> Level:
-    return level_of({fn(*bits) for bits in itertools.product(*(POSSIBLE[v] for v in ins))})
+    return level_of(
+        {fn(*bits) for bits in itertools.product(*(POSSIBLE[v] for v in ins))}
+    )
 
 
 OPS = {
@@ -71,7 +73,13 @@ def test_classic_x_cases():
 
 def test_coercion():
     assert list(Logic([True, False, 1, 0, 5])) == [ONE, ZERO, ONE, ZERO, ONE]
-    assert list(Logic([ZERO, ONE, X, Z, True])) == [ZERO, ONE, X, Z, ONE]  # Levels aren't their int codes
+    assert list(Logic([ZERO, ONE, X, Z, True])) == [
+        ZERO,
+        ONE,
+        X,
+        Z,
+        ONE,
+    ]  # Levels aren't their int codes
     assert codes(ONE) == ONE.value and codes(True) == ONE.value
     assert list(Logic.full(3, Z)) == [Z, Z, Z]
 
@@ -85,15 +93,31 @@ def test_truthiness():
 def test_where_matches_definition():
     for c, a, b in itertools.product(LEVELS, repeat=3):
         expect = {ONE: a, ZERO: b}.get(c)
-        if expect is None:  # unknown select: only a known value both sides agree on survives
+        if (
+            expect is None
+        ):  # unknown select: only a known value both sides agree on survives
             expect = a if a == b and a in (ZERO, ONE) else X
         assert where(c, a, b)[()] is expect, (c, a, b)
-    assert list(where(np.array([True, False]), ONE, Z)) == [ONE, Z]  # a tri-state buffer
+    assert list(where(np.array([True, False]), ONE, Z)) == [
+        ONE,
+        Z,
+    ]  # a tri-state buffer
 
 
 def test_resolve_and_fights():
     # (no empty groups: reduceat can't do them, and the engine only resolves nets with drivers)
-    groups = [[Z], [ZERO], [ONE], [X], [ZERO, Z], [ONE, Z, Z], [ZERO, ONE], [ZERO, X], [ONE, ONE], [Z, Z]]
+    groups = [
+        [Z],
+        [ZERO],
+        [ONE],
+        [X],
+        [ZERO, Z],
+        [ONE, Z, Z],
+        [ZERO, ONE],
+        [ZERO, X],
+        [ONE, ONE],
+        [Z, Z],
+    ]
     flat = np.array([v.value for g in groups for v in g], np.uint8)
     starts = np.cumsum([0] + [len(g) for g in groups[:-1]])
     value = [Level(int(v)) for v in resolve(flat, starts)]

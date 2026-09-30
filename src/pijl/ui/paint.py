@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from .editor import Editor
 
 Rgb = tuple[int, int, int]
-Pair = tuple[Rgb, Rgb]           # (off, on)
+Pair = tuple[Rgb, Rgb]  # (off, on)
 Stops = list[tuple[float, Pair]]  # (fraction of the wire's length, color), ascending
 
 
@@ -56,7 +56,11 @@ def part_color(part) -> str | None:
     return part.props.get("color") if part.type.look.lit else None
 
 
-def paint(editor: Editor, parts: Iterable[int] | None = None, wires: Iterable[int] | None = None) -> None:
+def paint(
+    editor: Editor,
+    parts: Iterable[int] | None = None,
+    wires: Iterable[int] | None = None,
+) -> None:
     """Recompute wire gradients and part tints: everywhere, or around the parts and wires
     (uids) that changed -- gone ones included, their uids are just skipped."""
     c = editor.circuit
@@ -65,9 +69,15 @@ def paint(editor: Editor, parts: Iterable[int] | None = None, wires: Iterable[in
     else:
         seed_parts = {c.part_by_uid[uid] for uid in parts or () if uid in c.part_by_uid}
         seeds = {c.wire_by_uid[uid] for uid in wires or () if uid in c.wire_by_uid}
-        seeds.update(w for part in seed_parts for pin in part.pins for w in c.ends_on(pin))
-        todo = sorted(seeds.union(c.descendants(*seeds)), key=lambda w: w.uid)  # parents first
-        affected = seed_parts | {e.part for w in todo for e in w.ends if isinstance(e, Pin)}
+        seeds.update(
+            w for part in seed_parts for pin in part.pins for w in c.ends_on(pin)
+        )
+        todo = sorted(
+            seeds.union(c.descendants(*seeds)), key=lambda w: w.uid
+        )  # parents first
+        affected = seed_parts | {
+            e.part for w in todo for e in w.ends if isinstance(e, Pin)
+        }
     for wire in todo:
         view = editor.wire_views.get(wire)
         if view is None:
@@ -79,9 +89,13 @@ def paint(editor: Editor, parts: Iterable[int] | None = None, wires: Iterable[in
             else:
                 parent = editor.wire_views.get(end)
                 ends.append(parent.color_at(pos) if parent is not None else None)
-        colors = [c for c in (ends[0], color_pair(view.color), ends[1]) if c is not None]
+        colors = [
+            c for c in (ends[0], color_pair(view.color), ends[1]) if c is not None
+        ]
         n = len(colors)
-        view.set_stops([(i / (n - 1) if n > 1 else 0.0, c) for i, c in enumerate(colors)])
+        view.set_stops(
+            [(i / (n - 1) if n > 1 else 0.0, c) for i, c in enumerate(colors)]
+        )
     for part in affected:
         view = editor.part_views.get(part)
         if view is None:
@@ -159,9 +173,11 @@ def _oklab(rgb: Rgb) -> tuple[float, float, float]:
     l = math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b)
     m = math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b)
     s = math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b)
-    return (0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
-            1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
-            0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s)
+    return (
+        0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+        1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+        0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+    )
 
 
 def _from_oklab(lab) -> Rgb:
@@ -169,6 +185,8 @@ def _from_oklab(lab) -> Rgb:
     l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3
     m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3
     s = (L - 0.0894841775 * a - 1.2914855480 * b) ** 3
-    return (_srgb(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
-            _srgb(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
-            _srgb(-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s))
+    return (
+        _srgb(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
+        _srgb(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
+        _srgb(-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s),
+    )

@@ -50,7 +50,14 @@ from .snapshot import MACRO, EndRef, Point, Snapshot
 FORMAT = 1
 NAME_MAX = 40
 _FORBIDDEN = '<>:"/\\|?*'
-_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+_RESERVED = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
 
 
 class FormatError(ValueError):
@@ -94,7 +101,7 @@ def encode(snap: Snapshot, types: Registry | None = None) -> dict[str, Any]:
         kind, label, x, y, props = snap.parts[uid]
         d: dict[str, Any] = {"uid": uid}
         if kind.startswith(MACRO):
-            d["macro"] = kind[len(MACRO):]
+            d["macro"] = kind[len(MACRO) :]
         else:
             d["kind"] = kind
         if label:
@@ -106,8 +113,11 @@ def encode(snap: Snapshot, types: Registry | None = None) -> dict[str, Any]:
     wires = []
     for uid in sorted(snap.wires):
         src, dst, bends, src_pt, dst_pt = snap.wires[uid]
-        d = {"uid": uid, "from": _encode_end(src, src_pt, snap, types),
-             "to": _encode_end(dst, dst_pt, snap, types)}
+        d = {
+            "uid": uid,
+            "from": _encode_end(src, src_pt, snap, types),
+            "to": _encode_end(dst, dst_pt, snap, types),
+        }
         if bends:
             d["bends"] = [_point(p) for p in bends]
         if uid in snap.wire_colors:
@@ -124,7 +134,9 @@ def decode(data: Any, types: Registry) -> Loaded:
     if not isinstance(version, int) or version < 1:
         raise FormatError(f"unknown format version {version!r}")
     if version > FORMAT:
-        raise FormatError(f"made by a newer pijl (format {version}; this one reads up to {FORMAT})")
+        raise FormatError(
+            f"made by a newer pijl (format {version}; this one reads up to {FORMAT})"
+        )
     out = Loaded(Snapshot({}, {}))
     warn = out.warnings.append
 
@@ -140,8 +152,11 @@ def decode(data: Any, types: Registry) -> Loaded:
             try:
                 t = types.get(kind)
             except KeyError as e:
-                what = (f"can't use macro {kind[len(MACRO):]!r} ({e.args[0] if e.args else 'missing'})"
-                        if kind.startswith(MACRO) else f"unknown kind {kind!r}")
+                what = (
+                    f"can't use macro {kind[len(MACRO) :]!r} ({e.args[0] if e.args else 'missing'})"
+                    if kind.startswith(MACRO)
+                    else f"unknown kind {kind!r}"
+                )
                 warn(f"part {uid}: {what}, dropped")
                 continue
             label = d.get("label", "")
@@ -159,7 +174,10 @@ def decode(data: Any, types: Registry) -> Loaded:
 
     wired_inputs: set[tuple[int, int]] = set()  # an input pin takes one wire
     lost = 0  # wires whose ends are gone: counted, not listed one by one
-    for d in sorted(_list(data, "wires"), key=lambda d: d.get("uid", 0) if isinstance(d, dict) else 0):
+    for d in sorted(
+        _list(data, "wires"),
+        key=lambda d: d.get("uid", 0) if isinstance(d, dict) else 0,
+    ):
         try:
             uid = _int(d["uid"])
             if uid in out.snapshot.wires:
@@ -170,8 +188,12 @@ def decode(data: Any, types: Registry) -> Loaded:
                 continue
             (src, src_pt), (dst, dst_pt) = ends
             pins = [ref for ref, _ in ends if ref[0] == "p"]
-            if len(pins) == 2 and (pins[0][2] == pins[1][2] or pins[0][1] == pins[1][1]):
-                raise ValueError("connects two inputs, two outputs, or a part to itself")
+            if len(pins) == 2 and (
+                pins[0][2] == pins[1][2] or pins[0][1] == pins[1][1]
+            ):
+                raise ValueError(
+                    "connects two inputs, two outputs, or a part to itself"
+                )
             inputs = {(ref[1], ref[3]) for ref in pins if ref[2]}
             if inputs & wired_inputs:
                 raise ValueError("a second wire into an input pin")
@@ -182,7 +204,9 @@ def decode(data: Any, types: Registry) -> Loaded:
                 raise ValueError("bad color")
             out.snapshot.wires[uid] = (src, dst, bends, src_pt, dst_pt)
             if color:
-                out.snapshot.wire_colors[uid] = color  # names the UI doesn't know draw as default
+                out.snapshot.wire_colors[uid] = (
+                    color  # names the UI doesn't know draw as default
+                )
         except (KeyError, TypeError, ValueError) as e:
             warn(f"a wire was unreadable ({_why(e)}), dropped")
     if lost:
@@ -192,12 +216,26 @@ def decode(data: Any, types: Registry) -> Loaded:
 
 def dumps(data: dict[str, Any]) -> str:
     """The on-disk text: stable order, one part / wire per line."""
+
     def block(key: str) -> str:
         rows = data[key]
         if not rows:
             return f'  "{key}": []'
-        return f'  "{key}": [\n' + ",\n".join("    " + json.dumps(r, ensure_ascii=False) for r in rows) + "\n  ]"
-    return '{\n  "pijl": ' + json.dumps(data["pijl"]) + ",\n" + block("parts") + ",\n" + block("wires") + "\n}\n"
+        return (
+            f'  "{key}": [\n'
+            + ",\n".join("    " + json.dumps(r, ensure_ascii=False) for r in rows)
+            + "\n  ]"
+        )
+
+    return (
+        '{\n  "pijl": '
+        + json.dumps(data["pijl"])
+        + ",\n"
+        + block("parts")
+        + ",\n"
+        + block("wires")
+        + "\n}\n"
+    )
 
 
 # ---- files -----------------------------------------------------------------------
@@ -227,7 +265,9 @@ class MacroStore:
         name = check_name(name)
         old = self.find(name)
         if old is not None and old != name:
-            self.path(old).unlink()  # same name, new capitalization: rename, don't keep the old spelling
+            self.path(
+                old
+            ).unlink()  # same name, new capitalization: rename, don't keep the old spelling
         self.folder.mkdir(parents=True, exist_ok=True)
         write_atomic(self.path(name), dumps(encode(snap, types)))
 
@@ -243,7 +283,9 @@ class MacroStore:
 # ---- helpers ----------------------------------------------------------------------
 
 
-def _encode_end(ref: EndRef, at: Point | None, snap: Snapshot, types: Registry | None) -> dict[str, Any]:
+def _encode_end(
+    ref: EndRef, at: Point | None, snap: Snapshot, types: Registry | None
+) -> dict[str, Any]:
     if ref[0] == "p":
         _, part, is_input, index = ref
         kind = snap.parts[part][0]
@@ -254,7 +296,9 @@ def _encode_end(ref: EndRef, at: Point | None, snap: Snapshot, types: Registry |
     return {"wire": ref[1], "at": _point(at)}
 
 
-def _decode_end(d: Any, wire_uid: int, kinds: dict[int, Any], snap: Snapshot) -> tuple[EndRef | None, Point | None]:
+def _decode_end(
+    d: Any, wire_uid: int, kinds: dict[int, Any], snap: Snapshot
+) -> tuple[EndRef | None, Point | None]:
     """(ref, junction point); ref is None when the thing it points at is gone."""
     if not isinstance(d, dict):
         raise TypeError("a wire end isn't an object")
@@ -298,8 +342,11 @@ def _int(v: Any) -> int:
 
 
 def _pair(v: Any) -> Point:
-    if not (isinstance(v, list) and len(v) == 2 and all(isinstance(c, (int, float)) and not isinstance(c, bool)
-                                                         for c in v)) or not all(map(math.isfinite, v)):
+    if not (
+        isinstance(v, list)
+        and len(v) == 2
+        and all(isinstance(c, (int, float)) and not isinstance(c, bool) for c in v)
+    ) or not all(map(math.isfinite, v)):
         raise TypeError(f"{v!r} isn't a point")
     return float(v[0]), float(v[1])
 

@@ -17,7 +17,7 @@ class Collection:
     name: str
     parts: list[str] = field(default_factory=list)
     builtin: bool = False  # the defaults; can be renamed and emptied, not deleted
-    open: bool = True      # expanded in the picker
+    open: bool = True  # expanded in the picker
 
 
 class Library:
@@ -53,10 +53,19 @@ class Library:
     # ---- saving -------------------------------------------------------------------
 
     def to_dict(self) -> dict:
-        return {"pijl": 1,
-                "collections": [{"name": c.name, "parts": list(c.parts), "builtin": c.builtin, "open": c.open}
-                                for c in self.collections],
-                "loose": list(self.loose)}
+        return {
+            "pijl": 1,
+            "collections": [
+                {
+                    "name": c.name,
+                    "parts": list(c.parts),
+                    "builtin": c.builtin,
+                    "open": c.open,
+                }
+                for c in self.collections
+            ],
+            "loose": list(self.loose),
+        }
 
     @classmethod
     def from_dict(cls, data: dict, parts: list[tuple[str, str]]) -> Library:
@@ -75,11 +84,21 @@ class Library:
 
         names: set[str] = set()
         for d in data.get("collections", []) if isinstance(data, dict) else []:
-            if not isinstance(d, dict) or not isinstance(d.get("name"), str) or d["name"] in names:
+            if (
+                not isinstance(d, dict)
+                or not isinstance(d.get("name"), str)
+                or d["name"] in names
+            ):
                 continue
             names.add(d["name"])
-            lib.collections.append(Collection(d["name"], entries(d.get("parts")), builtin=d.get("builtin") is True,
-                                              open=d.get("open") is not False))
+            lib.collections.append(
+                Collection(
+                    d["name"],
+                    entries(d.get("parts")),
+                    builtin=d.get("builtin") is True,
+                    open=d.get("open") is not False,
+                )
+            )
         lib.loose = entries(data.get("loose")) if isinstance(data, dict) else []
         lib.sync(parts)
         return lib
@@ -91,7 +110,9 @@ class Library:
     def _list(self, dest: Collection | None) -> list[str]:
         return self.loose if dest is None else dest.parts
 
-    def move_part(self, part: str, dest: Collection | None, index: int | None = None) -> None:
+    def move_part(
+        self, part: str, dest: Collection | None, index: int | None = None
+    ) -> None:
         """Put `part` into `dest` (None = loose) so it ends up at position `index`
         (None = at the end). Positions count the list without the part in it."""
         self._list(self.where(part)).remove(part)

@@ -4,7 +4,15 @@ import pytest
 
 from pijl.parts import builtin_registry
 from pijl.snapshot import Snapshot
-from pijl.storage import FORMAT, FormatError, MacroStore, check_name, decode, dumps, encode
+from pijl.storage import (
+    FORMAT,
+    FormatError,
+    MacroStore,
+    check_name,
+    decode,
+    dumps,
+    encode,
+)
 
 REG = builtin_registry()
 
@@ -19,10 +27,22 @@ def board() -> Snapshot:
         5: ("NOT", "", 380.0, 500.0, {}),
     }
     wires = {
-        1: (("p", 1, False, 0), ("p", 3, True, 0), ((320.0, 380.0), (320.0, 320.0)), None, None),
+        1: (
+            ("p", 1, False, 0),
+            ("p", 3, True, 0),
+            ((320.0, 380.0), (320.0, 320.0)),
+            None,
+            None,
+        ),
         2: (("p", 2, False, 0), ("p", 3, True, 1), (), None, None),
         3: (("p", 3, False, 0), ("p", 4, True, 0), (), None, None),
-        4: (("w", 1), ("p", 5, True, 0), ((320.0, 520.0),), (320.0, 350.0), None),  # branch off wire 1
+        4: (
+            ("w", 1),
+            ("p", 5, True, 0),
+            ((320.0, 520.0),),
+            (320.0, 350.0),
+            None,
+        ),  # branch off wire 1
     }
     return Snapshot(parts, wires)
 
@@ -61,9 +81,17 @@ def test_text_is_stable_and_one_line_per_item():
     assert text == dumps(encode(roundtrip(board())))
     lines = text.splitlines()
     assert lines[:2] == ["{", f'  "pijl": {FORMAT},']
-    assert sum('"uid"' in line for line in lines) == 9  # 5 parts + 4 wires, one per line
-    assert '"pos": [200, 360]' in text and '"pos": [580.5, 290.25]' in text  # whole numbers without .0
-    assert '"label": ""' not in text and '"bends": []' not in text and '"props"' not in text
+    assert (
+        sum('"uid"' in line for line in lines) == 9
+    )  # 5 parts + 4 wires, one per line
+    assert (
+        '"pos": [200, 360]' in text and '"pos": [580.5, 290.25]' in text
+    )  # whole numbers without .0
+    assert (
+        '"label": ""' not in text
+        and '"bends": []' not in text
+        and '"props"' not in text
+    )
     assert json.loads(text) == encode(board())
 
 
@@ -89,9 +117,15 @@ def test_pin_that_no_longer_exists_drops_the_wire():
 
 def test_invalid_connections_are_dropped():
     data = encode(board())
-    data["wires"].append({"uid": 9, "from": {"part": 2, "out": 0}, "to": {"part": 4, "in": 0}})  # LED already driven
-    data["wires"].append({"uid": 10, "from": {"part": 1, "out": 0}, "to": {"part": 2, "out": 0}})  # out -> out
-    data["wires"].append({"uid": 11, "from": {"wire": 12, "at": [0, 0]}, "to": {"part": 5, "in": 0}})  # newer wire
+    data["wires"].append(
+        {"uid": 9, "from": {"part": 2, "out": 0}, "to": {"part": 4, "in": 0}}
+    )  # LED already driven
+    data["wires"].append(
+        {"uid": 10, "from": {"part": 1, "out": 0}, "to": {"part": 2, "out": 0}}
+    )  # out -> out
+    data["wires"].append(
+        {"uid": 11, "from": {"wire": 12, "at": [0, 0]}, "to": {"part": 5, "in": 0}}
+    )  # newer wire
     loaded = decode(data, REG)
     assert set(loaded.snapshot.wires) == {1, 2, 3, 4}
     assert len(loaded.warnings) == 3
@@ -109,7 +143,9 @@ def test_garbage_entries_are_skipped_not_fatal():
     assert len(loaded.warnings) == 4
 
 
-@pytest.mark.parametrize("data", [[], {}, {"pijl": "one"}, {"pijl": 0}, {"pijl": FORMAT, "parts": {}}])
+@pytest.mark.parametrize(
+    "data", [[], {}, {"pijl": "one"}, {"pijl": 0}, {"pijl": FORMAT, "parts": {}}]
+)
 def test_not_a_macro_file(data):
     with pytest.raises(FormatError):
         decode(data, REG)
@@ -123,7 +159,10 @@ def test_newer_format_is_refused():
 # ---- names and files ---------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", ["", "   ", "a/b", "what?", "x" * 41, "trailing.", "CON", "nul.txt", "tab\there"])
+@pytest.mark.parametrize(
+    "name",
+    ["", "   ", "a/b", "what?", "x" * 41, "trailing.", "CON", "nul.txt", "tab\there"],
+)
 def test_bad_names(name):
     with pytest.raises(ValueError):
         check_name(name)

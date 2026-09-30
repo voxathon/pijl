@@ -32,8 +32,17 @@ from .views import PartView, Touched, WireView, paused_gc
 if TYPE_CHECKING:
     from .editor import Editor
 
-__all__ = ["EMPTY", "Change", "History", "Snapshot", "capture", "changes", "instantiate", "internal_wires",
-           "restore"]
+__all__ = [
+    "EMPTY",
+    "Change",
+    "History",
+    "Snapshot",
+    "capture",
+    "changes",
+    "instantiate",
+    "internal_wires",
+    "restore",
+]
 
 # One undo step: for parts, wires and wire colors, uid -> (before, after). None = absent.
 Change = tuple[dict[int, tuple], dict[int, tuple], dict[int, tuple]]
@@ -52,7 +61,9 @@ def capture(editor: Editor, views: Iterable[PartView] | None = None) -> Snapshot
     return Snapshot(parts, wires, colors)
 
 
-def changes(editor: Editor, parts: Iterable[int], wires: Iterable[int]) -> tuple[dict, dict, dict]:
+def changes(
+    editor: Editor, parts: Iterable[int], wires: Iterable[int]
+) -> tuple[dict, dict, dict]:
     """What those parts and wires (uids) look like now, for History.record: their
     data, their wire colors -- or None where they're gone (or a wire has no color)."""
     c = editor.circuit
@@ -76,9 +87,13 @@ def part_data(view: PartView) -> PartData:
 
 def wire_data(view: WireView) -> WireData:
     w = view.wire
-    return (_ref(w.src), _ref(w.dst), tuple(view.bends),
-            None if isinstance(w.src, Pin) else view.src,
-            None if isinstance(w.dst, Pin) else view.dst)
+    return (
+        _ref(w.src),
+        _ref(w.dst),
+        tuple(view.bends),
+        None if isinstance(w.src, Pin) else view.src,
+        None if isinstance(w.dst, Pin) else view.dst,
+    )
 
 
 def internal_wires(editor: Editor, views: Iterable[PartView]) -> list[WireView]:
@@ -99,14 +114,20 @@ def internal_wires(editor: Editor, views: Iterable[PartView]) -> list[WireView]:
     return result
 
 
-def restore(editor: Editor, target: Snapshot, only: tuple[Iterable[int], Iterable[int]] | None = None) -> None:
+def restore(
+    editor: Editor,
+    target: Snapshot,
+    only: tuple[Iterable[int], Iterable[int]] | None = None,
+) -> None:
     """Make the board match `target`, touching only what differs. `only`: the part and
     wire uids to look at (an undo step's); everything else is known to match already."""
     with paused_gc():
         _restore(editor, target, only)
 
 
-def _restore(editor: Editor, target: Snapshot, only: tuple[Iterable[int], Iterable[int]] | None) -> None:
+def _restore(
+    editor: Editor, target: Snapshot, only: tuple[Iterable[int], Iterable[int]] | None
+) -> None:
     c = editor.circuit
     if only is None:
         part_uids = c.part_by_uid.keys() | target.parts.keys()
@@ -120,7 +141,11 @@ def _restore(editor: Editor, target: Snapshot, only: tuple[Iterable[int], Iterab
 
     # 1. parts that shouldn't exist. Their wires (and branches) go with them; any of
     #    those the target does have get rebuilt in step 4.
-    doomed = [view for uid in part_uids - target.parts.keys() if (view := view_of(uid)) is not None]
+    doomed = [
+        view
+        for uid in part_uids - target.parts.keys()
+        if (view := view_of(uid)) is not None
+    ]
     wire_uids.update(w.uid for w in editor.remove_parts(doomed))
     # 2. wires that shouldn't exist -- or exist with different endpoints (cut-deletion
     #    splices a branch onto its trunk, re-pointing the trunk's far end). Those are
@@ -172,12 +197,24 @@ def _restore(editor: Editor, target: Snapshot, only: tuple[Iterable[int], Iterab
             if wire is None:
                 src = _resolve(src_ref, c.part_by_uid, c.wire_by_uid)
                 dst = _resolve(dst_ref, c.part_by_uid, c.wire_by_uid)
-                editor.connect(src, dst, list(bends), src_pt, dst_pt, uid=uid,
-                               color=target.wire_colors.get(uid), check=False)
+                editor.connect(
+                    src,
+                    dst,
+                    list(bends),
+                    src_pt,
+                    dst_pt,
+                    uid=uid,
+                    color=target.wire_colors.get(uid),
+                    check=False,
+                )
                 continue
             view = editor.wire_views[wire]
             view.color = target.wire_colors.get(uid)  # paint() redoes the gradients
-            if tuple(view.bends) != bends or (src_pt and view.src != src_pt) or (dst_pt and view.dst != dst_pt):
+            if (
+                tuple(view.bends) != bends
+                or (src_pt and view.src != src_pt)
+                or (dst_pt and view.dst != dst_pt)
+            ):
                 view.src, view.dst = src_pt or view.src, dst_pt or view.dst
                 view.set_bends(list(bends))
                 changed.append(view)
@@ -187,16 +224,25 @@ def _restore(editor: Editor, target: Snapshot, only: tuple[Iterable[int], Iterab
     editor.refresh_wires([*editor.wires_touching(moved), *changed])
 
 
-def instantiate(editor: Editor, clip: Snapshot, live: bool = True) -> tuple[list[PartView], list[WireView]]:
+def instantiate(
+    editor: Editor, clip: Snapshot, live: bool = True
+) -> tuple[list[PartView], list[WireView]]:
     """Add a copy of `clip` at its original coordinates, with fresh uids (for paste).
     `live=False`: the parts are ghosts until the caller opens them (see Circuit.open_part)."""
     with paused_gc():
         return _instantiate(editor, clip, live)
 
 
-def _instantiate(editor: Editor, clip: Snapshot, live: bool) -> tuple[list[PartView], list[WireView]]:
-    views = editor.add_parts([(kind, x, y, None, label, props)
-                              for kind, label, x, y, props in clip.parts.values()], live=live)
+def _instantiate(
+    editor: Editor, clip: Snapshot, live: bool
+) -> tuple[list[PartView], list[WireView]]:
+    views = editor.add_parts(
+        [
+            (kind, x, y, None, label, props)
+            for kind, label, x, y, props in clip.parts.values()
+        ],
+        live=live,
+    )
     new = dict(zip(clip.parts, views))
     new_parts = {uid: view.part for uid, view in new.items()}
     new_wires: dict[int, Wire] = {}
@@ -205,8 +251,15 @@ def _instantiate(editor: Editor, clip: Snapshot, live: bool) -> tuple[list[PartV
             src_ref, dst_ref, bends, src_pt, dst_pt = clip.wires[uid]
             src = _resolve(src_ref, new_parts, new_wires)
             dst = _resolve(dst_ref, new_parts, new_wires)
-            new_wires[uid] = editor.connect(src, dst, list(bends), src_pt, dst_pt,
-                                            color=clip.wire_colors.get(uid), check=False)
+            new_wires[uid] = editor.connect(
+                src,
+                dst,
+                list(bends),
+                src_pt,
+                dst_pt,
+                color=clip.wire_colors.get(uid),
+                check=False,
+            )
     return list(new.values()), [editor.wire_views[w] for w in new_wires.values()]
 
 
@@ -218,8 +271,12 @@ class History:
     changed since it was saved?" is a comparison of two numbers."""
 
     def __init__(self, initial: Snapshot, limit: int = 500) -> None:
-        self.current = Snapshot(dict(initial.parts), dict(initial.wires), dict(initial.wire_colors))
-        self.undo_stack: list[tuple[Change, int, int]] = []  # (change, state before, state after)
+        self.current = Snapshot(
+            dict(initial.parts), dict(initial.wires), dict(initial.wire_colors)
+        )
+        self.undo_stack: list[
+            tuple[Change, int, int]
+        ] = []  # (change, state before, state after)
         self.redo_stack: list[tuple[Change, int, int]] = []
         self.limit = limit
         self._ids = itertools.count(1)
@@ -230,8 +287,14 @@ class History:
 
     def _diff(self, parts: dict, wires: dict, colors: dict) -> Change:
         """uid -> (before, after) for the entries that differ from `current`."""
-        return tuple({uid: (cur.get(uid), new) for uid, new in now.items() if cur.get(uid) != new}
-                     for now, cur in zip((parts, wires, colors), self._sections()))
+        return tuple(
+            {
+                uid: (cur.get(uid), new)
+                for uid, new in now.items()
+                if cur.get(uid) != new
+            }
+            for now, cur in zip((parts, wires, colors), self._sections())
+        )
 
     def record(self, parts: dict, wires: dict, colors: dict) -> bool:
         """A new step: what these uids look like now (see changes()); None = gone.
@@ -242,7 +305,7 @@ class History:
         _apply(self._sections(), change, 1)
         after = next(self._ids)
         self.undo_stack.append((change, self.state, after))
-        del self.undo_stack[:-self.limit]
+        del self.undo_stack[: -self.limit]
         self.redo_stack.clear()
         self.state = after
         return True
@@ -250,9 +313,14 @@ class History:
     def commit(self, snap: Snapshot) -> bool:
         """Record the board becoming `snap`, compared in full (record() is the fast way)."""
         cur = self.current
-        return self.record({u: snap.parts.get(u) for u in cur.parts.keys() | snap.parts.keys()},
-                           {u: snap.wires.get(u) for u in cur.wires.keys() | snap.wires.keys()},
-                           {u: snap.wire_colors.get(u) for u in cur.wire_colors.keys() | snap.wire_colors.keys()})
+        return self.record(
+            {u: snap.parts.get(u) for u in cur.parts.keys() | snap.parts.keys()},
+            {u: snap.wires.get(u) for u in cur.wires.keys() | snap.wires.keys()},
+            {
+                u: snap.wire_colors.get(u)
+                for u in cur.wire_colors.keys() | snap.wire_colors.keys()
+            },
+        )
 
     def amend(self, parts: dict, wires: dict, colors: dict) -> bool:
         """Like record, but folded into the newest step (a run of small tweaks = one undo step)."""

@@ -30,6 +30,7 @@ CODE = np.uint8
 
 class Level(IntEnum):
     """One four-state value. Truthy only when it's 1."""
+
     Z = 0
     ZERO = 1
     ONE = 2
@@ -62,6 +63,7 @@ class Level(IntEnum):
 
 Z, ZERO, ONE, X = Level.Z, Level.ZERO, Level.ONE, Level.X
 
+
 def _level(v: Logic | Any):
     return Level(int(v.codes)) if isinstance(v, Logic) and v.codes.ndim == 0 else v
 
@@ -73,8 +75,12 @@ def codes(value: Any) -> np.ndarray:
         return value.codes
     if isinstance(value, Level):
         return np.asarray(value.value, CODE)
-    if isinstance(value, (list, tuple)) and any(isinstance(v, (Level, Logic)) for v in value):
-        return np.array([codes(v) for v in value], CODE)  # (numpy would see a Level as its int code)
+    if isinstance(value, (list, tuple)) and any(
+        isinstance(v, (Level, Logic)) for v in value
+    ):
+        return np.array(
+            [codes(v) for v in value], CODE
+        )  # (numpy would see a Level as its int code)
     return (np.asarray(value).astype(bool) + CODE(1)).astype(CODE)
 
 
@@ -86,8 +92,11 @@ class Logic:
     in planes AND is two ops and NOT is free (swap them). The engine hands over and
     takes back codes; the planes are split / joined only at that boundary.
     """
+
     __slots__ = ("_codes", "_lo", "_hi")
-    __array_ufunc__ = None  # numpy must not treat this as a number array: ours are the only ops
+    __array_ufunc__ = (
+        None  # numpy must not treat this as a number array: ours are the only ops
+    )
 
     def __init__(self, value: Any = ()) -> None:
         if isinstance(value, Logic):
@@ -128,7 +137,9 @@ class Logic:
 
     def __and__(self, other) -> Logic:
         (a0, a1), (b0, b1) = _gate_in(self), _gate_in(other)
-        return Logic._of_planes(a0 | b0, a1 & b1)  # 1 only if both can be; 0 if either can
+        return Logic._of_planes(
+            a0 | b0, a1 & b1
+        )  # 1 only if both can be; 0 if either can
 
     def __or__(self, other) -> Logic:
         (a0, a1), (b0, b1) = _gate_in(self), _gate_in(other)
@@ -188,7 +199,9 @@ class Logic:
         return (Level(int(c)) for c in self.codes)
 
     def __bool__(self) -> bool:
-        raise TypeError("a Logic array has no single truth value: use .is1 / .is0 / .known")
+        raise TypeError(
+            "a Logic array has no single truth value: use .is1 / .is0 / .known"
+        )
 
     def __repr__(self) -> str:
         if self.codes.ndim == 0:

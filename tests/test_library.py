@@ -1,7 +1,14 @@
 from pijl.ui.library import Library
 
-PARTS = [("IN", "I/O"), ("OUT", "I/O"), ("NAND", "GATES"), ("AND", "GATES"), ("OR", "GATES"),
-         ("NOT", "GATES"), ("XOR", "")]
+PARTS = [
+    ("IN", "I/O"),
+    ("OUT", "I/O"),
+    ("NAND", "GATES"),
+    ("AND", "GATES"),
+    ("OR", "GATES"),
+    ("NOT", "GATES"),
+    ("XOR", ""),
+]
 KINDS = [kind for kind, _ in PARTS]
 
 
@@ -83,10 +90,18 @@ def test_to_dict_from_dict_roundtrip():
 
 
 def test_from_dict_forgives_junk_and_duplicates():
-    data = {"collections": [{"name": "A", "parts": ["NAND", "NAND", 5, "GHOST"]}, "junk", {"parts": []},
-                            {"name": "A", "parts": ["OR"]}],
-            "loose": "not a list"}
+    data = {
+        "collections": [
+            {"name": "A", "parts": ["NAND", "NAND", 5, "GHOST"]},
+            "junk",
+            {"parts": []},
+            {"name": "A", "parts": ["OR"]},
+        ],
+        "loose": "not a list",
+    }
     lib = Library.from_dict(data, PARTS)
     assert lib.collections[0].name == "A" and lib.collections[0].parts == ["NAND"]
     assert sorted(everything(lib)) == sorted(KINDS)  # every part exactly once
-    assert lib.where("OR").name == "GATES"  # the duplicate "A" was skipped, so OR got its default
+    assert (
+        lib.where("OR").name == "GATES"
+    )  # the duplicate "A" was skipped, so OR got its default

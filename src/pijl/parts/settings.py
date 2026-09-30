@@ -34,7 +34,9 @@ def _parse_default(s: Setting):
     try:
         return s.parse(s.default)
     except ValueError as e:
-        raise ValueError(f"the default {s.default!r} isn't a value it allows ({e})") from None
+        raise ValueError(
+            f"the default {s.default!r} isn't a value it allows ({e})"
+        ) from None
 
 
 def _same(a, b) -> bool:
@@ -46,6 +48,7 @@ def _same(a, b) -> bool:
 class Setting:
     """Base of every setting. `label`: what the menu calls it (default: from the key).
     `hint`: a help line under the value while it's being edited."""
+
     label: str = field(default="", kw_only=True)
     hint: str = field(default="", kw_only=True)
     # (every subclass has a `default` field; it's not declared here because a field
@@ -76,9 +79,12 @@ class Setting:
 @dataclass(frozen=True)
 class Choice(Setting):
     """One of a fixed set of values: a submenu with the current one checked."""
+
     values: tuple = ()
     default: Any = None
-    labels: tuple[str, ...] | None = None  # what the menu shows per value (default: str(value))
+    labels: tuple[str, ...] | None = (
+        None  # what the menu shows per value (default: str(value))
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "values", tuple(self.values))
@@ -92,8 +98,10 @@ class Choice(Setting):
             raise ValueError("Choice values must be str, int, float or bool")
         if len({(type(v), v) for v in self.values}) != len(self.values):
             raise ValueError("Choice values must be unique")
-        if self.labels is not None and (len(self.labels) != len(self.values)
-                                        or not all(isinstance(s, str) for s in self.labels)):
+        if self.labels is not None and (
+            len(self.labels) != len(self.values)
+            or not all(isinstance(s, str) for s in self.labels)
+        ):
             raise ValueError("Choice labels must be one string per value")
         super().check()
 
@@ -114,6 +122,7 @@ class Choice(Setting):
 @dataclass(frozen=True)
 class Toggle(Setting):
     """On or off: a menu row that flips it."""
+
     default: bool = False
 
     def parse(self, value) -> bool:
@@ -129,6 +138,7 @@ class Toggle(Setting):
 class Text(Setting):
     """A line of text, typed into a prompt. Unprintable characters are dropped and
     it's cut to max_len."""
+
     default: str = ""
     max_len: int = 32
 
@@ -140,7 +150,7 @@ class Text(Setting):
     def parse(self, value) -> str:
         if not isinstance(value, str):
             raise ValueError(f"{value!r} isn't text")
-        return "".join(c for c in value if c.isprintable())[:self.max_len]
+        return "".join(c for c in value if c.isprintable())[: self.max_len]
 
     def show(self, value) -> str:
         return value or "(empty)"
@@ -156,6 +166,7 @@ class Number(Setting):
     must be > 0). `slider=False`: just the typed field. `live`: the part's changed
     hook also runs while the slider drags (at most once a frame), not only when the
     edit is done -- see PartType.changed."""
+
     default: int | float = 0
     min: int | float = 0
     max: int | float = 1
@@ -167,11 +178,15 @@ class Number(Setting):
 
     @property
     def whole(self) -> bool:
-        nums = (self.default, self.min, self.max) + ((self.step,) if self.step is not None else ())
+        nums = (self.default, self.min, self.max) + (
+            (self.step,) if self.step is not None else ()
+        )
         return all(type(n) is int for n in nums)
 
     def check(self) -> None:
-        for name in ("default", "min", "max") + (("step",) if self.step is not None else ()):
+        for name in ("default", "min", "max") + (
+            ("step",) if self.step is not None else ()
+        ):
             n = getattr(self, name)
             if type(n) not in (int, float) or not math.isfinite(n):
                 raise ValueError(f"Number {name} must be a finite int or float")
@@ -181,7 +196,9 @@ class Number(Setting):
             raise ValueError("Number step must be > 0")
         if self.log and self.min <= 0:
             raise ValueError("a log Number needs min > 0")
-        if _parse_default(self) != self.default:  # (an int default of a float Number is fine)
+        if (
+            _parse_default(self) != self.default
+        ):  # (an int default of a float Number is fine)
             raise ValueError(f"the default {self.default!r} isn't a value it allows")
 
     @property
@@ -214,7 +231,9 @@ class Number(Setting):
 
     def parse_text(self, text: str) -> int | float:
         """Typed input -> a value (ValueError if it isn't a number)."""
-        text = text.strip().removesuffix(self.unit).strip() if self.unit else text.strip()
+        text = (
+            text.strip().removesuffix(self.unit).strip() if self.unit else text.strip()
+        )
         try:
             value = float(text)
         except ValueError:
@@ -232,6 +251,7 @@ class Number(Setting):
 class Action:
     """A menu row that runs the part's action(ctx, name) hook on the clicked (or
     selected) parts. `danger`: drawn in red, like Delete."""
+
     label: str = ""
     danger: bool = False
 

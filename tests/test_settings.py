@@ -4,8 +4,17 @@ set / changed / action calls, and loading saved values."""
 import pytest
 
 from pijl.logic import ONE, ZERO
-from pijl.parts import (Action, Choice, Number, PartType, Registry, Text, Toggle, check_props,
-                        fresh_props)
+from pijl.parts import (
+    Action,
+    Choice,
+    Number,
+    PartType,
+    Registry,
+    Text,
+    Toggle,
+    check_props,
+    fresh_props,
+)
 from pijl.sim import Circuit
 from pijl.storage import decode, encode
 from pijl.snapshot import Snapshot
@@ -104,26 +113,30 @@ def test_titles_default_to_the_key():
 # ---- the registry --------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("settings, match", [
-    ({"x": Choice((), 0)}, "needs values"),
-    ({"x": Choice((1, 2), 3)}, "default"),
-    ({"x": Choice((1, 1), 1)}, "unique"),
-    ({"x": Choice((1, 2), 1, labels=("one",))}, "labels"),
-    ({"x": Choice(([1], 2), 2)}, "must be str"),
-    ({"x": Number(5, 10, 0)}, "min < max"),
-    ({"x": Number(5, 0, 10, step=0)}, "step"),
-    ({"x": Number(5, 0, 10, log=True)}, "log"),
-    ({"x": Number(50, 0, 10)}, "default"),
-    ({"x": Toggle(1)}, "default"),
-    ({"x": Text(max_len=0)}, "max_len"),
-    ({"x": Text("toolong", max_len=3)}, "default"),
-    ({"not ok": Toggle()}, "identifiers"),
-    ({"x": (1, 2)}, "not a Setting"),
-    ({"color": Toggle()}, "reserved"),
-])
+@pytest.mark.parametrize(
+    "settings, match",
+    [
+        ({"x": Choice((), 0)}, "needs values"),
+        ({"x": Choice((1, 2), 3)}, "default"),
+        ({"x": Choice((1, 1), 1)}, "unique"),
+        ({"x": Choice((1, 2), 1, labels=("one",))}, "labels"),
+        ({"x": Choice(([1], 2), 2)}, "must be str"),
+        ({"x": Number(5, 10, 0)}, "min < max"),
+        ({"x": Number(5, 0, 10, step=0)}, "step"),
+        ({"x": Number(5, 0, 10, log=True)}, "log"),
+        ({"x": Number(50, 0, 10)}, "default"),
+        ({"x": Toggle(1)}, "default"),
+        ({"x": Text(max_len=0)}, "max_len"),
+        ({"x": Text("toolong", max_len=3)}, "default"),
+        ({"not ok": Toggle()}, "identifiers"),
+        ({"x": (1, 2)}, "not a Setting"),
+        ({"color": Toggle()}, "reserved"),
+    ],
+)
 def test_bad_settings_are_refused(settings, match):
     class Bad(PartType):
         kind = "BAD"
+
     Bad.settings = settings
     with pytest.raises((ValueError, TypeError), match=match):
         Registry().add(Bad)
@@ -132,6 +145,7 @@ def test_bad_settings_are_refused(settings, match):
 def test_a_setting_isnt_also_a_prop():
     class Both(PartType):
         kind, props, settings = "BOTH", {"x": 1}, {"x": Number(1, 0, 2)}
+
     with pytest.raises(ValueError, match="not also in props"):
         Registry().add(Both)
 
@@ -139,27 +153,37 @@ def test_a_setting_isnt_also_a_prop():
 def test_actions_need_the_hook():
     class NoHook(PartType):
         kind, actions = "NOHOOK", {"go": Action()}
+
     with pytest.raises(ValueError, match="action"):
         Registry().add(NoHook)
 
     class BadName(Clock):
         kind, actions = "BADNAME", {"go now": Action()}
+
     with pytest.raises(ValueError, match="identifiers"):
         Registry().add(BadName)
 
 
 def test_fresh_props_include_the_settings(clock):
-    assert fresh_props(clock) == {"phase": 0, "period": 250, "running": True, "mode": "square",
-                                  "note": "", "duty": 0.5}
+    assert fresh_props(clock) == {
+        "phase": 0,
+        "period": 250,
+        "running": True,
+        "mode": "square",
+        "note": "",
+        "duty": 0.5,
+    }
 
 
 def test_saved_values_are_checked(clock):
-    props, bad = check_props(clock, {"period": 99_999, "mode": "sine", "old_setting": 3})
-    assert props["period"] == 10_000       # clamped, silently
-    assert props["mode"] == "square"       # not a value: reset to the default...
+    props, bad = check_props(
+        clock, {"period": 99_999, "mode": "sine", "old_setting": 3}
+    )
+    assert props["period"] == 10_000  # clamped, silently
+    assert props["mode"] == "square"  # not a value: reset to the default...
     assert len(bad) == 1 and "mode" in bad[0]  # ...and said so
-    assert props["old_setting"] == 3       # unknown keys are kept
-    assert props["running"] is True        # missing: the default
+    assert props["old_setting"] == 3  # unknown keys are kept
+    assert props["running"] is True  # missing: the default
 
 
 def test_loading_a_bad_saved_value_warns(clock):
@@ -243,7 +267,16 @@ def test_a_raising_hook_disables_the_kind(circuit, clock):
 
 def test_slider_positions():
     lin = Number(5, 0, 10)
-    assert lin.fraction(5) == 0.5 and lin.at(0.5) == 5 and lin.at(-1) == 0 and lin.at(2) == 10
+    assert (
+        lin.fraction(5) == 0.5
+        and lin.at(0.5) == 5
+        and lin.at(-1) == 0
+        and lin.at(2) == 10
+    )
     log = Number(100, 1, 10_000, log=True)
-    assert log.fraction(100) == pytest.approx(0.5) and log.at(0.5) == 100 and log.at(1) == 10_000
+    assert (
+        log.fraction(100) == pytest.approx(0.5)
+        and log.at(0.5) == 100
+        and log.at(1) == 10_000
+    )
     assert Number(0.5, 0, 1, step=0.25).at(0.4) == 0.5  # snapped

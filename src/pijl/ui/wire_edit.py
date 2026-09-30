@@ -36,40 +36,73 @@ from .camera import Camera
 from .canvas import Canvas
 from .views import Layers, Point, Polyline, WireView, project_onto
 
-BEND_PX = 10          # square side
+BEND_PX = 10  # square side
 ADD_RADIUS_PX = 4.5
 JUNCTION_RADIUS_PX = 6
 BORDER_PX = 1.5
-HIT_PX = 8            # grab distance for any handle
+HIT_PX = 8  # grab distance for any handle
 MIN_ADD_SEGMENT_PX = 28  # hide "+" on segments too short to hold one comfortably
 
-Target = tuple[str, int]    # ("bend", bend index), ("add", segment index) or ("junction", index)
-End = str                   # "src" or "dst"
+Target = tuple[
+    str, int
+]  # ("bend", bend index), ("add", segment index) or ("junction", index)
+End = str  # "src" or "dst"
 Anchor = tuple[int, float]  # segment k of the edited wire, fraction t along it
 
 
 class _Handle:
-    def __init__(self, kind: str, batch: pyglet.graphics.Batch, group: pyglet.graphics.Group) -> None:
+    def __init__(
+        self, kind: str, batch: pyglet.graphics.Batch, group: pyglet.graphics.Group
+    ) -> None:
         self.kind = kind
         if kind == "bend":
-            self.outer = shapes.Rectangle(0, 0, 1, 1, color=T.HANDLE_BORDER, batch=batch, group=group)
-            self.inner = shapes.Rectangle(0, 0, 1, 1, color=T.HANDLE_FILL, batch=batch, group=group)
+            self.outer = shapes.Rectangle(
+                0, 0, 1, 1, color=T.HANDLE_BORDER, batch=batch, group=group
+            )
+            self.inner = shapes.Rectangle(
+                0, 0, 1, 1, color=T.HANDLE_FILL, batch=batch, group=group
+            )
         elif kind == "junction":
-            self.outer = shapes.Circle(0, 0, 1, segments=24, color=T.HANDLE_BORDER, batch=batch, group=group)
-            self.inner = shapes.Circle(0, 0, 1, segments=24, color=T.JUNCTION_HANDLE_FILL,
-                                       batch=batch, group=group)
+            self.outer = shapes.Circle(
+                0, 0, 1, segments=24, color=T.HANDLE_BORDER, batch=batch, group=group
+            )
+            self.inner = shapes.Circle(
+                0,
+                0,
+                1,
+                segments=24,
+                color=T.JUNCTION_HANDLE_FILL,
+                batch=batch,
+                group=group,
+            )
         else:
-            self.outer = shapes.Circle(0, 0, 1, segments=24, color=T.ADD_HANDLE_BORDER, batch=batch, group=group)
-            self.inner = shapes.Circle(0, 0, 1, segments=24, color=T.ADD_HANDLE_FILL, batch=batch, group=group)
+            self.outer = shapes.Circle(
+                0,
+                0,
+                1,
+                segments=24,
+                color=T.ADD_HANDLE_BORDER,
+                batch=batch,
+                group=group,
+            )
+            self.inner = shapes.Circle(
+                0, 0, 1, segments=24, color=T.ADD_HANDLE_FILL, batch=batch, group=group
+            )
         self.pos: Point = (0.0, 0.0)
 
-    def place(self, pos: Point, zoom: float, hovered: bool, visible: bool = True) -> None:
+    def place(
+        self, pos: Point, zoom: float, hovered: bool, visible: bool = True
+    ) -> None:
         self.pos = pos
         x, y = pos
         b = BORDER_PX / zoom
         if self.kind == "bend":
             half = BEND_PX / 2 / zoom
-            self.outer.position, self.outer.width, self.outer.height = (x - half, y - half), 2 * half, 2 * half
+            self.outer.position, self.outer.width, self.outer.height = (
+                (x - half, y - half),
+                2 * half,
+                2 * half,
+            )
             self.inner.position = (x - half + b, y - half + b)
             self.inner.width = self.inner.height = 2 * (half - b)
             self.inner.color = T.HANDLE_HOVER if hovered else T.HANDLE_FILL
@@ -95,25 +128,43 @@ class _Handle:
 
 
 class WireEditSession:
-    def __init__(self, view: WireView, camera: Camera, canvas: Canvas, layers: Layers,
-                 parents: dict[End, WireView], branches: list[tuple[WireView, End]]) -> None:
+    def __init__(
+        self,
+        view: WireView,
+        camera: Camera,
+        canvas: Canvas,
+        layers: Layers,
+        parents: dict[End, WireView],
+        branches: list[tuple[WireView, End]],
+    ) -> None:
         """`parents`: the wire each of this wire's junction ends sits on.
         `branches`: the (wire, end) pairs whose junction sits on this wire."""
         self.view = view
         self.camera = camera
-        self.batch = canvas.batch  # the handles are plain pyglet shapes, over everything
+        self.batch = (
+            canvas.batch
+        )  # the handles are plain pyglet shapes, over everything
         self.group = layers.overlay
         self.original = list(view.bends)
         self.original_ends = view.src, view.dst
         # One per junction handle: (the wire whose end it is, which end, the rail it slides on).
         self.junctions: list[tuple[WireView, End, WireView]] = [
             *((view, end, rail) for end, rail in parents.items()),
-            *((b, end, view) for b, end in branches)]
+            *((b, end, view) for b, end in branches),
+        ]
         self.branch_original = [(b, b.src, b.dst) for b, _ in branches]
-        self.anchors: dict[int, Anchor] = {j: _anchor_of(view.points, getattr(w, end))
-                                          for j, (w, end, rail) in enumerate(self.junctions) if rail is view}
-        self.halo = Polyline(view.points, T.WIRE_HALO, canvas, layers.wire_halo,
-                             thickness=T.WIRE_THICKNESS + 6)
+        self.anchors: dict[int, Anchor] = {
+            j: _anchor_of(view.points, getattr(w, end))
+            for j, (w, end, rail) in enumerate(self.junctions)
+            if rail is view
+        }
+        self.halo = Polyline(
+            view.points,
+            T.WIRE_HALO,
+            canvas,
+            layers.wire_halo,
+            thickness=T.WIRE_THICKNESS + 6,
+        )
         self.bend_handles: list[_Handle] = []
         self.add_handles: list[_Handle] = []
         self.junction_handles: list[_Handle] = []
@@ -136,9 +187,15 @@ class WireEditSession:
         for k, h in enumerate(self.add_handles):
             (ax, ay), (bx, by) = pts[k], pts[k + 1]
             long_enough = math.hypot(bx - ax, by - ay) * zoom >= MIN_ADD_SEGMENT_PX
-            h.place(((ax + bx) / 2, (ay + by) / 2), zoom, self.hover == ("add", k),
-                    visible=long_enough and self.dragging is None)
-        for j, (h, (w, end, _)) in enumerate(zip(self.junction_handles, self.junctions)):
+            h.place(
+                ((ax + bx) / 2, (ay + by) / 2),
+                zoom,
+                self.hover == ("add", k),
+                visible=long_enough and self.dragging is None,
+            )
+        for j, (h, (w, end, _)) in enumerate(
+            zip(self.junction_handles, self.junctions)
+        ):
             h.place(getattr(w, end), zoom, self._lit(("junction", j)))
         self.halo.set_points(pts)
 
@@ -153,11 +210,17 @@ class WireEditSession:
 
     # ---- hit testing (screen pixels) ------------------------------------------
 
-    def target_at(self, sx: float, sy: float, prefer_junction: bool = False) -> Target | None:
+    def target_at(
+        self, sx: float, sy: float, prefer_junction: bool = False
+    ) -> Target | None:
         """Bend handles win over junctions (for a branch on a corner, moving the corner is
         the likelier intent, and the junction follows it); junctions win over "+" handles.
         `prefer_junction` (Alt held) puts junctions first."""
-        order = [("bend", self.bend_handles), ("junction", self.junction_handles), ("add", self.add_handles)]
+        order = [
+            ("bend", self.bend_handles),
+            ("junction", self.junction_handles),
+            ("add", self.add_handles),
+        ]
         if prefer_junction:
             order[0], order[1] = order[1], order[0]
         for kind, handles in order:
@@ -193,14 +256,22 @@ class WireEditSession:
 
     def insert(self, segment: int, point: Point) -> int:
         """Split `segment` at `point`; returns the new bend's index."""
-        a, b = self.view.points[segment:segment + 2]
+        a, b = self.view.points[segment : segment + 2]
         seg = math.dist(a, b)
-        s = 0.0 if seg == 0 else math.dist(a, point) / seg  # where along the old segment
+        s = (
+            0.0 if seg == 0 else math.dist(a, point) / seg
+        )  # where along the old segment
         for j, (k, t) in self.anchors.items():
             if k > segment:
                 self.anchors[j] = k + 1, t
-            elif k == segment:  # the split point itself stays put, so t == s maps either way
-                self.anchors[j] = (k, t / s) if t < s else (k + 1, 1.0 if s >= 1 else (t - s) / (1 - s))
+            elif (
+                k == segment
+            ):  # the split point itself stays put, so t == s maps either way
+                self.anchors[j] = (
+                    (k, t / s)
+                    if t < s
+                    else (k + 1, 1.0 if s >= 1 else (t - s) / (1 - s))
+                )
         bends = list(self.view.bends)
         bends.insert(segment, point)  # segment k ends at points[k+1] == bends[k]
         self.view.set_bends(bends)
@@ -214,7 +285,10 @@ class WireEditSession:
     def remove(self, index: int) -> None:
         # Segments `index` and `index + 1` merge; each anchor on them keeps its share of the path.
         pts = self.view.points
-        l1, l2 = math.dist(pts[index], pts[index + 1]), math.dist(pts[index + 1], pts[index + 2])
+        l1, l2 = (
+            math.dist(pts[index], pts[index + 1]),
+            math.dist(pts[index + 1], pts[index + 2]),
+        )
         for j, (k, t) in self.anchors.items():
             if k > index + 1:
                 self.anchors[j] = k - 1, t
@@ -315,5 +389,9 @@ def _project(px: float, py: float, a: Point, b: Point) -> Point:
     (x1, y1), (x2, y2) = a, b
     dx, dy = x2 - x1, y2 - y1
     length_sq = dx * dx + dy * dy
-    t = 0.0 if length_sq == 0 else max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / length_sq))
+    t = (
+        0.0
+        if length_sq == 0
+        else max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / length_sq))
+    )
     return x1 + t * dx, y1 + t * dy

@@ -55,7 +55,9 @@ def projects_dir() -> Path:
 def project_names() -> list[str]:
     """Every project on disk (a folder under projects/ with a project.json), by name."""
     try:
-        found = [p.name for p in projects_dir().iterdir() if (p / "project.json").is_file()]
+        found = [
+            p.name for p in projects_dir().iterdir() if (p / "project.json").is_file()
+        ]
     except OSError:
         return []
     return sorted(found, key=str.casefold)
@@ -133,15 +135,25 @@ class Project:
         project = cls(projects_dir() / name)
         project.macros_dir.mkdir(parents=True, exist_ok=True)
         if project.meta_file.exists():
-            version = json.loads(project.meta_file.read_text(encoding="utf-8")).get("pijl")
+            version = json.loads(project.meta_file.read_text(encoding="utf-8")).get(
+                "pijl"
+            )
             if not isinstance(version, int) or version > FORMAT:
-                raise ValueError(f"project {name!r} has format {version!r}; this pijl reads up to {FORMAT}")
+                raise ValueError(
+                    f"project {name!r} has format {version!r}; this pijl reads up to {FORMAT}"
+                )
         else:
-            write_atomic(project.meta_file, json.dumps({"pijl": FORMAT}, indent=2) + "\n")
+            write_atomic(
+                project.meta_file, json.dumps({"pijl": FORMAT}, indent=2) + "\n"
+            )
         if not project.parts_dir.exists():
             # The project gets its own copy of the built-in parts, so it keeps behaving
             # the same whatever later pijl versions ship (and can edit them).
-            shutil.copytree(TEMPLATES, project.parts_dir, ignore=shutil.ignore_patterns("__pycache__"))
+            shutil.copytree(
+                TEMPLATES,
+                project.parts_dir,
+                ignore=shutil.ignore_patterns("__pycache__"),
+            )
         return project
 
 

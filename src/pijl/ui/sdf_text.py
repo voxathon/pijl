@@ -30,11 +30,13 @@ from scipy.ndimage import distance_transform_edt
 from .canvas import UNIFORMS, Canvas, Kind
 
 FONT_NAME = "Consolas"
-EM_PT = 48               # rasterization size in points
+EM_PT = 48  # rasterization size in points
 EM_PX = EM_PT * 96 / 72  # ... in pixels (64)
-SPREAD = 8               # SDF range in atlas pixels on each side of the outline
-SUPERSAMPLE = 4          # glyphs are rasterized this much bigger, then the SDF is averaged down;
-                         # without it the SDF encodes the bitmap's pixel stairs and edges look jagged
+SPREAD = 8  # SDF range in atlas pixels on each side of the outline
+SUPERSAMPLE = (
+    4  # glyphs are rasterized this much bigger, then the SDF is averaged down;
+)
+# without it the SDF encodes the bitmap's pixel stairs and edges look jagged
 CHARS = "".join(chr(c) for c in range(33, 127))  # printable ASCII except space
 ATLAS_W = 1024
 _FORMAT_VERSION = 1  # bump when the cache layout or SDF math changes
@@ -76,14 +78,20 @@ void main() {
 }
 """ % {"spread": float(SPREAD)}
 
-GLYPH = Kind("glyph", 0, _VERTEX, _FRAGMENT,
-             np.dtype([("rect", "f4", 4), ("uv", "f4", 4), ("color", "u1", 4), ("lift", "f4")]),
-             texture=lambda: _get_atlas().texture, positions=("rect",))
+GLYPH = Kind(
+    "glyph",
+    0,
+    _VERTEX,
+    _FRAGMENT,
+    np.dtype([("rect", "f4", 4), ("uv", "f4", 4), ("color", "u1", 4), ("lift", "f4")]),
+    texture=lambda: _get_atlas().texture,
+    positions=("rect",),
+)
 
 
 @dataclass
 class _Glyph:
-    left: float    # quad extents relative to the pen position on the baseline, source px
+    left: float  # quad extents relative to the pen position on the baseline, source px
     bottom: float
     right: float
     top: float
@@ -94,11 +102,19 @@ class _Atlas:
     def __init__(self) -> None:
         atlas, table, self.advance, self.cap_height = _load_or_build()
         h = atlas.shape[0]
-        self.glyphs = {ch: _Glyph(*row[:4], uv=tuple(row[4:])) for ch, row in zip(CHARS, table.tolist())}
+        self.glyphs = {
+            ch: _Glyph(*row[:4], uv=tuple(row[4:]))
+            for ch, row in zip(CHARS, table.tolist())
+        }
         rgba = np.repeat(atlas[:, :, None], 4, axis=2)
-        self.texture = pyglet.image.ImageData(ATLAS_W, h, "RGBA", rgba.tobytes()).get_texture()
+        self.texture = pyglet.image.ImageData(
+            ATLAS_W, h, "RGBA", rgba.tobytes()
+        ).get_texture()
         # per character: its quad relative to the pen (source px) and its atlas uv, for numpy layout
-        self.boxes = {ch: (g.left, g.bottom, g.right - g.left, g.top - g.bottom) for ch, g in self.glyphs.items()}
+        self.boxes = {
+            ch: (g.left, g.bottom, g.right - g.left, g.top - g.bottom)
+            for ch, g in self.glyphs.items()
+        }
 
 
 def _cache_path() -> Path:
@@ -120,7 +136,9 @@ def _load_or_build() -> tuple[np.ndarray, np.ndarray, float, float]:
     atlas, table, advance, cap_height = _build()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(path, atlas=atlas, table=table, advance=advance, cap_height=cap_height)
+        np.savez_compressed(
+            path, atlas=atlas, table=table, advance=advance, cap_height=cap_height
+        )
     except OSError:
         pass  # no cache, just slower next launch
     return atlas, table, advance, cap_height
@@ -142,7 +160,10 @@ def _build() -> tuple[np.ndarray, np.ndarray, float, float]:
         alpha = np.frombuffer(img.get_data("RGBA", img.width * 4), np.uint8)
         alpha = alpha.reshape(img.height, img.width, 4)[:, :, 3]  # rows bottom-up
         sdf = _to_sdf(alpha)
-        left, bottom = g.vertices[0] / SUPERSAMPLE - SPREAD, g.vertices[1] / SUPERSAMPLE - SPREAD
+        left, bottom = (
+            g.vertices[0] / SUPERSAMPLE - SPREAD,
+            g.vertices[1] / SUPERSAMPLE - SPREAD,
+        )
         cells.append((sdf, (left, bottom, left + sdf.shape[1], bottom + sdf.shape[0])))
 
     # Cap height (top of 'H' ink above the baseline) for vertical centering.
@@ -165,8 +186,14 @@ def _build() -> tuple[np.ndarray, np.ndarray, float, float]:
     table = np.zeros((len(CHARS), 8), np.float64)
     for i, ((sdf, box), (px, py)) in enumerate(zip(cells, placements)):
         h, w = sdf.shape
-        atlas[py:py + h, px:px + w] = sdf
-        table[i] = (*box, px / ATLAS_W, py / atlas_h, (px + w) / ATLAS_W, (py + h) / atlas_h)
+        atlas[py : py + h, px : px + w] = sdf
+        table[i] = (
+            *box,
+            px / ATLAS_W,
+            py / atlas_h,
+            (px + w) / ATLAS_W,
+            (py + h) / atlas_h,
+        )
     return atlas, table, advance, float(cap_height)
 
 
@@ -176,9 +203,13 @@ def _to_sdf(alpha: np.ndarray) -> np.ndarray:
     inside = np.pad(alpha > 127, SPREAD * ss)
     h, w = inside.shape
     inside = np.pad(inside, ((0, -h % ss), (0, -w % ss)))  # make divisible by ss
-    dist = distance_transform_edt(inside) - distance_transform_edt(~inside)  # + inside, - outside
+    dist = distance_transform_edt(inside) - distance_transform_edt(
+        ~inside
+    )  # + inside, - outside
     h, w = inside.shape
-    dist = dist.reshape(h // ss, ss, w // ss, ss).mean(axis=(1, 3)) / ss  # average down, atlas px
+    dist = (
+        dist.reshape(h // ss, ss, w // ss, ss).mean(axis=(1, 3)) / ss
+    )  # average down, atlas px
     return np.clip(128 + dist * (127 / SPREAD), 0, 255).astype(np.uint8)
 
 
@@ -208,8 +239,15 @@ class SDFText:
         """A label's cap_height at `size`, before making it."""
         return self.atlas.cap_height * (size * 96 / 72 / EM_PX)
 
-    def label(self, text: str, x: float, y: float, size: float,
-              color: tuple[int, int, int, int], anchor_x: str = "center") -> SDFLabel:
+    def label(
+        self,
+        text: str,
+        x: float,
+        y: float,
+        size: float,
+        color: tuple[int, int, int, int],
+        anchor_x: str = "center",
+    ) -> SDFLabel:
         return SDFLabel(self, text, x, y, size, color, anchor_x)
 
     def labels(self, specs: list[tuple]) -> list[SDFLabel]:
@@ -232,17 +270,22 @@ class SDFText:
             slots = buf.alloc_many(total)
             f = buf.f
             f["uv"][slots] = np.concatenate(uvs)
-            f["color"][slots] = np.repeat(np.array([label._color for label in out if label._rel.size], np.uint8),
-                                          counts, axis=0)
+            f["color"][slots] = np.repeat(
+                np.array([label._color for label in out if label._rel.size], np.uint8),
+                counts,
+                axis=0,
+            )
             f["lift"][slots] = 0.0
             # (float64, like move_to's rel + (left, y, 0, 0), then stored as float32)
-            f["rect"][slots] = np.concatenate(rels).astype(np.float64) + np.repeat(np.array(offsets), counts, axis=0)
+            f["rect"][slots] = np.concatenate(rels).astype(np.float64) + np.repeat(
+                np.array(offsets), counts, axis=0
+            )
             buf.mark_many(slots)
             k = 0
             for label in out:
                 if label._rel.size:
                     n = len(label._rel)
-                    label.slots = slots[k:k + n]
+                    label.slots = slots[k : k + n]
                     k += n
         return out
 
@@ -250,7 +293,9 @@ class SDFText:
 _layouts: dict[tuple[str, float], tuple[str, np.ndarray, np.ndarray]] = {}
 
 
-def _layout(atlas: _Atlas, text: str, scale: float) -> tuple[str, np.ndarray, np.ndarray]:
+def _layout(
+    atlas: _Atlas, text: str, scale: float
+) -> tuple[str, np.ndarray, np.ndarray]:
     """(the text as shown, glyph quads relative to its anchor, glyph uvs), cached: a
     board shows the same few titles thousands of times. (Callers mustn't modify them.)"""
     key = (text, scale)
@@ -258,11 +303,21 @@ def _layout(atlas: _Atlas, text: str, scale: float) -> tuple[str, np.ndarray, np
     if hit is None:
         shown = "".join(c for c in text if c == " " or c in atlas.glyphs)
         visible = [(i, c) for i, c in enumerate(shown) if c != " "]
-        boxes = np.array([atlas.boxes[c] for _, c in visible], np.float32).reshape(-1, 4)
+        boxes = np.array([atlas.boxes[c] for _, c in visible], np.float32).reshape(
+            -1, 4
+        )
         pens = np.array([i for i, _ in visible], np.float32)
-        rel = np.column_stack((pens * atlas.advance + boxes[:, 0], boxes[:, 1] - atlas.cap_height / 2,
-                               boxes[:, 2], boxes[:, 3])).astype(np.float32) * np.float32(scale)
-        uv = np.array([atlas.glyphs[c].uv for _, c in visible], np.float32).reshape(-1, 4)
+        rel = np.column_stack(
+            (
+                pens * atlas.advance + boxes[:, 0],
+                boxes[:, 1] - atlas.cap_height / 2,
+                boxes[:, 2],
+                boxes[:, 3],
+            )
+        ).astype(np.float32) * np.float32(scale)
+        uv = np.array([atlas.glyphs[c].uv for _, c in visible], np.float32).reshape(
+            -1, 4
+        )
         if len(_layouts) > 4096:
             _layouts.clear()
         hit = _layouts[key] = (shown, rel, uv)
@@ -275,13 +330,28 @@ class SDFLabel:
     at zoom 1, like pyglet's font_size. Characters outside the atlas are dropped.
     Each visible character is one glyph instance."""
 
-    def __init__(self, owner: SDFText, text: str, x: float, y: float, size: float,
-                 color: tuple[int, int, int, int], anchor_x: str = "center") -> None:
+    def __init__(
+        self,
+        owner: SDFText,
+        text: str,
+        x: float,
+        y: float,
+        size: float,
+        color: tuple[int, int, int, int],
+        anchor_x: str = "center",
+    ) -> None:
         self._init(owner, x, y, size, color, anchor_x)
         self.set_text(text)
 
-    def _init(self, owner: SDFText, x: float, y: float, size: float,
-              color: tuple[int, int, int, int], anchor_x: str) -> None:
+    def _init(
+        self,
+        owner: SDFText,
+        x: float,
+        y: float,
+        size: float,
+        color: tuple[int, int, int, int],
+        anchor_x: str,
+    ) -> None:
         """Everything but the text (see set_text, SDFText.labels)."""
         self.owner = owner
         self.atlas = owner.atlas
@@ -321,7 +391,11 @@ class SDFLabel:
         return self._left() + index * self.atlas.advance * self.scale
 
     def _left(self) -> float:
-        return {"left": self.x, "center": self.x - self.width / 2, "right": self.x - self.width}[self.anchor_x]
+        return {
+            "left": self.x,
+            "center": self.x - self.width / 2,
+            "right": self.x - self.width,
+        }[self.anchor_x]
 
     def move_to(self, x: float, y: float) -> None:
         self.x, self.y = x, y

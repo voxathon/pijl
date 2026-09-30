@@ -44,7 +44,9 @@ class Selection:
         else:
             self.add(view)
 
-    def set(self, parts: Iterable[PartView] = (), wires: Iterable[WireView] = ()) -> None:
+    def set(
+        self, parts: Iterable[PartView] = (), wires: Iterable[WireView] = ()
+    ) -> None:
         """Replace the selection, touching only views whose state actually changes
         (cheap to call on every mouse move while box-selecting)."""
         parts, wires = set(parts), set(wires)

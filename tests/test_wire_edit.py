@@ -17,4 +17,6 @@ def test_junction_mid_segment_keeps_its_fraction():
     stretched = [(0, 0), (100, 0), (100, 200)]
     p = _at(stretched, k, t)
     assert p == (100, 50)
-    assert project_onto(stretched, p) == p  # on the line bit for bit: refresh won't nudge it
+    assert (
+        project_onto(stretched, p) == p
+    )  # on the line bit for bit: refresh won't nudge it

@@ -8,4 +8,12 @@ API = 2
 
 
 def register(reg):
-    reg.add(part("TRI", ins=("a", "en"), outs=("out",), eval=lambda a, en: where(en, a, Z), category="GATES"))
+    reg.add(
+        part(
+            "TRI",
+            ins=("a", "en"),
+            outs=("out",),
+            eval=lambda a, en: where(en, a, Z),
+            category="GATES",
+        )
+    )

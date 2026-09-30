@@ -1,7 +1,11 @@
 from pijl.ui import theme as T
 from pijl.ui.paint import mix, sample, with_hue
 
-RED, BLUE, YELLOW = T.WIRE_COLORS["red"][1], T.WIRE_COLORS["blue"][1], T.WIRE_COLORS["yellow"][1]
+RED, BLUE, YELLOW = (
+    T.WIRE_COLORS["red"][1],
+    T.WIRE_COLORS["blue"][1],
+    T.WIRE_COLORS["yellow"][1],
+)
 
 
 def test_red_tint_keeps_the_classic_theme():
@@ -23,7 +27,11 @@ def test_mix_ends_and_no_grey_middle():
 
 
 def test_sample_gradient():
-    stops = [(0.0, ((0, 0, 0), BLUE)), (0.5, ((0, 0, 0), RED)), (1.0, ((0, 0, 0), YELLOW))]
+    stops = [
+        (0.0, ((0, 0, 0), BLUE)),
+        (0.5, ((0, 0, 0), RED)),
+        (1.0, ((0, 0, 0), YELLOW)),
+    ]
     assert sample(stops, 0.0)[1] == BLUE
     assert sample(stops, 0.5)[1] == RED
     assert sample(stops, 1.0)[1] == YELLOW

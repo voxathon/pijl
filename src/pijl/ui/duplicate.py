@@ -25,32 +25,48 @@ from . import theme as T
 from .views import PartView, Point, WireView
 
 RIGHT, DOWN = 0, 1
-MIN_GAP = 1  # grid cells: pins sit on part edges, so touching parts would short visually
+MIN_GAP = (
+    1  # grid cells: pins sit on part edges, so touching parts would short visually
+)
 
 
 @dataclass
 class Cell:
     """One copy of the unit, with where each piece sits in the unit (cell 0, 0)."""
+
     parts: list[tuple[PartView, float, float]] = field(default_factory=list)
-    wires: list[tuple[WireView, list[Point], Point, Point]] = field(default_factory=list)
+    wires: list[tuple[WireView, list[Point], Point, Point]] = field(
+        default_factory=list
+    )
 
     @classmethod
     def of(cls, parts: list[PartView], wires: list[WireView]) -> Cell:
-        return cls([(v, v.x, v.y) for v in parts], [(w, list(w.bends), w.src, w.dst) for w in wires])
+        return cls(
+            [(v, v.x, v.y) for v in parts],
+            [(w, list(w.bends), w.src, w.dst) for w in wires],
+        )
 
 
 class Tiling:
-    def __init__(self, unit: Snapshot, parts: list[PartView], wires: list[WireView]) -> None:
+    def __init__(
+        self, unit: Snapshot, parts: list[PartView], wires: list[WireView]
+    ) -> None:
         self.unit = unit
-        xs = [x for v in parts for x in (v.x, v.x + v.w)] + [p[0] for w in wires for p in w.points]
-        ys = [y for v in parts for y in (v.y, v.y + v.h)] + [p[1] for w in wires for p in w.points]
+        xs = [x for v in parts for x in (v.x, v.x + v.w)] + [
+            p[0] for w in wires for p in w.points
+        ]
+        ys = [y for v in parts for y in (v.y, v.y + v.h)] + [
+            p[1] for w in wires for p in w.points
+        ]
         self.size = (_cells(max(xs) - min(xs)), _cells(max(ys) - min(ys)))
         self.gap = [max(MIN_GAP, s) for s in self.size]  # default: the unit's own size
         self.cells: dict[tuple[int, int], Cell] = {(0, 0): Cell.of(parts, wires)}
         self.cols = self.rows = 1
         self.last: int | None = None  # axis of the last doubling
-        self.signature = None         # the selection right after our last change (see Editor)
-        self.adjusting = False        # the last history entry is a spacing change (merge into it)
+        self.signature = None  # the selection right after our last change (see Editor)
+        self.adjusting = (
+            False  # the last history entry is a spacing change (merge into it)
+        )
 
     def next_axis(self) -> int:
         return RIGHT if self.last != RIGHT else DOWN
@@ -75,8 +91,10 @@ class Tiling:
 
     def offset(self, i: int, j: int) -> Point:
         """Where cell (i, j) sits relative to the unit. Down is -y (world y points up)."""
-        return (i * (self.size[RIGHT] + self.gap[RIGHT]) * T.GRID,
-                -j * (self.size[DOWN] + self.gap[DOWN]) * T.GRID)
+        return (
+            i * (self.size[RIGHT] + self.gap[RIGHT]) * T.GRID,
+            -j * (self.size[DOWN] + self.gap[DOWN]) * T.GRID,
+        )
 
     def layout(self) -> list[WireView]:
         """Move every cell into place; returns the wires moved (their ends need re-attaching)."""
@@ -86,7 +104,10 @@ class Tiling:
             for view, x, y in cell.parts:
                 view.move_to(x + dx, y + dy)
             for view, bends, (sx, sy), (tx, ty) in cell.wires:
-                view.src, view.dst = (sx + dx, sy + dy), (tx + dx, ty + dy)  # junction ends ride along
+                view.src, view.dst = (
+                    (sx + dx, sy + dy),
+                    (tx + dx, ty + dy),
+                )  # junction ends ride along
                 view.set_bends([(bx + dx, by + dy) for bx, by in bends])
                 moved.append(view)
         return moved

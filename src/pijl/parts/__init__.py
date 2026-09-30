@@ -24,5 +24,22 @@ def builtin_registry() -> Registry:
     return load(TEMPLATES)
 
 
-__all__ = ["API", "Action", "Choice", "Ctx", "Look", "Number", "PartType", "Registry", "Setting",
-           "TEMPLATES", "Text", "Toggle", "builtin_registry", "check_props", "fresh_props", "load", "part"]
+__all__ = [
+    "API",
+    "Action",
+    "Choice",
+    "Ctx",
+    "Look",
+    "Number",
+    "PartType",
+    "Registry",
+    "Setting",
+    "TEMPLATES",
+    "Text",
+    "Toggle",
+    "builtin_registry",
+    "check_props",
+    "fresh_props",
+    "load",
+    "part",
+]

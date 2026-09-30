@@ -35,7 +35,9 @@ class MacroType(PartType):
         self.kind = MACRO + name
         self.title = name
         self.body = body
-        self.look = Look(label="below", swatch="MACRO_SWATCH", body="MACRO_BODY", pin_labels=True)
+        self.look = Look(
+            label="below", swatch="MACRO_SWATCH", body="MACRO_BODY", pin_labels=True
+        )
         # Every kind inside must exist (KeyError / CycleError otherwise): a body that
         # can't be built fully isn't a macro that can be placed.
         types = {uid: catalog.get(d[0]) for uid, d in body.parts.items()}
@@ -44,7 +46,9 @@ class MacroType(PartType):
         self.ins = _names(body, self.in_ids)
         self.outs = _names(body, self.out_ids)
         # the macros used directly in the body
-        self.uses = frozenset(d[0][len(MACRO):] for d in body.parts.values() if d[0].startswith(MACRO))
+        self.uses = frozenset(
+            d[0][len(MACRO) :] for d in body.parts.values() if d[0].startswith(MACRO)
+        )
 
 
 def _ports(body: Snapshot, types: dict[int, PartType], side: str) -> tuple[int, ...]:
@@ -66,14 +70,18 @@ class MacroBook:
         self.catalog = catalog
         self.load = load
         self._types: dict[str, MacroType] = {}
-        self._loading: list[str] = []  # names being loaded right now (a repeat means a cycle)
+        self._loading: list[
+            str
+        ] = []  # names being loaded right now (a repeat means a cycle)
 
     def get(self, name: str) -> MacroType:
         t = self._types.get(name)
         if t is not None:
             return t
         if name in self._loading:
-            raise CycleError(f"{name} contains itself ({' -> '.join(self._loading[self._loading.index(name):])} -> {name})")
+            raise CycleError(
+                f"{name} contains itself ({' -> '.join(self._loading[self._loading.index(name) :])} -> {name})"
+            )
         self._loading.append(name)
         try:  # both steps can need other macros (nested ones), so both count as loading
             try:
@@ -81,7 +89,9 @@ class MacroBook:
             except CycleError:
                 raise
             except (KeyError, OSError, ValueError) as e:
-                raise KeyError(f"macro {name!r}: {e.args[0] if isinstance(e, KeyError) and e.args else e}") from None
+                raise KeyError(
+                    f"macro {name!r}: {e.args[0] if isinstance(e, KeyError) and e.args else e}"
+                ) from None
             t = MacroType(name, body, self.catalog)
         finally:
             self._loading.pop()
@@ -118,7 +128,7 @@ class Catalog:
 
     def get(self, kind: str) -> PartType:
         if kind.startswith(MACRO):
-            return self.book.get(kind[len(MACRO):])
+            return self.book.get(kind[len(MACRO) :])
         return self.registry.get(kind)
 
     def __contains__(self, kind: str) -> bool:

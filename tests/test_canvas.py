@@ -13,7 +13,13 @@ def _buffer(monkeypatch, capacity: int = 2) -> InstanceBuffer:
 
 def test_slots_grow_and_are_reused_lowest_first(monkeypatch):
     buf = _buffer(monkeypatch)
-    assert [buf.alloc() for _ in range(5)] == [0, 1, 2, 3, 4]  # grew past its capacity of 2
+    assert [buf.alloc() for _ in range(5)] == [
+        0,
+        1,
+        2,
+        3,
+        4,
+    ]  # grew past its capacity of 2
     assert len(buf.data) >= 5 and buf.top == 5 and buf.realloc
     buf.free(4)
     assert buf.top == 4  # nothing drawn past the last slot in use
@@ -30,7 +36,9 @@ def test_freed_slots_are_zeroed_and_marked(monkeypatch):
     buf.realloc = buf.any_dirty = False
     buf.dirty[:] = False
     buf.free(b)
-    assert buf.f["x"][b] == 0 and not buf.f["flags"][b].any()  # a zero instance draws nothing
+    assert (
+        buf.f["x"][b] == 0 and not buf.f["flags"][b].any()
+    )  # a zero instance draws nothing
     assert buf.dirty[b] and buf.any_dirty and buf.top == 1
 
 

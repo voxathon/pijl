@@ -60,19 +60,41 @@ void main() {
 
 class Grid:
     def __init__(self) -> None:
-        self.program = ShaderProgram(Shader(_VERTEX, "vertex"), Shader(_FRAGMENT, "fragment"))
+        self.program = ShaderProgram(
+            Shader(_VERTEX, "vertex"), Shader(_FRAGMENT, "fragment")
+        )
         self.quad = self.program.vertex_list(
-            6, gl.GL_TRIANGLES,
-            position=("f", (-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1)))
+            6,
+            gl.GL_TRIANGLES,
+            position=("f", (-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1)),
+        )
 
-    def draw(self, window: pyglet.window.Window, camera: Camera, emphasized: bool,
-             divisions: int = 1) -> None:
+    def draw(
+        self,
+        window: pyglet.window.Window,
+        camera: Camera,
+        emphasized: bool,
+        divisions: int = 1,
+    ) -> None:
         """`divisions` > 1 shows the finer subgrid (Ctrl+Shift); major lines stay put."""
-        self.draw_at(window, camera.translation(), camera.zoom, T.BACKGROUND,
-                     T.GRID_SNAPPING if emphasized else T.GRID_COLORS, divisions)
+        self.draw_at(
+            window,
+            camera.translation(),
+            camera.zoom,
+            T.BACKGROUND,
+            T.GRID_SNAPPING if emphasized else T.GRID_COLORS,
+            divisions,
+        )
 
-    def draw_at(self, window: pyglet.window.Window, translate: tuple[float, float], zoom: float,
-                background, colors, divisions: int = 1) -> None:
+    def draw_at(
+        self,
+        window: pyglet.window.Window,
+        translate: tuple[float, float],
+        zoom: float,
+        background,
+        colors,
+        divisions: int = 1,
+    ) -> None:
         """The grid for any view: `translate` is where the world's origin is on screen (px).
         Fills the whole window; clip it with glScissor (the minimap panels do)."""
         p = self.program

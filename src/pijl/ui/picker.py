@@ -34,14 +34,20 @@ from .views import Box
 
 S = T.UI_SCALE
 HEADER_H, SECTION_H, ROW_H = 36 * S, 26 * S, 24 * S
-BUTTON = 24 * S      # header buttons are squares this big
-BUTTON_GAP = 4 * S   # around the toggle button, which sits at the panel's right edge
+BUTTON = 24 * S  # header buttons are squares this big
+BUTTON_GAP = 4 * S  # around the toggle button, which sits at the panel's right edge
 PANEL_W = round(190 * S)
-COLLAPSED_W = round(BUTTON + 2 * BUTTON_GAP)  # what's left on screen when tucked away: the toggle's column
+COLLAPSED_W = round(
+    BUTTON + 2 * BUTTON_GAP
+)  # what's left on screen when tucked away: the toggle's column
 PAD, INDENT = 8 * S, 14 * S  # left padding; extra indent for parts inside a collection
-SWATCH = 10 * S      # little color chip in front of each part name
-LOOSE_GAP = 12 * S   # space between the last collection and the loose parts (holds the divider)
-TAIL = 2 * ROW_H     # empty space under the list, so there's always somewhere to drop "loose"
+SWATCH = 10 * S  # little color chip in front of each part name
+LOOSE_GAP = (
+    12 * S
+)  # space between the last collection and the loose parts (holds the divider)
+TAIL = (
+    2 * ROW_H
+)  # empty space under the list, so there's always somewhere to drop "loose"
 SCROLL_STEP = 40 * S
 EDGE_SCROLL = 30 * S  # dragging this close to the list's top/bottom edge scrolls it
 EDGE_SPEED = 600 * S  # px per second
@@ -60,10 +66,13 @@ def approach(value: float, target: float, k: float, eps: float) -> float:
 @dataclass(eq=False)
 class Row:
     """One line of the layout: where a row should be, not what's drawn (that's Widget)."""
-    what: str                      # "section", "part", or "empty" (placeholder in an empty open collection)
-    collection: Collection | None  # the section's collection, or the part's (None: loose)
+
+    what: str  # "section", "part", or "empty" (placeholder in an empty open collection)
+    collection: (
+        Collection | None
+    )  # the section's collection, or the part's (None: loose)
     part: str | None = None
-    top: float = 0.0               # distance from the top of the list, px, scroll not applied
+    top: float = 0.0  # distance from the top of the list, px, scroll not applied
     h: float = ROW_H
 
     @property
@@ -108,9 +117,11 @@ class Widget:
         self.top = self.target_top = row.top
         self.indent = self.target_indent = row.indent
         self.alpha, self.target_alpha = 0.0, 1.0
-        self.dx = 0.0                # horizontal offset, eases back to 0 after a drop
-        self.angle = self.target_angle = 0.0  # section triangle: 0 points right, 90 down
-        self.leaving = False         # fading out; deleted once invisible
+        self.dx = 0.0  # horizontal offset, eases back to 0 after a drop
+        self.angle = self.target_angle = (
+            0.0  # section triangle: 0 points right, 90 down
+        )
+        self.leaving = False  # fading out; deleted once invisible
         self.hovered = False
         self.pin: tuple | None = None  # while dragged: (x, y) at press, cursor at press
         self.shown_alpha = -1
@@ -118,32 +129,58 @@ class Widget:
         base = self._base_color()
         self.color = list(base)
         self.layer = layer
-        self.bg = shapes.Rectangle(0, 0, PANEL_W - 1, row.h, color=base, batch=b, group=layer.bg)
+        self.bg = shapes.Rectangle(
+            0, 0, PANEL_W - 1, row.h, color=base, batch=b, group=layer.bg
+        )
         self.shapes: list = [self.bg]
         self.labels: list[pyglet.text.Label] = []
-        self.field: Box | None = None     # rename text field
+        self.field: Box | None = None  # rename text field
         self.caret: shapes.Rectangle | None = None
 
         def label(text, color=T.PART_TEXT, size=FONT_SIZE, anchor_x="left"):
-            lb = pyglet.text.Label(text, font_name=FONT, font_size=size, color=color, anchor_x=anchor_x,
-                                   anchor_y="center", batch=b, group=layer.text)
+            lb = pyglet.text.Label(
+                text,
+                font_name=FONT,
+                font_size=size,
+                color=color,
+                anchor_x=anchor_x,
+                anchor_y="center",
+                batch=b,
+                group=layer.text,
+            )
             self.labels.append(lb)
             return lb
 
         if self.what == "part":
             fill, border = picker.swatch(row.part)
-            self.chip_border = shapes.Rectangle(0, 0, SWATCH, SWATCH, color=border, batch=b, group=layer.fg)
-            self.chip = shapes.Rectangle(0, 0, SWATCH - 2 * S, SWATCH - 2 * S, color=fill, batch=b, group=layer.fg)
+            self.chip_border = shapes.Rectangle(
+                0, 0, SWATCH, SWATCH, color=border, batch=b, group=layer.fg
+            )
+            self.chip = shapes.Rectangle(
+                0,
+                0,
+                SWATCH - 2 * S,
+                SWATCH - 2 * S,
+                color=fill,
+                batch=b,
+                group=layer.fg,
+            )
             self.shapes += [self.chip_border, self.chip]
             self.name = label(picker.name_of(row.part))
         elif self.what == "section":
             self.angle = self.target_angle = 90.0 if row.collection.open else 0.0
-            self.tri = shapes.Triangle(0, 0, 0, 0, 0, 0, color=T.HELP_TEXT[:3], batch=b, group=layer.fg)
+            self.tri = shapes.Triangle(
+                0, 0, 0, 0, 0, 0, color=T.HELP_TEXT[:3], batch=b, group=layer.fg
+            )
             self.shapes.append(self.tri)
             self.name = label("")
-            self.count = label("", color=T.PICKER_DIM_TEXT, size=SMALL_SIZE, anchor_x="right")
+            self.count = label(
+                "", color=T.PICKER_DIM_TEXT, size=SMALL_SIZE, anchor_x="right"
+            )
         else:
-            self.name = label("drop parts here", color=T.PICKER_DIM_TEXT, size=SMALL_SIZE)
+            self.name = label(
+                "drop parts here", color=T.PICKER_DIM_TEXT, size=SMALL_SIZE
+            )
         self.refresh()
 
     def _base_color(self) -> tuple:
@@ -164,7 +201,9 @@ class Widget:
 
     def refresh(self) -> None:
         """Bring text + rename field up to date with the row's data."""
-        if self.what == "part":  # greyed out while it can't be placed (see PartPicker.disabled)
+        if (
+            self.what == "part"
+        ):  # greyed out while it can't be placed (see PartPicker.disabled)
             color = T.PICKER_DIM_TEXT if self.p.disabled(self.row.part) else T.PART_TEXT
             if tuple(self.name.color) != tuple(color):
                 self.name.color = color
@@ -179,10 +218,24 @@ class Widget:
             self.name.text = text or c.name  # empty: the default name as a placeholder
             self.name.color = T.PART_TEXT if text else T.PICKER_DIM_TEXT
             if self.field is None:
-                self.field = Box(PANEL_W - self._name_x() - PAD + 4 * S, self.row.h - 6 * S, round(S),
-                                 T.PICKER_BG, T.SELECT, p.batch, self.layer.fg)
-                self.caret = shapes.Rectangle(0, 0, 1.5 * S, 16 * S, color=T.CARET, batch=p.batch,
-                                              group=self.layer.text)
+                self.field = Box(
+                    PANEL_W - self._name_x() - PAD + 4 * S,
+                    self.row.h - 6 * S,
+                    round(S),
+                    T.PICKER_BG,
+                    T.SELECT,
+                    p.batch,
+                    self.layer.fg,
+                )
+                self.caret = shapes.Rectangle(
+                    0,
+                    0,
+                    1.5 * S,
+                    16 * S,
+                    color=T.CARET,
+                    batch=p.batch,
+                    group=self.layer.text,
+                )
             self.count.visible = False
         else:
             self.name.text = p.fit(c.name, PANEL_W - self._name_x() - 24 * S - PAD)
@@ -206,9 +259,22 @@ class Widget:
         self.alpha = approach(self.alpha, self.target_alpha, k, 0.01)
         self.dx = approach(self.dx, 0.0, k, 0.3)
         self.angle = approach(self.angle, self.target_angle, k, 0.5)
-        want = T.PICKER_LIFT if self.pin else T.PICKER_HOVER if self.hovered else self._base_color()
+        want = (
+            T.PICKER_LIFT
+            if self.pin
+            else T.PICKER_HOVER
+            if self.hovered
+            else self._base_color()
+        )
         self.color = [approach(c, w, k, 1.0) for c, w in zip(self.color, want)]
-        return before != (self.top, self.indent, self.alpha, self.dx, self.angle, *self.color)
+        return before != (
+            self.top,
+            self.indent,
+            self.alpha,
+            self.dx,
+            self.angle,
+            *self.color,
+        )
 
     def screen_pos(self, cursor: tuple[float, float]) -> tuple[float, float]:
         """Bottom-left corner on screen."""
@@ -231,16 +297,27 @@ class Widget:
         elif self.what == "section":
             tx, r = x + PAD + 6 * S, 5 * S
             a = -math.radians(self.angle)  # clockwise: right -> down
-            (x1, y1), (x2, y2), (x3, y3) = [(tx + px * math.cos(a) - py * math.sin(a),
-                                              cy + px * math.sin(a) + py * math.cos(a))
-                                             for px, py in ((r, 0), (-0.6 * r, r), (-0.6 * r, -r))]
-            self.tri.x, self.tri.y, self.tri.x2, self.tri.y2, self.tri.x3, self.tri.y3 = x1, y1, x2, y2, x3, y3
+            (x1, y1), (x2, y2), (x3, y3) = [
+                (
+                    tx + px * math.cos(a) - py * math.sin(a),
+                    cy + px * math.sin(a) + py * math.cos(a),
+                )
+                for px, py in ((r, 0), (-0.6 * r, r), (-0.6 * r, -r))
+            ]
+            (
+                self.tri.x,
+                self.tri.y,
+                self.tri.x2,
+                self.tri.y2,
+                self.tri.x3,
+                self.tri.y3,
+            ) = x1, y1, x2, y2, x3, y3
             nx = x + self._name_x()
             self.name.position = (nx, cy, 0)
             self.count.position = (x + PANEL_W - PAD - 2 * S, cy, 0)
             if self.field is not None:
                 self.field.position = (nx - 4 * S, y + 3 * S)
-                self.p.measure.text = self.p.edit.text[:self.p.edit.caret]
+                self.p.measure.text = self.p.edit.text[: self.p.edit.caret]
                 self.caret.position = (nx + self.p.measure.content_width, cy - 8 * S)
                 self.caret.visible = self.p.caret_on
         else:
@@ -264,21 +341,31 @@ class Widget:
 
 
 class PartPicker:
-    def __init__(self, library: Library, batch: pyglet.graphics.Batch, win_h: int,
-                 pixel_ratio: float = 1.0, swatch: Callable[[str], tuple] = lambda part: T.PART_BODY,
-                 name_of: Callable[[str], str] = lambda part: part,
-                 disabled: Callable[[str], bool] = lambda part: False) -> None:
+    def __init__(
+        self,
+        library: Library,
+        batch: pyglet.graphics.Batch,
+        win_h: int,
+        pixel_ratio: float = 1.0,
+        swatch: Callable[[str], tuple] = lambda part: T.PART_BODY,
+        name_of: Callable[[str], str] = lambda part: part,
+        disabled: Callable[[str], bool] = lambda part: False,
+    ) -> None:
         self.lib = library
         self.disabled = disabled  # part -> shown greyed out (can't be placed right now); refresh() re-asks
-        self.swatch = swatch    # part -> (fill, border) of the little color chip in front of its name
+        self.swatch = swatch  # part -> (fill, border) of the little color chip in front of its name
         self.name_of = name_of  # part -> the text shown for it
         self.batch = batch
         self.open = True
-        self.open_t = 1.0               # animated: 1 = fully out, 0 = tucked away
+        self.open_t = 1.0  # animated: 1 = fully out, 0 = tucked away
         self.win_h = win_h
-        self.pixel_ratio = pixel_ratio  # framebuffer pixels per window pixel (HiDPI), for the clip
+        self.pixel_ratio = (
+            pixel_ratio  # framebuffer pixels per window pixel (HiDPI), for the clip
+        )
         self.scroll = self.scroll_target = 0.0  # how far the list is scrolled up, px
-        self.rows: list[Row] = []       # the current layout (during a drag: as if already dropped)
+        self.rows: list[
+            Row
+        ] = []  # the current layout (during a drag: as if already dropped)
         self.loose_top = 0.0
         self.content_h = 0.0
         self.widgets: dict[tuple, Widget] = {}
@@ -286,8 +373,10 @@ class PartPicker:
         self.hovered: Row | str | None = None
         # dragging
         self.dragging: Row | None = None
-        self.drop: tuple | None = None  # parts: (collection or None, index or None = end); collections: (index,)
-        self.grab_dy = 0.0              # grabbed row's center minus the cursor, screen px
+        self.drop: tuple | None = (
+            None  # parts: (collection or None, index or None = end); collections: (index,)
+        )
+        self.grab_dy = 0.0  # grabbed row's center minus the cursor, screen px
         self._drop_c: Collection | None = None
         # renaming
         self.renaming: Collection | None = None
@@ -296,22 +385,43 @@ class PartPicker:
 
         self.clip = ClipGroup(order=3)
         self.part_layer = Layer(0, self.clip)
-        self.section_layer = Layer(3, self.clip)   # above parts: collapsing rows slide under their header
+        self.section_layer = Layer(
+            3, self.clip
+        )  # above parts: collapsing rows slide under their header
         self.marker_group = pyglet.graphics.Group(order=6, parent=self.clip)
         self.panel_group = pyglet.graphics.Group(order=2)
         self.header_bg = pyglet.graphics.Group(order=5)
         self.header_fg = pyglet.graphics.Group(order=6)
-        self.drag_layer = Layer(0, pyglet.graphics.Group(order=9))  # not clipped: can leave the panel
+        self.drag_layer = Layer(
+            0, pyglet.graphics.Group(order=9)
+        )  # not clipped: can leave the panel
 
         self.measure = pyglet.text.Label("", font_name=FONT, font_size=FONT_SIZE)
-        self.divider = shapes.Rectangle(0, 0, PANEL_W - 2 * PAD, max(1, round(S / 2)), color=T.PICKER_BORDER,
-                                        batch=batch, group=self.part_layer.fg)
+        self.divider = shapes.Rectangle(
+            0,
+            0,
+            PANEL_W - 2 * PAD,
+            max(1, round(S / 2)),
+            color=T.PICKER_BORDER,
+            batch=batch,
+            group=self.part_layer.fg,
+        )
         self.divider_top = self.divider_target = 0.0
-        self.drop_box = shapes.Box(0, 0, PANEL_W - 4 * S, SECTION_H - 2 * S, thickness=2 * S, color=T.SELECT,
-                                   batch=batch, group=self.marker_group)
+        self.drop_box = shapes.Box(
+            0,
+            0,
+            PANEL_W - 4 * S,
+            SECTION_H - 2 * S,
+            thickness=2 * S,
+            color=T.SELECT,
+            batch=batch,
+            group=self.marker_group,
+        )
         self.drop_box.visible = False
-        self.chrome: list = []           # panel + header: (shape, base x), slid by x_off
-        self.chevron: list[shapes.Line] = []  # the toggle's «, turning into » as the panel tucks away
+        self.chrome: list = []  # panel + header: (shape, base x), slid by x_off
+        self.chevron: list[
+            shapes.Line
+        ] = []  # the toggle's «, turning into » as the panel tucks away
         self.buttons: dict[str, tuple[float, float, float, float]] = {}
         self.button_bgs: dict[str, shapes.Rectangle] = {}
         self._build_chrome()
@@ -400,7 +510,9 @@ class PartPicker:
         self._place_all()
 
     def scroll_by(self, clicks: float) -> None:
-        self.scroll_target = self._clamp_scroll(self.scroll_target - clicks * SCROLL_STEP)
+        self.scroll_target = self._clamp_scroll(
+            self.scroll_target - clicks * SCROLL_STEP
+        )
 
     def _clamp_scroll(self, s: float) -> float:
         return max(0.0, min(s, self.content_h - self.list_top))
@@ -434,7 +546,9 @@ class PartPicker:
             self.scroll_target = row.top + row.h - self.list_top
 
     def rename_text(self, text: str) -> None:
-        self.edit.insert(text.upper())  # collection names are all caps, like the built-in ones
+        self.edit.insert(
+            text.upper()
+        )  # collection names are all caps, like the built-in ones
         self._rename_changed()
 
     def rename_motion(self, motion: int) -> None:
@@ -459,7 +573,11 @@ class PartPicker:
         """The widgets that travel with a dragged row: a collection brings its visible rows."""
         if row.what == "part":
             return [self.widgets[row.key]]
-        return [w for w in self.widgets.values() if not w.leaving and w.row.collection is row.collection]
+        return [
+            w
+            for w in self.widgets.values()
+            if not w.leaving and w.row.collection is row.collection
+        ]
 
     def begin_drag(self, row: Row, press: tuple[float, float]) -> None:
         self.dragging = row
@@ -516,14 +634,26 @@ class PartPicker:
             if row is None:
                 if self.rows and ly < self.rows[0].top:
                     return self.drop
-                return (None, 0) if ly < self.loose_top else (None, None)  # just above / below the loose parts
+                return (
+                    (None, 0) if ly < self.loose_top else (None, None)
+                )  # just above / below the loose parts
             if row.key == drag.key:
                 return self.drop
-            if row.what == "section":  # on a header: first in an open collection, into a closed one
-                return (row.collection, 0) if row.collection.open else (row.collection, None)
+            if (
+                row.what == "section"
+            ):  # on a header: first in an open collection, into a closed one
+                return (
+                    (row.collection, 0)
+                    if row.collection.open
+                    else (row.collection, None)
+                )
             if row.what == "empty":
                 return row.collection, 0
-            rest = [p for p in (row.collection.parts if row.collection else self.lib.loose) if p != drag.part]
+            rest = [
+                p
+                for p in (row.collection.parts if row.collection else self.lib.loose)
+                if p != drag.part
+            ]
             return row.collection, rest.index(row.part) + (ly > row.top + row.h / 2)
         # a collection: before / after the block (section + its rows) under the grabbed header
         rest = [c for c in self.lib.collections if c is not drag.collection]
@@ -559,7 +689,9 @@ class PartPicker:
                     parts.remove(d.part)
             if d.part in loose:
                 loose.remove(d.part)
-            target = loose if dest is None else next(parts for c, parts in cols if c is dest)
+            target = (
+                loose if dest is None else next(parts for c, parts in cols if c is dest)
+            )
             target.insert(len(target) if index is None else index, d.part)
         elif d is not None:
             entry = next(e for e in cols if e[0] is d.collection)
@@ -593,15 +725,27 @@ class PartPicker:
         self.rows = self._layout()
         self.scroll_target = self._clamp_scroll(self.scroll_target)
         section_top = {r.collection: r.top for r in self.rows if r.what == "section"}
-        carried = {w.row.key for w in self._carried(self.dragging)} if self.dragging else set()
+        carried = (
+            {w.row.key for w in self._carried(self.dragging)}
+            if self.dragging
+            else set()
+        )
         seen = set()
         for row in self.rows:
             seen.add(row.key)
             w = self.widgets.get(row.key)
             if w is None:
-                w = Widget(self, row, self.section_layer if row.what == "section" else self.part_layer)
+                w = Widget(
+                    self,
+                    row,
+                    self.section_layer if row.what == "section" else self.part_layer,
+                )
                 # new rows grow out from under their collection's header (expanding), else fade in place
-                w.top = section_top.get(row.collection, row.top) if row.what != "section" else row.top
+                w.top = (
+                    section_top.get(row.collection, row.top)
+                    if row.what != "section"
+                    else row.top
+                )
                 self.widgets[row.key] = w
             w.row, w.leaving = row, False
             w.target_top, w.target_indent, w.target_alpha = row.top, row.indent, 1.0
@@ -618,7 +762,11 @@ class PartPicker:
         self.divider_target = self.loose_top - LOOSE_GAP / 2
         self.divider.visible = bool(self.lib.loose and self.lib.collections)
         drag = self.dragging
-        self._drop_c = self.drop[0] if drag and drag.what == "part" and self.drop[1] is None else None
+        self._drop_c = (
+            self.drop[0]
+            if drag and drag.what == "part" and self.drop[1] is None
+            else None
+        )
         self.drop_box.visible = self._drop_c is not None and not self._drop_c.open
 
     # ---- animation + drawing ----------------------------------------------------------
@@ -632,12 +780,18 @@ class PartPicker:
             if self._blink_t >= 0.5:
                 self._blink_t, self.caret_on = 0.0, not self.caret_on
                 moving = True
-        if self.dragging is not None and self.contains(*self.cursor):  # near an edge: scroll along
+        if self.dragging is not None and self.contains(
+            *self.cursor
+        ):  # near an edge: scroll along
             sy = self.cursor[1]
             if sy > self.list_top - EDGE_SCROLL:
-                self.scroll_target = self._clamp_scroll(self.scroll_target - EDGE_SPEED * dt)
+                self.scroll_target = self._clamp_scroll(
+                    self.scroll_target - EDGE_SPEED * dt
+                )
             elif sy < EDGE_SCROLL:
-                self.scroll_target = self._clamp_scroll(self.scroll_target + EDGE_SPEED * dt)
+                self.scroll_target = self._clamp_scroll(
+                    self.scroll_target + EDGE_SPEED * dt
+                )
         old = (self.open_t, self.scroll, self.divider_top)
         self.open_t = approach(self.open_t, 1.0 if self.open else 0.0, k, 0.002)
         self.scroll = approach(self.scroll, self.scroll_target, k, 0.3)
@@ -664,7 +818,10 @@ class PartPicker:
         self._place_chevron()
         for w in self.widgets.values():
             w.place(self.cursor)
-        self.divider.position = (x_off + PAD, self.list_top - self.divider_top + self.scroll)
+        self.divider.position = (
+            x_off + PAD,
+            self.list_top - self.divider_top + self.scroll,
+        )
         w = self.widgets.get(("section", self._drop_c))
         if self.drop_box.visible and w is not None:
             x, y = w.screen_pos(self.cursor)
@@ -684,8 +841,18 @@ class PartPicker:
             return s
 
         def label(text, x, y, group, color=T.PART_TEXT, chrome=True, anchor_x="left"):
-            lb = pyglet.text.Label(text, font_name=FONT, font_size=FONT_SIZE, color=color, x=x, y=y,
-                                   anchor_x=anchor_x, anchor_y="center", batch=b, group=group)
+            lb = pyglet.text.Label(
+                text,
+                font_name=FONT,
+                font_size=FONT_SIZE,
+                color=color,
+                x=x,
+                y=y,
+                anchor_x=anchor_x,
+                anchor_y="center",
+                batch=b,
+                group=group,
+            )
             if chrome:
                 self.chrome.append((lb, x))
             return lb
@@ -700,13 +867,26 @@ class PartPicker:
         for i, name in enumerate(("toggle", "new")):
             bx = PANEL_W - BUTTON_GAP - (i + 1) * BUTTON - i * 2 * S
             self.buttons[name] = (bx, by, BUTTON, BUTTON)
-            self.button_bgs[name] = rect(bx, by, BUTTON, BUTTON, T.PICKER_HEADER, self.header_bg)
+            self.button_bgs[name] = rect(
+                bx, by, BUTTON, BUTTON, T.PICKER_HEADER, self.header_bg
+            )
         label("+", *self._button_center("new"), self.header_fg, anchor_x="center")
         # The toggle's « is drawn, not typed, so it can turn around its own center (see _place_all).
         for s in self.chevron:
             s.delete()
-        self.chevron = [shapes.Line(0, 0, 0, 0, thickness=1.25 * S, color=T.PART_TEXT[:3], batch=b,
-                                    group=self.header_fg) for _ in range(4)]
+        self.chevron = [
+            shapes.Line(
+                0,
+                0,
+                0,
+                0,
+                thickness=1.25 * S,
+                color=T.PART_TEXT[:3],
+                batch=b,
+                group=self.header_fg,
+            )
+            for _ in range(4)
+        ]
 
     def _button_center(self, name: str) -> tuple[float, float]:
         """A header button's center, with the panel fully open."""
@@ -719,11 +899,17 @@ class PartPicker:
         cx += self.x_off
         a = math.pi * (1 - self.open_t)
         ca, sa = math.cos(a), math.sin(a)
-        arm_x, arm_y, apart = 2.5 * S, 4 * S, 5 * S  # each chevron: < with its tip at -arm_x
+        arm_x, arm_y, apart = (
+            2.5 * S,
+            4 * S,
+            5 * S,
+        )  # each chevron: < with its tip at -arm_x
         lines = iter(self.chevron)
         for dx in (-apart / 2, apart / 2):
             tip = (dx - arm_x, 0.0)
             for end in ((dx + arm_x, arm_y), (dx + arm_x, -arm_y)):
                 line = next(lines)
-                (line.x, line.y), (line.x2, line.y2) = ((cx + px * ca - py * sa, cy + px * sa + py * ca)
-                                                        for px, py in (tip, end))
+                (line.x, line.y), (line.x2, line.y2) = (
+                    (cx + px * ca - py * sa, cy + px * sa + py * ca)
+                    for px, py in (tip, end)
+                )

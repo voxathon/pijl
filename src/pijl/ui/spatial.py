@@ -24,7 +24,9 @@ PIECE = 80.0  # world units: longest piece of a line that gets a single box
 
 class SpatialIndex:
     def __init__(self, capacity: int = 1024) -> None:
-        self._cols = np.full((4, capacity), np.inf)  # x0, y0, x1, y1 per box; free rows never match
+        self._cols = np.full(
+            (4, capacity), np.inf
+        )  # x0, y0, x1, y1 per box; free rows never match
         self._cols[2:] = -np.inf
         self._owner: list[Hashable | None] = [None] * capacity
         self._free: list[int] = []
@@ -36,7 +38,9 @@ class SpatialIndex:
 
     # ---- registering -------------------------------------------------------
 
-    def put_rect(self, obj: Hashable, x0: float, y0: float, x1: float, y1: float) -> None:
+    def put_rect(
+        self, obj: Hashable, x0: float, y0: float, x1: float, y1: float
+    ) -> None:
         self._put(obj, [(x0, y0, x1, y1)])
 
     def put_polyline(self, obj: Hashable, points: list[Point]) -> None:
@@ -63,11 +67,13 @@ class SpatialIndex:
         k = 0
         owner, where = self._owner, self.where
         for obj, boxes in new:
-            mine = where[obj] = rows[k:k + len(boxes)]
+            mine = where[obj] = rows[k : k + len(boxes)]
             for r in mine:
                 owner[r] = obj
             k += len(boxes)
-        self._cols[:, rows] = np.array([box for _, boxes in new for box in boxes], np.float64).T
+        self._cols[:, rows] = np.array(
+            [box for _, boxes in new for box in boxes], np.float64
+        ).T
 
     def _put(self, obj: Hashable, boxes: list[tuple]) -> None:
         rows = self.where.get(obj)
@@ -138,16 +144,23 @@ class SpatialIndex:
         """Everything with a box overlapping the rectangle."""
         n = self._end
         c = self._cols
-        hit = np.flatnonzero((c[0, :n] <= x1) & (c[2, :n] >= x0) & (c[1, :n] <= y1) & (c[3, :n] >= y0))
+        hit = np.flatnonzero(
+            (c[0, :n] <= x1) & (c[2, :n] >= x0) & (c[1, :n] <= y1) & (c[3, :n] >= y0)
+        )
         owner = self._owner
         return {owner[i] for i in hit.tolist()}
 
     def bounds(self) -> tuple[float, float, float, float] | None:
         """The box around everything (x0, y0, x1, y1), or None if empty."""
-        c = self._cols[:, :self._end]
+        c = self._cols[:, : self._end]
         if not len(self.where):
             return None
-        return float(c[0].min()), float(c[1].min()), float(c[2].max()), float(c[3].max())
+        return (
+            float(c[0].min()),
+            float(c[1].min()),
+            float(c[2].max()),
+            float(c[3].max()),
+        )
 
     def near(self, x: float, y: float, r: float) -> set:
         return self.query(x - r, y - r, x + r, y + r)
@@ -166,7 +179,7 @@ def polyline_boxes(points: list[Point]) -> list[tuple]:
             qx, qy = ax + (bx - ax) * (k + 1) / n, ay + (by - ay) * (k + 1) / n
             boxes.append((min(px, qx), min(py, qy), max(px, qx), max(py, qy)))
     if len(points) == 1:
-        (x, y), = points
+        ((x, y),) = points
         boxes.append((x, y, x, y))
     return boxes
 

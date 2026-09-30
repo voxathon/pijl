@@ -26,61 +26,90 @@ LINE_STEP = 30 * S  # one arrow key / wheel notch
 FONT, SIZE, SMALL = "Consolas", 10.5 * S, 10 * S
 
 CONTROLS: list[tuple[str, list[tuple[str, str]]]] = [
-    ("Parts", [
-        ("click a part (picker)", "pick it up; it follows the cursor"),
-        ("click", "place it (Shift+click: place it and keep another)"),
-        ("right-click / Esc", "put it back"),
-        ("click a part", "select it; a plain click on an IN switch toggles it"),
-        ("drag a part", "move it (a selected part moves the whole selection)"),
-        ("right-click a part", "label, recolor, its settings and actions, delete"),
-        ("  ...in a selection", "parts all of one kind: edit them all (Ctrl: just this one)"),
-        ("  number slider", "drag (live), or type + Enter; Esc takes a drag back"),
-    ]),
-    ("Wires", [
-        ("click a pin", "start a wire; it follows the cursor"),
-        ("  click empty space", "add a bend point"),
-        ("  click a pin / wire", "connect (ending on a wire makes a junction)"),
-        ("  right-click / Bksp", "remove the last bend point, or cancel"),
-        ("press+drag on a wire", "start a branch from that spot (also Alt+click)"),
-        ("right-click a wire", "edit bends, branch, recolor, delete from there on"),
-    ]),
-    ("Selection", [
-        ("Shift+click", "add to / remove from the selection"),
-        ("drag empty space", "box-select (Shift: add to the selection)"),
-        ("Ctrl+A", "select everything"),
-        ("Del / Backspace", "delete the selection"),
-        ("Esc / click empty space", "clear the selection"),
-    ]),
-    ("Editing", [
-        ("Ctrl+C / Ctrl+X", "copy / cut"),
-        ("Ctrl+V", "paste: click to place it (Shift+click: and keep another copy)"),
-        ("Ctrl+D", "duplicate into a block: each press doubles it, right then down"),
-        ("  Ctrl+scroll", "space the block out (Ctrl+Shift+scroll: the other way)"),
-        ("Ctrl+Z / Ctrl+Y", "undo / redo (also Ctrl+Shift+Z); mid-action, Ctrl+Z cancels it"),
-    ]),
-    ("Files", [
-        ("Ctrl+S", "save the board as a macro (the first save asks for a name)"),
-        ("Ctrl+Shift+S", "save under another name"),
-        ("Ctrl+O", "open a macro (or right-click it in the picker -> Open)"),
-        ("Ctrl+N", "new, empty board"),
-        ("cogwheel -> Projects", "switch to another project, or make a new one"),
-    ]),
-    ("View", [
-        ("scroll", "zoom"),
-        ("right-drag / middle-drag", "pan"),
-        ("Home", "reset the camera"),
-        ("M", "minimap: press or drag in it (any button) to go there"),
-        ("G", "lens: magnify around the cursor"),
-        ("  G+scroll", "how much (or scroll on the lens / minimap)"),
-        ("hold Ctrl", "snap to the grid (Ctrl+Shift: the finer subgrid)"),
-        ("Tab", "pin names on parts: hidden -> on hover -> always"),
-        ("«  (picker header)", "tuck the part picker away"),
-    ]),
+    (
+        "Parts",
+        [
+            ("click a part (picker)", "pick it up; it follows the cursor"),
+            ("click", "place it (Shift+click: place it and keep another)"),
+            ("right-click / Esc", "put it back"),
+            ("click a part", "select it; a plain click on an IN switch toggles it"),
+            ("drag a part", "move it (a selected part moves the whole selection)"),
+            ("right-click a part", "label, recolor, its settings and actions, delete"),
+            (
+                "  ...in a selection",
+                "parts all of one kind: edit them all (Ctrl: just this one)",
+            ),
+            ("  number slider", "drag (live), or type + Enter; Esc takes a drag back"),
+        ],
+    ),
+    (
+        "Wires",
+        [
+            ("click a pin", "start a wire; it follows the cursor"),
+            ("  click empty space", "add a bend point"),
+            ("  click a pin / wire", "connect (ending on a wire makes a junction)"),
+            ("  right-click / Bksp", "remove the last bend point, or cancel"),
+            ("press+drag on a wire", "start a branch from that spot (also Alt+click)"),
+            ("right-click a wire", "edit bends, branch, recolor, delete from there on"),
+        ],
+    ),
+    (
+        "Selection",
+        [
+            ("Shift+click", "add to / remove from the selection"),
+            ("drag empty space", "box-select (Shift: add to the selection)"),
+            ("Ctrl+A", "select everything"),
+            ("Del / Backspace", "delete the selection"),
+            ("Esc / click empty space", "clear the selection"),
+        ],
+    ),
+    (
+        "Editing",
+        [
+            ("Ctrl+C / Ctrl+X", "copy / cut"),
+            ("Ctrl+V", "paste: click to place it (Shift+click: and keep another copy)"),
+            (
+                "Ctrl+D",
+                "duplicate into a block: each press doubles it, right then down",
+            ),
+            ("  Ctrl+scroll", "space the block out (Ctrl+Shift+scroll: the other way)"),
+            (
+                "Ctrl+Z / Ctrl+Y",
+                "undo / redo (also Ctrl+Shift+Z); mid-action, Ctrl+Z cancels it",
+            ),
+        ],
+    ),
+    (
+        "Files",
+        [
+            ("Ctrl+S", "save the board as a macro (the first save asks for a name)"),
+            ("Ctrl+Shift+S", "save under another name"),
+            ("Ctrl+O", "open a macro (or right-click it in the picker -> Open)"),
+            ("Ctrl+N", "new, empty board"),
+            ("cogwheel -> Projects", "switch to another project, or make a new one"),
+        ],
+    ),
+    (
+        "View",
+        [
+            ("scroll", "zoom"),
+            ("right-drag / middle-drag", "pan"),
+            ("Home", "reset the camera"),
+            ("M", "minimap: press or drag in it (any button) to go there"),
+            ("G", "lens: magnify around the cursor"),
+            ("  G+scroll", "how much (or scroll on the lens / minimap)"),
+            ("hold Ctrl", "snap to the grid (Ctrl+Shift: the finer subgrid)"),
+            ("Tab", "pin names on parts: hidden -> on hover -> always"),
+            ("«  (picker header)", "tuck the part picker away"),
+        ],
+    ),
 ]
 
 
 class ControlsSheet:
-    def __init__(self, batch: pyglet.graphics.Batch, win_w: int, win_h: int, pixel_ratio: float) -> None:
+    def __init__(
+        self, batch: pyglet.graphics.Batch, win_w: int, win_h: int, pixel_ratio: float
+    ) -> None:
         self.batch = batch
         self.pixel_ratio = pixel_ratio
         self.scroll = 0.0
@@ -88,27 +117,68 @@ class ControlsSheet:
         text_g = pyglet.graphics.Group(order=23)
         self.clip = ClipGroup(order=22)
         body_g = pyglet.graphics.Group(order=0, parent=self.clip)
-        self.shade = shapes.Rectangle(0, 0, win_w, win_h, color=(0, 0, 0, 110), batch=batch, group=shade_g)
+        self.shade = shapes.Rectangle(
+            0, 0, win_w, win_h, color=(0, 0, 0, 110), batch=batch, group=shade_g
+        )
         self.panel: Box | None = None
         self.bg_group = bg
-        self.title = pyglet.text.Label("Controls", font_name=FONT, font_size=11 * S, color=T.PART_TEXT,
-                                       anchor_y="center", batch=batch, group=text_g)
-        self.hint = pyglet.text.Label("scroll / arrows: more   Esc: close", font_name=FONT, font_size=SMALL,
-                                      color=T.HELP_TEXT, anchor_y="center", batch=batch, group=text_g)
+        self.title = pyglet.text.Label(
+            "Controls",
+            font_name=FONT,
+            font_size=11 * S,
+            color=T.PART_TEXT,
+            anchor_y="center",
+            batch=batch,
+            group=text_g,
+        )
+        self.hint = pyglet.text.Label(
+            "scroll / arrows: more   Esc: close",
+            font_name=FONT,
+            font_size=SMALL,
+            color=T.HELP_TEXT,
+            anchor_y="center",
+            batch=batch,
+            group=text_g,
+        )
         self.body_g = body_g
-        self.char_w = pyglet.text.Label("M" * 10, font_name=FONT, font_size=SIZE).content_width / 10
+        self.char_w = (
+            pyglet.text.Label("M" * 10, font_name=FONT, font_size=SIZE).content_width
+            / 10
+        )
         # (kind, what): "head" a section title label, "keys" the key column's label, "what" the
         # description: its text, plus one single-line label per wrapped line (made by layout).
         # Wrapped here, not by pyglet: its multiline labels lose some of the spaces between words.
         self.labels: list[tuple[str, pyglet.text.Label | list]] = []
         for head, rows in CONTROLS:
-            self.labels.append(("head", pyglet.text.Label(head.upper(), font_name=FONT, font_size=SMALL,
-                                                          color=T.PICKER_DIM_TEXT, anchor_y="top",
-                                                          batch=batch, group=body_g)))
+            self.labels.append(
+                (
+                    "head",
+                    pyglet.text.Label(
+                        head.upper(),
+                        font_name=FONT,
+                        font_size=SMALL,
+                        color=T.PICKER_DIM_TEXT,
+                        anchor_y="top",
+                        batch=batch,
+                        group=body_g,
+                    ),
+                )
+            )
             for keys, what in rows:
-                self.labels.append(("keys", pyglet.text.Label(keys, font_name=FONT, font_size=SIZE,
-                                                              color=T.PART_TEXT, anchor_y="top",
-                                                              batch=batch, group=body_g)))
+                self.labels.append(
+                    (
+                        "keys",
+                        pyglet.text.Label(
+                            keys,
+                            font_name=FONT,
+                            font_size=SIZE,
+                            color=T.PART_TEXT,
+                            anchor_y="top",
+                            batch=batch,
+                            group=body_g,
+                        ),
+                    )
+                )
                 self.labels.append(("what", [what]))
         self.layout(win_w, win_h)
 
@@ -123,16 +193,27 @@ class ControlsSheet:
             if kind == "what":
                 for line in what[1:]:
                     line.delete()
-                what[1:] = [pyglet.text.Label(text, font_name=FONT, font_size=SIZE, color=T.HELP_TEXT,
-                                              anchor_y="top", batch=self.batch, group=self.body_g)
-                            for text in textwrap.wrap(what[0], cols)]
+                what[1:] = [
+                    pyglet.text.Label(
+                        text,
+                        font_name=FONT,
+                        font_size=SIZE,
+                        color=T.HELP_TEXT,
+                        anchor_y="top",
+                        batch=self.batch,
+                        group=self.body_g,
+                    )
+                    for text in textwrap.wrap(what[0], cols)
+                ]
         # the body's height, top to bottom (the rows' own offsets are worked out in _place)
         self.body_h = self._place(0, 0, dry=True)
         h = min(win_h - 2 * MARGIN, TITLE_H + self.body_h + HINT_H + PAD)
         h = max(h, TITLE_H + HINT_H + 2 * PAD)
         if self.panel is not None:
             self.panel.delete()
-        self.panel = Box(w, h, max(1, round(S)), *T.MENU_PANEL, self.batch, self.bg_group)
+        self.panel = Box(
+            w, h, max(1, round(S)), *T.MENU_PANEL, self.batch, self.bg_group
+        )
         left, top = (win_w - w) / 2, (win_h + h) / 2
         self.panel.position = (left, top - h)
         self.box = (left, top - h, w, h)
@@ -141,7 +222,12 @@ class ControlsSheet:
         self.view_top, self.view_h = top - TITLE_H, h - TITLE_H - HINT_H
         self.scroll = max(0.0, min(self.scroll, self.body_h - self.view_h))
         r = self.pixel_ratio
-        self.clip.rect = (int(left * r), int((self.view_top - self.view_h) * r), int(w * r), int(self.view_h * r))
+        self.clip.rect = (
+            int(left * r),
+            int((self.view_top - self.view_h) * r),
+            int(w * r),
+            int(self.view_h * r),
+        )
         self._place(left + PAD, self.view_top + self.scroll)
 
     def _place(self, x: float, top: float, dry: bool = False) -> float:
@@ -172,7 +258,9 @@ class ControlsSheet:
     choice = None
 
     def move(self, delta: int) -> None:
-        self.scroll = max(0.0, min(self.scroll + delta * LINE_STEP, self.body_h - self.view_h))
+        self.scroll = max(
+            0.0, min(self.scroll + delta * LINE_STEP, self.body_h - self.view_h)
+        )
         self._place(self.box[0] + PAD, self.view_top + self.scroll)
 
     def contains(self, sx: float, sy: float) -> bool:
@@ -198,5 +286,5 @@ class ControlsSheet:
         for s in (self.shade, self.panel, self.title, self.hint):
             s.delete()
         for kind, what in self.labels:
-            for label in (what[1:] if kind == "what" else [what]):
+            for label in what[1:] if kind == "what" else [what]:
                 label.delete()

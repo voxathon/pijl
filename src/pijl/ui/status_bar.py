@@ -16,8 +16,8 @@ from . import theme as T
 S = T.UI_SCALE
 BAR_H = round(22 * S)
 PAD = 8 * S
-COG = BAR_H           # the cog button is a square this big, at the right end
-COG_R = 5.5 * S       # outer radius of the gear's body
+COG = BAR_H  # the cog button is a square this big, at the right end
+COG_R = 5.5 * S  # outer radius of the gear's body
 TEETH, TOOTH = 8, (3 * S, 2.5 * S)  # count, (width, how far past COG_R)
 FONT, SIZE = "Consolas", 9.5 * S
 
@@ -30,23 +30,57 @@ class StatusBar:
         self.hovered = False
         bg, fg = pyglet.graphics.Group(order=7), pyglet.graphics.Group(order=8)
         line = max(1, round(S / 2))
-        self.bg = shapes.Rectangle(0, 0, 1, BAR_H, color=T.PICKER_HEADER, batch=batch, group=bg)
-        self.border = shapes.Rectangle(0, BAR_H - line, 1, line, color=T.PICKER_BORDER, batch=batch, group=fg)
-        self.cog_bg = shapes.Rectangle(0, 0, COG, BAR_H - line, color=T.PICKER_HEADER, batch=batch, group=fg)
+        self.bg = shapes.Rectangle(
+            0, 0, 1, BAR_H, color=T.PICKER_HEADER, batch=batch, group=bg
+        )
+        self.border = shapes.Rectangle(
+            0, BAR_H - line, 1, line, color=T.PICKER_BORDER, batch=batch, group=fg
+        )
+        self.cog_bg = shapes.Rectangle(
+            0, 0, COG, BAR_H - line, color=T.PICKER_HEADER, batch=batch, group=fg
+        )
         gear = pyglet.graphics.Group(order=9)
         hole = pyglet.graphics.Group(order=10)
         tw, tl = TOOTH
-        self.teeth = [shapes.Rectangle(0, 0, tw, 2 * (COG_R + tl), color=T.HELP_TEXT[:3], batch=batch, group=gear)
-                      for _ in range(TEETH // 2)]  # each bar is two opposite teeth
+        self.teeth = [
+            shapes.Rectangle(
+                0,
+                0,
+                tw,
+                2 * (COG_R + tl),
+                color=T.HELP_TEXT[:3],
+                batch=batch,
+                group=gear,
+            )
+            for _ in range(TEETH // 2)
+        ]  # each bar is two opposite teeth
         for i, t in enumerate(self.teeth):
             t.anchor_position = (tw / 2, COG_R + tl)
             t.rotation = i * 360 / TEETH
-        self.body = shapes.Circle(0, 0, COG_R, segments=32, color=T.HELP_TEXT[:3], batch=batch, group=gear)
-        self.hole = shapes.Circle(0, 0, COG_R * 0.45, segments=24, color=T.PICKER_HEADER, batch=batch, group=hole)
+        self.body = shapes.Circle(
+            0, 0, COG_R, segments=32, color=T.HELP_TEXT[:3], batch=batch, group=gear
+        )
+        self.hole = shapes.Circle(
+            0,
+            0,
+            COG_R * 0.45,
+            segments=24,
+            color=T.PICKER_HEADER,
+            batch=batch,
+            group=hole,
+        )
 
         def label(color, anchor_x="left"):
-            return pyglet.text.Label("", font_name=FONT, font_size=SIZE, color=color, anchor_x=anchor_x,
-                                     anchor_y="center", batch=batch, group=fg)
+            return pyglet.text.Label(
+                "",
+                font_name=FONT,
+                font_size=SIZE,
+                color=color,
+                anchor_x=anchor_x,
+                anchor_y="center",
+                batch=batch,
+                group=fg,
+            )
 
         self.doc = label(T.PART_TEXT)
         self.stats = label(T.HELP_TEXT, anchor_x="right")
@@ -73,7 +107,10 @@ class StatusBar:
         self.doc.position = (self.left + PAD, cy, 0)
         self.stats.position = (self.win_w - COG - PAD, cy, 0)
         # the numbers give way to the name when there isn't room for both
-        self.stats.visible = self.stats.x - self.stats.content_width > self.doc.x + self.doc.content_width + 2 * PAD
+        self.stats.visible = (
+            self.stats.x - self.stats.content_width
+            > self.doc.x + self.doc.content_width + 2 * PAD
+        )
 
     # ---- content ---------------------------------------------------------------
 

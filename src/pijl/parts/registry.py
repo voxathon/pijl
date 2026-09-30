@@ -37,7 +37,7 @@ _package_ids = itertools.count(1)
 class Registry:
     def __init__(self) -> None:
         self.types: dict[str, PartType] = {}  # kind -> type, in load order
-        self.errors: list[str] = []           # one message per script that didn't load
+        self.errors: list[str] = []  # one message per script that didn't load
         self._pending: list[PartType] | None = None  # adds from the script being loaded
         for t in PORTS:
             self._check(t, engine=True)
@@ -69,7 +69,9 @@ class Registry:
             raise ValueError(f"{type(t).__name__} has no kind")
         name = t.kind
         if ":" in name:
-            raise ValueError(f"{name}: ':' isn't allowed in part names")  # "macro:..." is taken
+            raise ValueError(
+                f"{name}: ':' isn't allowed in part names"
+            )  # "macro:..." is taken
         taken = set(self.types) | {p.kind for p in self._pending or ()}
         if name in taken:
             raise ValueError(f"{name}: there already is a part with that name")
@@ -93,7 +95,9 @@ class Registry:
         if not isinstance(t.props, dict):
             raise TypeError(f"{name}: props must be a dict")
         if hasattr(t, "choices"):
-            raise ValueError(f"{name}: `choices` was replaced by `settings` (see pijl/parts/settings.py)")
+            raise ValueError(
+                f"{name}: `choices` was replaced by `settings` (see pijl/parts/settings.py)"
+            )
         if not isinstance(t.settings, dict) or not isinstance(t.actions, dict):
             raise TypeError(f"{name}: settings and actions must be dicts")
         t.settings, t.actions = dict(t.settings), dict(t.actions)
@@ -104,17 +108,23 @@ class Registry:
             if not isinstance(s, Setting):
                 raise TypeError(f"{where}: not a Setting")
             if key in t.props:
-                raise ValueError(f"{where}: its default lives in the setting, not also in props")
+                raise ValueError(
+                    f"{where}: its default lives in the setting, not also in props"
+                )
             try:
                 s.check()
             except ValueError as e:
                 raise ValueError(f"{where}: {e}") from None
         taken = RESERVED_PROPS & (t.props.keys() | t.settings.keys())
         if taken and not engine:
-            raise ValueError(f"{name}: {', '.join(sorted(taken))} is reserved for the editor")
+            raise ValueError(
+                f"{name}: {', '.join(sorted(taken))} is reserved for the editor"
+            )
         for action_name, a in t.actions.items():
             if not isinstance(action_name, str) or not action_name.isidentifier():
-                raise ValueError(f"{name}: actions[{action_name!r}]: names must be identifiers")
+                raise ValueError(
+                    f"{name}: actions[{action_name!r}]: names must be identifiers"
+                )
             if not isinstance(a, Action):
                 raise TypeError(f"{name}: actions[{action_name!r}]: not an Action")
         if t.actions and not t.has("action"):

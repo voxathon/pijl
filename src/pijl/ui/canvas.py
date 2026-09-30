@@ -32,8 +32,10 @@ import pyglet
 from pyglet import gl
 from pyglet.graphics.shader import Shader, ShaderProgram
 
-GAP = 64       # dirty slots at most this far apart are uploaded as one run
-MAX_RUNS = 32  # more runs than this: upload one range from the first dirty slot to the last
+GAP = 64  # dirty slots at most this far apart are uploaded as one run
+MAX_RUNS = (
+    32  # more runs than this: upload one range from the first dirty slot to the last
+)
 
 UNIFORMS = """uniform WindowBlock { mat4 projection; mat4 view; } window;
 uniform vec2 lift_offset;  // added to the position of lifted instances (Canvas.offset)"""
@@ -45,8 +47,16 @@ class Kind:
     to bind while drawing, if the kind needs one. `positions`: the fields whose first
     two numbers are a world position (what InstanceBuffer.shift moves)."""
 
-    def __init__(self, name: str, rank: int, vertex: str, fragment: str, dtype: np.dtype, texture=None,
-                 positions: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        name: str,
+        rank: int,
+        vertex: str,
+        fragment: str,
+        dtype: np.dtype,
+        texture=None,
+        positions: tuple[str, ...] = (),
+    ) -> None:
         self.name, self.rank = name, rank
         self.vertex, self.fragment = vertex, fragment
         self.dtype = dtype
@@ -57,7 +67,9 @@ class Kind:
     @property
     def program(self) -> ShaderProgram:
         if self._program is None:
-            self._program = ShaderProgram(Shader(self.vertex, "vertex"), Shader(self.fragment, "fragment"))
+            self._program = ShaderProgram(
+                Shader(self.vertex, "vertex"), Shader(self.fragment, "fragment")
+            )
         return self._program
 
 
@@ -100,9 +112,13 @@ class InstanceBuffer:
             elif sub.base == np.uint8:
                 gltype, normalized = gl.GL_UNSIGNED_BYTE, gl.GL_TRUE
             else:
-                raise TypeError(f"{self.kind.name}.{name}: unsupported field type {sub}")
+                raise TypeError(
+                    f"{self.kind.name}.{name}: unsupported field type {sub}"
+                )
             gl.glEnableVertexAttribArray(loc)
-            gl.glVertexAttribPointer(loc, count, gltype, normalized, stride, ctypes.c_void_p(offset))
+            gl.glVertexAttribPointer(
+                loc, count, gltype, normalized, stride, ctypes.c_void_p(offset)
+            )
             gl.glVertexAttribDivisor(loc, 1)
         gl.glBindVertexArray(0)
 
@@ -153,7 +169,7 @@ class InstanceBuffer:
         self.mark_many(slots)
         self.free_slots.extend(slots.tolist())
         heapq.heapify(self.free_slots)
-        in_use = np.flatnonzero(self.used[:self.top])
+        in_use = np.flatnonzero(self.used[: self.top])
         self.top = int(in_use[-1]) + 1 if in_use.size else 0
 
     def _grow(self) -> None:
@@ -192,9 +208,11 @@ class InstanceBuffer:
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
         base, size = self.data.ctypes.data, self.dtype.itemsize
         if self.realloc:
-            gl.glBufferData(gl.GL_ARRAY_BUFFER, self.data.nbytes, base, gl.GL_DYNAMIC_DRAW)
+            gl.glBufferData(
+                gl.GL_ARRAY_BUFFER, self.data.nbytes, base, gl.GL_DYNAMIC_DRAW
+            )
         else:
-            idx = np.flatnonzero(self.dirty[:self.end])
+            idx = np.flatnonzero(self.dirty[: self.end])
             if idx.size:
                 breaks = np.flatnonzero(np.diff(idx) > GAP)
                 starts = idx[np.r_[0, breaks + 1]]
@@ -202,7 +220,12 @@ class InstanceBuffer:
                 if len(starts) > MAX_RUNS:
                     starts, stops = idx[:1], idx[-1:] + 1
                 for lo, hi in zip(starts.tolist(), stops.tolist()):
-                    gl.glBufferSubData(gl.GL_ARRAY_BUFFER, lo * size, (hi - lo) * size, base + lo * size)
+                    gl.glBufferSubData(
+                        gl.GL_ARRAY_BUFFER,
+                        lo * size,
+                        (hi - lo) * size,
+                        base + lo * size,
+                    )
         self.dirty[:] = False
         self.realloc = self.any_dirty = False
 
@@ -212,7 +235,9 @@ class InstanceBuffer:
         self._upload()
         self.program.use()
         self.program["lift_offset"] = offset
-        if "time" in self.program.uniforms:  # (only programs that animate something have it)
+        if (
+            "time" in self.program.uniforms
+        ):  # (only programs that animate something have it)
             self.program["time"] = now
         if self.kind.texture is not None:
             tex = self.kind.texture()
@@ -231,7 +256,10 @@ class Canvas:
     def __init__(self, batch: pyglet.graphics.Batch) -> None:
         self.batch = batch
         self._buffers: dict[tuple[int, int, str], InstanceBuffer] = {}
-        self.offset = (0.0, 0.0)  # where lifted instances are drawn, relative to their data
+        self.offset = (
+            0.0,
+            0.0,
+        )  # where lifted instances are drawn, relative to their data
 
     def buffer(self, kind: Kind, layer) -> InstanceBuffer:
         """`layer`: a pyglet Group (its order counts) or an order number."""
@@ -258,5 +286,5 @@ class Canvas:
         """Instances in use per kind (for the curious / tests)."""
         out: dict[str, int] = {}
         for (_, _, name), buf in self._buffers.items():
-            out[name] = out.get(name, 0) + int(buf.used[:buf.end].sum())
+            out[name] = out.get(name, 0) + int(buf.used[: buf.end].sum())
         return out

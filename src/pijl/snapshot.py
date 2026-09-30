@@ -30,7 +30,9 @@ WireData = tuple[EndRef, EndRef, tuple[Point, ...], Point | None, Point | None]
 class Snapshot:
     parts: dict[int, PartData]
     wires: dict[int, WireData]
-    wire_colors: dict[int, str] = field(default_factory=dict)  # wire uid -> color name; absent = default
+    wire_colors: dict[int, str] = field(
+        default_factory=dict
+    )  # wire uid -> color name; absent = default
 
 
 EMPTY = Snapshot({}, {})

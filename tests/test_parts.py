@@ -30,8 +30,19 @@ def level(b: bool):
 def test_builtins_are_the_ports_plus_the_template_scripts():
     reg = builtin_registry()
     assert reg.errors == []
-    assert [t.kind for t in reg] == ["IN", "OUT", "AND", "BUF", "NAND", "NOT", "OR", "TRI", "XOR",
-                                     "PULLUP", "PULLDOWN"]  # ports, then by path
+    assert [t.kind for t in reg] == [
+        "IN",
+        "OUT",
+        "AND",
+        "BUF",
+        "NAND",
+        "NOT",
+        "OR",
+        "TRI",
+        "XOR",
+        "PULLUP",
+        "PULLDOWN",
+    ]  # ports, then by path
     assert {t.category for t in reg} == {"I/O", "GATES", "WIRING"}
     assert {t.api for t in reg} == {2}
 
@@ -39,12 +50,18 @@ def test_builtins_are_the_ports_plus_the_template_scripts():
 def test_scripts_load_recursively_and_helpers_are_skipped():
     reg = load(SCRIPTS / "good")
     assert reg.errors == []
-    assert {"COUNTER", "BRIDGE", "INV", "HIGH", "AND16", "SPLIT", "BOOM"} <= set(reg.types)
+    assert {"COUNTER", "BRIDGE", "INV", "HIGH", "AND16", "SPLIT", "BOOM"} <= set(
+        reg.types
+    )
 
 
 def test_broken_scripts_are_skipped_whole_and_reported():
     reg = load(SCRIPTS / "bad")
-    assert set(reg.types) == {"IN", "OUT", "FINE"}  # nothing from the bad ones, not even half of partial.py
+    assert set(reg.types) == {
+        "IN",
+        "OUT",
+        "FINE",
+    }  # nothing from the bad ones, not even half of partial.py
     errors = "\n".join(reg.errors)
     for name in ("broken.py", "old_api.py", "partial.py", "port.py", "sink.py"):
         assert name in errors
@@ -54,7 +71,9 @@ def test_broken_scripts_are_skipped_whole_and_reported():
 def test_two_folders_cannot_define_the_same_part():
     reg = load(TEMPLATES, TEMPLATES)
     assert [t.kind for t in reg].count("NAND") == 1
-    assert len(reg.errors) == len(list(TEMPLATES.rglob("*.py")))  # every template script, the second time
+    assert len(reg.errors) == len(
+        list(TEMPLATES.rglob("*.py"))
+    )  # every template script, the second time
 
 
 def test_missing_folder_is_just_empty(tmp_path):
@@ -66,8 +85,11 @@ def test_missing_folder_is_just_empty(tmp_path):
 
 def test_every_gate_on_arrays():
     c = Circuit()
-    cases = {"AND": lambda a, b: a and b, "NAND": lambda a, b: not (a and b),
-             "OR": lambda a, b: a or b}
+    cases = {
+        "AND": lambda a, b: a and b,
+        "NAND": lambda a, b: not (a and b),
+        "OR": lambda a, b: a or b,
+    }
     rows = [(a, b) for a in (False, True) for b in (False, True)]
     for kind, expect in cases.items():
         gates = []
@@ -78,7 +100,9 @@ def test_every_gate_on_arrays():
             c.connect(ib.outputs[0], g.inputs[1])
             gates.append(g)
         settle(c, 3)
-        assert [g.outputs[0].state for g in gates] == [level(expect(a, b)) for a, b in rows], kind
+        assert [g.outputs[0].state for g in gates] == [
+            level(expect(a, b)) for a, b in rows
+        ], kind
     n = c.add_part("NOT")
     settle(c, 1)
     assert n.outputs[0].state is X  # its input floats
@@ -91,7 +115,9 @@ def test_scalars_many_inputs_and_many_outputs(circuit):
     circuit.connect(high[0].outputs[0], split.inputs[0])
     settle(circuit, 3)
     assert all(h.outputs[0].state is ONE for h in high)
-    assert wide.outputs[0].state is X  # nothing wired: an API 1 part can't know what X does
+    assert (
+        wide.outputs[0].state is X
+    )  # nothing wired: an API 1 part can't know what X does
     assert [p.state for p in split.outputs] == [ONE, ZERO]
 
 
@@ -103,7 +129,11 @@ def test_relative_imports_inside_a_script_folder(circuit):
 
 
 def test_a_raising_eval_disables_only_its_own_kind(circuit):
-    boom, n, high = circuit.add_part("BOOM"), circuit.add_part("NOT"), circuit.add_part("HIGH")
+    boom, n, high = (
+        circuit.add_part("BOOM"),
+        circuit.add_part("NOT"),
+        circuit.add_part("HIGH"),
+    )
     circuit.connect(high.outputs[0], n.inputs[0])
     settle(circuit, 3)
     assert "BOOM" in circuit.faults and "ZeroDivisionError" in circuit.faults["BOOM"]
@@ -163,7 +193,11 @@ def test_a_bridge_thread_feeds_eval(circuit):
 
 def test_clicks_go_to_clickable_placed_parts():
     c = Circuit()
-    switch, gate, ghost = c.add_part("IN"), c.add_part("NAND"), c.add_part("IN", live=False)
+    switch, gate, ghost = (
+        c.add_part("IN"),
+        c.add_part("NAND"),
+        c.add_part("IN", live=False),
+    )
     assert c.click(switch) and switch.outputs[0].state is ONE
     assert not c.click(gate)
     assert not c.click(ghost) and ghost.outputs[0].state is ZERO  # switches start off
@@ -174,13 +208,20 @@ def test_clicks_go_to_clickable_placed_parts():
 
 def test_api_1_and_2_scripts_see_x_differently(circuit):
     """AND(0, X) is 0 -- if the script can see the X. API 1 gets bools, so it says X."""
-    zero, old, new = circuit.add_part("IN"), circuit.add_part("AND16"), circuit.add_part("AND4S")
+    zero, old, new = (
+        circuit.add_part("IN"),
+        circuit.add_part("AND16"),
+        circuit.add_part("AND4S"),
+    )
     for g in (old, new):
         circuit.connect(zero.outputs[0], g.inputs[0])  # (the other inputs float: X)
     settle(circuit, 3)
     assert new.outputs[0].state is ZERO
     assert old.outputs[0].state is X
-    assert circuit.registry.get("AND4S").api == 2 and circuit.registry.get("AND16").api == 1
+    assert (
+        circuit.registry.get("AND4S").api == 2
+        and circuit.registry.get("AND16").api == 1
+    )
 
 
 def bus(circuit, *kinds):
@@ -218,21 +259,30 @@ def test_tri_state_bus(circuit):
 
 def test_pulls_only_count_when_nobody_drives(circuit):
     seen, trunk, (tri, pull) = bus(circuit, "TRI", "PULLUP")
-    x, en = circuit.add_part("NOT"), circuit.add_part("IN")  # (x's input floats: it says X)
+    x, en = (
+        circuit.add_part("NOT"),
+        circuit.add_part("IN"),
+    )  # (x's input floats: it says X)
     circuit.connect(x.outputs[0], tri.inputs[0])
     circuit.connect(en.outputs[0], tri.inputs[1])
     settle(circuit, 3)
     assert seen.state is ONE  # tri is off: the pull-up wins
     en.outputs[0].state = True
     settle(circuit, 3)
-    assert seen.state is X and circuit.wire_state(trunk) == (X, False)  # strong X beats a pull, no fight
+    assert seen.state is X and circuit.wire_state(trunk) == (
+        X,
+        False,
+    )  # strong X beats a pull, no fight
 
 
 def test_pull_priority(circuit):
     seen, trunk, (up, down) = bus(circuit, "PULLUP", "PULLDOWN")
     assert up.props == down.props == {"priority": 0}
     settle(circuit, 3)
-    assert seen.state is X and circuit.wire_state(trunk) == (X, True)  # equal priority: a conflict
+    assert seen.state is X and circuit.wire_state(trunk) == (
+        X,
+        True,
+    )  # equal priority: a conflict
     down.props["priority"] = 1
     circuit.props_changed(down)
     settle(circuit, 3)
@@ -248,9 +298,9 @@ def test_weak_pins_must_be_outputs():
 
     class Bad(PartType):
         kind, ins, weak = "BAD", ("a",), ("a",)
+
     with pytest.raises(ValueError, match="weak"):
         Registry().add(Bad)
-
 
 
 def test_shipped_gates_in_four_states():
@@ -262,7 +312,12 @@ def test_shipped_gates_in_four_states():
     levels = (ZERO, ONE, X, Z)
     c = Circuit()
     xs = c.add_part("NOT")  # input floats: says X
-    source = {ZERO: None, ONE: None, X: xs.outputs[0], Z: None}  # Z: leave the input unwired
+    source = {
+        ZERO: None,
+        ONE: None,
+        X: xs.outputs[0],
+        Z: None,
+    }  # Z: leave the input unwired
 
     def wire(pin, v):
         if v in (ZERO, ONE):
@@ -302,7 +357,12 @@ def test_inline_pull_is_one_net_both_ways_with_no_delay():
     # left: a TRI, then a pull inline, then an LED. right: the same, but a plain wire.
     rows = []
     for inline in (True, False):
-        a, en, tri, led = c.add_part("IN"), c.add_part("IN"), c.add_part("TRI"), c.add_part("OUT")
+        a, en, tri, led = (
+            c.add_part("IN"),
+            c.add_part("IN"),
+            c.add_part("TRI"),
+            c.add_part("OUT"),
+        )
         c.connect(a.outputs[0], tri.inputs[0])
         c.connect(en.outputs[0], tri.inputs[1])
         if inline:
@@ -318,7 +378,9 @@ def test_inline_pull_is_one_net_both_ways_with_no_delay():
     assert [p.state for p in pull.pins] == [ONE, ONE]  # both of its pins show the net
     for a, en in ((a1, en1), (a2, en2)):
         a.state, en.state = False, True
-    for _ in range(4):  # the 0 arrives on the same tick as through a plain wire: no delay
+    for _ in range(
+        4
+    ):  # the 0 arrives on the same tick as through a plain wire: no delay
         c.step()
         assert (led1.state is ZERO) == (led2.state is ZERO)
     assert led1.state is ZERO and [p.state for p in pull.pins] == [ZERO, ZERO]
@@ -330,7 +392,9 @@ def test_inline_pull_is_one_net_both_ways_with_no_delay():
     trunk = d.wires[0]
     d.connect(pull.outputs[0], trunk)  # (out side on the driven wire)
     probe = d.add_part("OUT")
-    d.connect(pull.inputs[0], probe.inputs[0], check=False)  # (in side on to another reader)
+    d.connect(
+        pull.inputs[0], probe.inputs[0], check=False
+    )  # (in side on to another reader)
     src.outputs[0].state = True
     settle(d, 2)
     assert probe.inputs[0].state is ONE  # the strong 1 reaches through the pull
@@ -344,6 +408,7 @@ def test_joins_must_name_pins_once():
 
     class Twice(PartType):
         kind, ins, outs, joins = "TWICE", ("a",), ("b",), (("a", "b"), ("b",))
+
     for t in (Bad, Twice):
         with pytest.raises(ValueError, match="joins"):
             Registry().add(t)
@@ -354,8 +419,13 @@ def test_choices_were_replaced_by_settings():
 
     class Old(PartType):
         kind, props, choices = "OLD", {"speed": 1}, {"speed": (1, 2)}
+
     with pytest.raises(ValueError, match="replaced by `settings`"):
         Registry().add(Old)
     priority = builtin_registry().get("PULLUP").settings["priority"]
     assert priority.values == tuple(range(10)) and priority.default == 0
-    assert (priority.show(0), priority.show(5), priority.show(9)) == ("0 (weakest)", "5", "9 (strongest)")
+    assert (priority.show(0), priority.show(5), priority.show(9)) == (
+        "0 (weakest)",
+        "5",
+        "9 (strongest)",
+    )

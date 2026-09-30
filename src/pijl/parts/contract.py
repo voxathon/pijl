@@ -57,7 +57,10 @@ if TYPE_CHECKING:
     from ..sim.circuit import Part
 
 API = 2  # bump when this contract changes in a way old scripts can't follow
-SUPPORTED_APIS = (1, 2)  # what the loader still accepts (see _evaluate in sim/circuit.py)
+SUPPORTED_APIS = (
+    1,
+    2,
+)  # what the loader still accepts (see _evaluate in sim/circuit.py)
 
 LABEL_SIDES = ("below", "left", "right")
 
@@ -65,34 +68,50 @@ LABEL_SIDES = ("below", "left", "right")
 @dataclass(frozen=True)
 class Look:
     """How the editor draws a part. Colors are names from ui/theme.py."""
-    narrow: bool = False                # IO-width body with smaller text
-    label: str = "below"                # where the user's label goes: below, left, right
-    lit: tuple[str, str] | None = None  # body (off, on) colors, following the part's first pin
-    swatch: str = "PART_BODY"           # its color in the part picker
-    body: str = "PART_BODY"             # body (fill, border) colors, unless `lit` says otherwise
-    pin_labels: bool = True             # name tags next to the pins (Tab picks hidden / hover / always)
+
+    narrow: bool = False  # IO-width body with smaller text
+    label: str = "below"  # where the user's label goes: below, left, right
+    lit: tuple[str, str] | None = (
+        None  # body (off, on) colors, following the part's first pin
+    )
+    swatch: str = "PART_BODY"  # its color in the part picker
+    body: str = "PART_BODY"  # body (fill, border) colors, unless `lit` says otherwise
+    pin_labels: bool = (
+        True  # name tags next to the pins (Tab picks hidden / hover / always)
+    )
 
 
 class PartType:
     """One kind of part. Class attributes are the defaults; instances may set their own."""
-    kind: str = ""                   # stable id: save files refer to parts by it
-    title: str = ""                  # what the body says, if not the kind
-    ins: tuple[str, ...] = ()        # input pin names, top to bottom
-    outs: tuple[str, ...] = ()       # output pin names, top to bottom
-    props: dict[str, Any] = {}       # per-instance data (JSON values); each instance gets a copy
-    settings: dict[str, Setting] = {}  # props the user can set from the context menu (settings.py);
-                                     # prop name -> Setting, in menu order. Not also in `props`
-    actions: dict[str, Action] = {}  # context menu rows that call action(); name -> Action
-    pure: bool = False               # outputs depend only on inputs: the engine may optimize it
-    category: str = ""               # default collection in the part picker ("" = loose)
+
+    kind: str = ""  # stable id: save files refer to parts by it
+    title: str = ""  # what the body says, if not the kind
+    ins: tuple[str, ...] = ()  # input pin names, top to bottom
+    outs: tuple[str, ...] = ()  # output pin names, top to bottom
+    props: dict[
+        str, Any
+    ] = {}  # per-instance data (JSON values); each instance gets a copy
+    settings: dict[
+        str, Setting
+    ] = {}  # props the user can set from the context menu (settings.py);
+    # prop name -> Setting, in menu order. Not also in `props`
+    actions: dict[
+        str, Action
+    ] = {}  # context menu rows that call action(); name -> Action
+    pure: bool = False  # outputs depend only on inputs: the engine may optimize it
+    category: str = ""  # default collection in the part picker ("" = loose)
     look: Look = Look()
-    port: str | None = None          # "in" / "out": macro ports. Engine-only, see ports.py
-    weak: tuple[str, ...] = ()       # outputs that only drive a net nobody else drives (pulls).
-                                     # Of those on a net, the highest props["priority"] wins
-    joins: tuple[tuple[str, ...], ...] = ()  # pin groups that are one net straight through the
-                                     # part (an inline pull: (("in", "out"),)). They show the
-                                     # net's value; a joined output's eval value drives that net
-    api: int = API                   # the API its script was written for (set by the loader)
+    port: str | None = None  # "in" / "out": macro ports. Engine-only, see ports.py
+    weak: tuple[
+        str, ...
+    ] = ()  # outputs that only drive a net nobody else drives (pulls).
+    # Of those on a net, the highest props["priority"] wins
+    joins: tuple[
+        tuple[str, ...], ...
+    ] = ()  # pin groups that are one net straight through the
+    # part (an inline pull: (("in", "out"),)). They show the
+    # net's value; a joined output's eval value drives that net
+    api: int = API  # the API its script was written for (set by the loader)
 
     def eval(self, ctx: Ctx, *ins):
         """Every step: input arrays in, output arrays (or scalars) out."""
@@ -128,6 +147,7 @@ class PartType:
 @dataclass
 class Ctx:
     """What a hook sees: a batch of instances of one kind."""
+
     parts: list[Part]
     tick: int = 0  # simulation steps since the circuit was created
     time: float = field(default_factory=time.monotonic)
@@ -148,9 +168,12 @@ class Ctx:
 
 class FunctionPart(PartType):
     """A pure part whose eval is a plain function of its inputs. Made by part()."""
+
     pure = True
 
-    def __init__(self, kind: str, ins, outs, fn: Callable, category: str, look: Look) -> None:
+    def __init__(
+        self, kind: str, ins, outs, fn: Callable, category: str, look: Look
+    ) -> None:
         self.kind, self.ins, self.outs = kind, tuple(ins), tuple(outs)
         self.fn, self.category, self.look = fn, category, look
 
@@ -158,7 +181,14 @@ class FunctionPart(PartType):
         return self.fn(*ins)
 
 
-def part(kind: str, ins=(), outs=(), eval: Callable = None, *, category: str = "",
-         look: Look = Look()) -> PartType:
+def part(
+    kind: str,
+    ins=(),
+    outs=(),
+    eval: Callable = None,
+    *,
+    category: str = "",
+    look: Look = Look(),
+) -> PartType:
     """A pure part from a function: `eval` takes one array per input pin."""
     return FunctionPart(kind, ins, outs, eval, category, look)
