@@ -87,7 +87,7 @@ vec4 pattern(int kind, vec2 world, float wpp, float alpha) {{
         float z = mix(dash(d / p0, wpp / p0), dash(d / p1, wpp / p1), f);
         return vec4(mix(Z_A, Z_B, z), alpha);
     }}
-    float phase = kind == {SHOW_FIGHT} ? time * {T.LOGIC_SCROLL_HZ} : 0.0;
+    float phase = time * (kind == {SHOW_FIGHT} ? {T.LOGIC_FIGHT_HZ} : {T.LOGIC_SCROLL_HZ});
     float x = mix(band(d / p0 - phase), band(d / p1 - phase), f);
     return vec4(mix(X_B, X_A, x), alpha);
 }}

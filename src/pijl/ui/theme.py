@@ -33,7 +33,8 @@ LOGIC_Z = ((12, 12, 15), (60, 60, 74))  # near black, with short dashes: nothing
 LOGIC_PERIOD = 16      # world units between bands, zoomed in
 LOGIC_PERIOD_PX = 14   # ... but never fewer screen px than this
 LOGIC_DASH = 0.35      # Z: how much of each period is dash
-LOGIC_SCROLL_HZ = 0.75  # a conflict (drivers fighting) scrolls its X bands: periods per second
+LOGIC_SCROLL_HZ = 0.75  # X's bands scroll: periods per second
+LOGIC_FIGHT_HZ = 2.5    # a conflict (drivers fighting) shows X's bands too, scrolling faster
 
 
 def _dim(on: tuple[int, int, int]) -> tuple[int, int, int]:
