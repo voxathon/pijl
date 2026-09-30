@@ -41,6 +41,8 @@ Controls
     Label...               type in place; Enter commits, Esc reverts, clicking elsewhere commits
     Recolor                wires and IN/OUT parts: 8 colors, or Default (inherit). Colors blend
                            along wires, see paint.py. New branches take their wire's color
+    (settings)             whatever props a part's type offers (PartType.choices), e.g. a
+                           pull's Priority: pick a value
     Edit (wires)           hold+drag square handles to move bends, "+" handles or the wire
                            itself to add one; right-click a square to remove it. Round handles
                            are junctions (its own ends and branches off it): drag to slide
@@ -646,6 +648,7 @@ class Editor(pyglet.window.Window):
                 if view.look.lit:  # switches and LEDs are color sources (paint.py)
                     items.append(MenuItem("Recolor", submenu=self._recolor_items(
                         part_color(view.part), lambda c: self._set_part_color(view, c))))
+                items += self._choice_items(view)
                 items.append(MenuItem("Delete", lambda: self.remove_part(view), danger=True))
                 self._open_menu(x, y, items)
             elif wire := self.wire_at(wx, wy):
@@ -875,6 +878,22 @@ class Editor(pyglet.window.Window):
         return [*(MenuItem(name.capitalize(), lambda c=name: set_color(c), swatch=on, checked=current == name)
                   for name, (_, on) in T.WIRE_COLORS.items()),
                 MenuItem("Default", lambda: set_color(None), swatch=RAINBOW, checked=current is None)]
+
+    def _choice_items(self, view: PartView) -> list[MenuItem]:
+        """A submenu per prop the part's type lets the user pick (PartType.choices)."""
+        part = view.part
+        return [MenuItem(key.replace("_", " ").capitalize(), submenu=[
+                    MenuItem(str(value), lambda k=key, v=value: self._set_prop(view, k, v),
+                             checked=part.props.get(key) == value)
+                    for value in values])
+                for key, values in part.type.choices.items()]
+
+    def _set_prop(self, view: PartView, key: str, value) -> None:
+        part = view.part
+        if part.props.get(key) != value:
+            part.props[key] = value
+            self.circuit.props_changed(part)
+            Touched.part(part.uid)
 
     @staticmethod
     def _set_part_color(view: PartView, color: str | None) -> None:

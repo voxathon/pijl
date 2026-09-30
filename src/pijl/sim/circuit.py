@@ -23,6 +23,10 @@ Model:
     arrays (PartType.eval), which is what lets big boards go fast later.
   - Parts are *live* once placed. Ghosts (following the cursor before a click)
     aren't: they're never opened, and only pure parts among them are evaluated.
+  - Joined pins (PartType.joins) are one net straight through their part: they
+    show the net's value and never drive it. A joined output's value drives that
+    net from a hidden pin (Part.drives), so an inline pull-up is one net with a
+    weak driver on it, not two nets with a gate in between.
   - A macro instance is never evaluated: its body is added as *hidden* parts and
     wires (owned by the instance, not in `parts` / `wires`, which are only what's
     on the board), recursively. Its pins are joined straight into the nets of the
@@ -140,8 +144,9 @@ class Pin:
 
     @property
     def passive(self) -> bool:
-        """Pass-through: a macro instance's pins and its body's port pins. They join nets
-        (see Part.links) but never drive them; they just show the net's value."""
+        """Pass-through: a macro instance's pins, its body's port pins, and joined outputs
+        (PartType.joins). They join nets (see Part.links) but never drive them; they just
+        show the net's value."""
         return self._passive
 
     @passive.setter
@@ -176,7 +181,10 @@ class Part:
     owner: Part | None = field(default=None, repr=False)
     inner: dict[int, Part] = field(default_factory=dict, repr=False)
     inner_wires: list[Wire] = field(default_factory=list, repr=False)
-    links: list[tuple[Pin, Pin]] = field(default_factory=list, repr=False)
+    links: list[tuple[Pin, Pin]] = field(default_factory=list, repr=False)  # pins that are one net
+    # Per output: the pin its eval value goes to. The output itself, or for a joined
+    # output (which only shows its net) a hidden pin that drives the net. Not in `pins`.
+    drives: list[Pin] = field(default_factory=list, repr=False)
 
     @property
     def pins(self) -> list[Pin]:
@@ -213,7 +221,7 @@ class Circuit:
         self.rng = np.random.default_rng(seed)
         self._pins = _PinStates()
         self._wire_slots = _WireSlots()
-        self._macros: dict[Part, None] = {}  # instances with links (their pins <-> their ports)
+        self._linked: dict[Part, None] = {}  # parts with links: macro instances, parts with joins
         self._settle = np.zeros(256, np.int32)  # per part slot: ticks of settling jitter left
         self._n_part_slots = 0
         self._settling = 0  # how many parts are still settling
@@ -287,8 +295,12 @@ class Circuit:
             self._settle = np.concatenate((self._settle, np.zeros(len(self._settle), np.int32)))
         part.inputs = [Pin(part, i, True, self._pins) for i in range(len(t.ins))]
         power_on = X if t.has("eval") else ZERO  # (the IN switch starts off)
-        part.outputs = [Pin(part, i, False, self._pins, power_on, name in t.weak)
+        joined = {name for group in t.joins for name in group}
+        part.outputs = [Pin(part, i, False, self._pins, power_on, name in t.weak and name not in joined)
                         for i, name in enumerate(t.outs)]
+        part.drives = list(part.outputs)
+        if joined:
+            self._join(part, power_on)
         if getattr(t, "body", None) is not None:
             self._expand(part)
         self._kinds_dirty = self._batches_dirty = self._nets_dirty = True
@@ -317,7 +329,22 @@ class Circuit:
             inst.links.append((inst.inner[port_uid].inputs[0], pin))
         for a, b in inst.links:
             a.passive = b.passive = True
-        self._macros[inst] = None
+        self._linked[inst] = None
+
+    def _join(self, part: Part, power_on: Level) -> None:
+        """Make each of the type's join groups one net: link its pins, turn its outputs into
+        pass-through pins, and give each of those a hidden pin to drive the net from."""
+        t = part.type
+        named = dict(zip(t.ins, part.inputs)) | dict(zip(t.outs, part.outputs))
+        for group in t.joins:
+            pins = [named[name] for name in group]
+            for i, name in enumerate(t.outs):
+                if name in group:
+                    part.outputs[i].passive = True
+                    part.drives[i] = Pin(part, i, False, self._pins, power_on, name in t.weak)
+                    pins.append(part.drives[i])
+            part.links += [(pins[0], p) for p in pins[1:]]
+        self._linked[part] = None
 
     @staticmethod
     def _end(ref: tuple, inst: Part, wires: dict[int, Wire]) -> Endpoint:
@@ -347,8 +374,8 @@ class Circuit:
             if self.settle_ticks:
                 self._settle[p.slot] = self.settle_ticks
                 self._settling += 1
-                if p.outputs and p.type.has("eval"):  # power-on noise
-                    slots = [pin.slot for pin in p.outputs]
+                if p.drives and p.type.has("eval"):  # power-on noise
+                    slots = [pin.slot for pin in p.drives]
                     self._pins.states[slots] = self.rng.integers(ZERO, ONE + 1, len(slots), dtype=CODE)
             t = p.type
             if t.has("open") and t.kind not in self.faults:
@@ -400,7 +427,7 @@ class Circuit:
         self._wire_slots.alive[[w.slot for p in tree for w in p.inner_wires]] = False
         self._settle[[p.slot for p in tree]] = 0
         for p in tree:
-            self._macros.pop(p, None)
+            self._linked.pop(p, None)
         if any(part.inner for part in parts):  # macro instances: their insides go too
             dead = set(tree)
             dead_wires = {w for p in dead for w in p.inner_wires}
@@ -561,7 +588,7 @@ class Circuit:
         n_pins, n_wires = len(store.pins), len(ws.wires)
         live = np.flatnonzero(ws.alive[:n_wires])  # wire slots; a wire's node is n_pins + its slot
         ends = np.where(ws.end_is_wire[live], n_pins + ws.end_slot[live], ws.end_slot[live])
-        links = [(x.slot, y.slot) for inst in self._macros for x, y in inst.links]  # macro pins <-> ports
+        links = [(x.slot, y.slot) for p in self._linked for x, y in p.links]  # macro pins <-> ports, joins
         link_a, link_b = (np.array(side, np.intp) for side in zip(*links)) if links else (np.empty(0, np.intp),) * 2
         a = np.concatenate((n_pins + live, n_pins + live, link_a))
         b = np.concatenate((ends[:, 0], ends[:, 1], link_b))
@@ -718,7 +745,7 @@ class Circuit:
                     self._batches.append(_Batch(
                         t, group,
                         [np.array([p.inputs[i].slot for p in group], np.intp) for i in range(len(t.ins))],
-                        [np.array([p.outputs[i].slot for p in group], np.intp) for i in range(len(t.outs))],
+                        [np.array([p.drives[i].slot for p in group], np.intp) for i in range(len(t.outs))],
                         np.array([p.slot for p in group], np.intp)))
             self._batches_dirty = False
         return self._batches
@@ -743,7 +770,7 @@ class Circuit:
                 self.errors.append(msg)
                 self._changed_all = True
                 for part in self._by_kind().get(t, ()):
-                    for pin in part.outputs:
+                    for pin in part.drives:
                         pin.state = X
             return _FAILED
 
@@ -753,7 +780,7 @@ class _Batch:
     type: PartType
     parts: list[Part]
     ins: list[np.ndarray]   # per input pin: the instances' pin slots
-    outs: list[np.ndarray]  # per output pin
+    outs: list[np.ndarray]  # per output pin: where its values go (Part.drives)
     slots: np.ndarray       # the instances' part slots
 
 

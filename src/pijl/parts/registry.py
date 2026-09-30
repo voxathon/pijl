@@ -75,6 +75,12 @@ class Registry:
             raise TypeError(f"{name}: pin names must be strings")
         if not set(t.weak) <= set(t.outs):
             raise ValueError(f"{name}: weak pins must be outputs")
+        t.joins = tuple(tuple(group) for group in t.joins)
+        joined = [p for group in t.joins for p in group]
+        if not set(joined) <= set(t.ins + t.outs) or len(joined) != len(set(joined)):
+            raise ValueError(f"{name}: joins must name pins, each at most once")
+        if len(set(t.ins + t.outs)) != len(t.ins + t.outs) and joined:
+            raise ValueError(f"{name}: joined pins need unique names")
         if t.port is not None and not engine:
             raise ValueError(f"{name}: only the engine defines ports (IN/OUT)")
         if t.pure and not t.outs:
@@ -83,6 +89,10 @@ class Registry:
             raise ValueError(f"{name}: a pure part needs an eval")
         if not isinstance(t.props, dict):
             raise TypeError(f"{name}: props must be a dict")
+        t.choices = {key: tuple(values) for key, values in t.choices.items()}
+        for key, values in t.choices.items():
+            if key not in t.props or not values:
+                raise ValueError(f"{name}: choices[{key!r}] needs a default in props and some values")
         if not isinstance(t.look, Look) or t.look.label not in LABEL_SIDES:
             raise ValueError(f"{name}: bad look {t.look!r}")
 

@@ -69,12 +69,17 @@ class PartType:
     ins: tuple[str, ...] = ()        # input pin names, top to bottom
     outs: tuple[str, ...] = ()       # output pin names, top to bottom
     props: dict[str, Any] = {}       # per-instance settings (JSON values); each instance gets a copy
+    choices: dict[str, tuple] = {}   # props the user can set from the part's context menu:
+                                     # prop name -> the values to offer (each prop needs a default)
     pure: bool = False               # outputs depend only on inputs: the engine may optimize it
     category: str = ""               # default collection in the part picker ("" = loose)
     look: Look = Look()
     port: str | None = None          # "in" / "out": macro ports. Engine-only, see ports.py
     weak: tuple[str, ...] = ()       # outputs that only drive a net nobody else drives (pulls).
                                      # Of those on a net, the highest props["priority"] wins
+    joins: tuple[tuple[str, ...], ...] = ()  # pin groups that are one net straight through the
+                                     # part (an inline pull: (("in", "out"),)). They show the
+                                     # net's value; a joined output's eval value drives that net
     api: int = API                   # the API its script was written for (set by the loader)
 
     def eval(self, ctx: Ctx, *ins):

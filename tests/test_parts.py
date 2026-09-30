@@ -295,3 +295,69 @@ def test_shipped_gates_in_four_states():
             a, en = vals
             expect = {ONE: a, ZERO: Z}.get(en, X)
         assert got is expect, (kind, vals, got)
+
+
+def test_inline_pull_is_one_net_both_ways_with_no_delay():
+    c = Circuit()
+    # left: a TRI, then a pull inline, then an LED. right: the same, but a plain wire.
+    rows = []
+    for inline in (True, False):
+        a, en, tri, led = c.add_part("IN"), c.add_part("IN"), c.add_part("TRI"), c.add_part("OUT")
+        c.connect(a.outputs[0], tri.inputs[0])
+        c.connect(en.outputs[0], tri.inputs[1])
+        if inline:
+            pull = c.add_part("PULLUP")
+            c.connect(tri.outputs[0], pull.inputs[0])
+            c.connect(pull.outputs[0], led.inputs[0])
+        else:
+            c.connect(tri.outputs[0], led.inputs[0])
+        rows.append((a.outputs[0], en.outputs[0], led.inputs[0]))
+    (a1, en1, led1), (a2, en2, led2) = rows
+    settle(c, 3)
+    assert led1.state is ONE and led2.state is Z  # off: the pull decides
+    assert [p.state for p in pull.pins] == [ONE, ONE]  # both of its pins show the net
+    for a, en in ((a1, en1), (a2, en2)):
+        a.state, en.state = False, True
+    for _ in range(4):  # the 0 arrives on the same tick as through a plain wire: no delay
+        c.step()
+        assert (led1.state is ZERO) == (led2.state is ZERO)
+    assert led1.state is ZERO and [p.state for p in pull.pins] == [ZERO, ZERO]
+
+    # the other way round: driven from the `out` side, read on the `in` side
+    d = Circuit()
+    src, pull, led = d.add_part("IN"), d.add_part("PULLDOWN"), d.add_part("OUT")
+    d.connect(src.outputs[0], led.inputs[0])
+    trunk = d.wires[0]
+    d.connect(pull.outputs[0], trunk)  # (out side on the driven wire)
+    probe = d.add_part("OUT")
+    d.connect(pull.inputs[0], probe.inputs[0], check=False)  # (in side on to another reader)
+    src.outputs[0].state = True
+    settle(d, 2)
+    assert probe.inputs[0].state is ONE  # the strong 1 reaches through the pull
+
+
+def test_joins_must_name_pins_once():
+    from pijl.parts import PartType, Registry
+
+    class Bad(PartType):
+        kind, ins, outs, joins = "BAD", ("a",), ("b",), (("a", "c"),)
+
+    class Twice(PartType):
+        kind, ins, outs, joins = "TWICE", ("a",), ("b",), (("a", "b"), ("b",))
+    for t in (Bad, Twice):
+        with pytest.raises(ValueError, match="joins"):
+            Registry().add(t)
+
+
+def test_choices_need_a_default_and_values():
+    from pijl.parts import PartType, Registry
+
+    class NoDefault(PartType):
+        kind, choices = "NODEF", {"speed": (1, 2)}
+
+    class Empty(PartType):
+        kind, props, choices = "EMPTY", {"speed": 1}, {"speed": ()}
+    for t in (NoDefault, Empty):
+        with pytest.raises(ValueError, match="choices"):
+            Registry().add(t)
+    assert builtin_registry().get("PULLUP").choices == {"priority": tuple(range(10))}
