@@ -115,9 +115,8 @@ def restore(editor: Editor, target: Snapshot, only: tuple[Iterable[int], Iterabl
 
     # 1. parts that shouldn't exist. Their wires (and branches) go with them; any of
     #    those the target does have get rebuilt in step 4.
-    for uid in part_uids - target.parts.keys():
-        if (view := view_of(uid)) is not None:
-            wire_uids.update(w.uid for w in editor.remove_part(view))
+    doomed = [view for uid in part_uids - target.parts.keys() if (view := view_of(uid)) is not None]
+    wire_uids.update(w.uid for w in editor.remove_parts(doomed))
     # 2. wires that shouldn't exist -- or exist with different endpoints (cut-deletion
     #    splices a branch onto its trunk, re-pointing the trunk's far end). Those are
     #    rebuilt in step 4; so are branches that get removed along with them.

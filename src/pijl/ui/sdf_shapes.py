@@ -19,6 +19,8 @@ between them (so a pin lighting up is a one-byte write), and an `opacity`
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import numpy as np
 
 from .canvas import UNIFORMS, Canvas, Kind
@@ -43,6 +45,14 @@ _CORNER = "vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1)); 
 
 
 def _rgba(color) -> tuple[int, int, int, int]:
+    try:
+        return _rgba_of(color)
+    except TypeError:  # (not hashable: a list)
+        return _rgba_of(tuple(color))
+
+
+@lru_cache(maxsize=1 << 12)
+def _rgba_of(color: tuple) -> tuple[int, int, int, int]:
     return (*color[:3], color[3] if len(color) > 3 else 255)
 
 

@@ -209,6 +209,28 @@ class SDFText:
         return SDFLabel(self, text, x, y, size, color, anchor_x)
 
 
+_layouts: dict[tuple[str, float], tuple[str, np.ndarray, np.ndarray]] = {}
+
+
+def _layout(atlas: _Atlas, text: str, scale: float) -> tuple[str, np.ndarray, np.ndarray]:
+    """(the text as shown, glyph quads relative to its anchor, glyph uvs), cached: a
+    board shows the same few titles thousands of times. (Callers mustn't modify them.)"""
+    key = (text, scale)
+    hit = _layouts.get(key)
+    if hit is None:
+        shown = "".join(c for c in text if c == " " or c in atlas.glyphs)
+        visible = [(i, c) for i, c in enumerate(shown) if c != " "]
+        boxes = np.array([atlas.boxes[c] for _, c in visible], np.float32).reshape(-1, 4)
+        pens = np.array([i for i, _ in visible], np.float32)
+        rel = np.column_stack((pens * atlas.advance + boxes[:, 0], boxes[:, 1] - atlas.cap_height / 2,
+                               boxes[:, 2], boxes[:, 3])).astype(np.float32) * np.float32(scale)
+        uv = np.array([atlas.glyphs[c].uv for _, c in visible], np.float32).reshape(-1, 4)
+        if len(_layouts) > 4096:
+            _layouts.clear()
+        hit = _layouts[key] = (shown, rel, uv)
+    return hit
+
+
 class SDFLabel:
     """One line of text anchored at (x, y): vertically centered on the capitals,
     horizontally per `anchor_x` ("left", "center", "right"). `size` is in points
@@ -232,17 +254,12 @@ class SDFLabel:
         self.set_text(text)
 
     def set_text(self, text: str) -> None:
-        self.text = "".join(c for c in text if c == " " or c in self.atlas.glyphs)
+        self.text, self._rel, uv = _layout(self.atlas, text, self.scale)
         self._free()
-        visible = [(i, c) for i, c in enumerate(self.text) if c != " "]
-        if visible:
-            buf, a, s = self.buf, self.atlas, self.scale
-            self.slots = np.array([buf.alloc() for _ in visible], np.intp)
-            boxes = np.array([a.boxes[c] for _, c in visible], np.float32)
-            pens = np.array([i for i, _ in visible], np.float32)
-            self._rel = np.column_stack((pens * a.advance + boxes[:, 0], boxes[:, 1] - a.cap_height / 2,
-                                         boxes[:, 2], boxes[:, 3])) * s
-            buf.f["uv"][self.slots] = [a.glyphs[c].uv for _, c in visible]
+        if len(uv):
+            buf = self.buf
+            self.slots = buf.alloc_many(len(uv))
+            buf.f["uv"][self.slots] = uv
             buf.f["color"][self.slots] = self._color
             buf.f["lift"][self.slots] = self._lift
             buf.mark_many(self.slots)

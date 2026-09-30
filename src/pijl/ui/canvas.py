@@ -119,6 +119,22 @@ class InstanceBuffer:
         self.top = max(self.top, slot + 1)
         return slot
 
+    def alloc_many(self, n: int) -> np.ndarray:
+        """n slots, as alloc() would hand them out one by one."""
+        free = self.free_slots
+        out = [heapq.heappop(free) for _ in range(min(n, len(free)))]
+        rest = n - len(out)
+        if rest:
+            while self.end + rest > len(self.data):
+                self._grow()
+            out.extend(range(self.end, self.end + rest))
+            self.end += rest
+        slots = np.array(out, np.intp)
+        if n:
+            self.used[slots] = True
+            self.top = max(self.top, int(slots.max()) + 1)
+        return slots
+
     def free(self, slot: int) -> None:
         self.data[slot] = self._zero  # all-zero: a degenerate quad, draws nothing
         self.used[slot] = False
@@ -126,6 +142,18 @@ class InstanceBuffer:
         heapq.heappush(self.free_slots, slot)
         while self.top and not self.used[self.top - 1]:
             self.top -= 1
+
+    def free_many(self, slots: np.ndarray) -> None:
+        """free() for many slots at once."""
+        if not slots.size:
+            return
+        self.data[slots] = self._zero
+        self.used[slots] = False
+        self.mark_many(slots)
+        self.free_slots.extend(slots.tolist())
+        heapq.heapify(self.free_slots)
+        in_use = np.flatnonzero(self.used[:self.top])
+        self.top = int(in_use[-1]) + 1 if in_use.size else 0
 
     def _grow(self) -> None:
         n = len(self.data)

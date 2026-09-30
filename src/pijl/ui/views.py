@@ -560,18 +560,7 @@ class PartView:
             self.body.set_colors(off[0], off[1], on[0], on[1])
 
     def delete(self) -> None:
-        Touched.part(self.part.uid)
-        if self.index is not None:
-            self.index.remove(self)
-        self.body.delete()
-        self.set_selected(False)
-        self.kind_text.delete()
-        self.name.delete()
-        for dot in self.pin_dots:
-            dot.delete()
-        for bg, label in self.pin_tags:
-            bg.delete()
-            label.delete()
+        delete_views([self], [])
 
 
 class WireView:
@@ -593,7 +582,7 @@ class WireView:
         self.color = color  # a T.WIRE_COLORS name; None = Default (inherit from the ends)
         self.stops: list[tuple[float, Pair]] = []  # empty: neutral, the classic grey / red
         self.canvas, self.layers = canvas, layers
-        self.line = Polyline(self.points, T.WIRE_OFF, canvas, layers.wires)
+        self.line = Polyline([], T.WIRE_OFF, canvas, layers.wires)  # (laid out by _redraw, below)
         self.highlight: Polyline | None = None  # selection glow, only while selected
         # A dot on each end that attaches to another wire (a junction), like on schematics.
         # (In the wires layer, right after the line: a wire crossing the junction covers it.)
@@ -716,13 +705,7 @@ class WireView:
         return self.line.distance_to(wx, wy)
 
     def delete(self) -> None:
-        Touched.wire(self.wire.uid)
-        if self.index is not None:
-            self.index.remove(self)
-        self.set_selected(False)
-        self.line.delete()
-        for dot in self.dots.values():
-            dot.delete()
+        delete_views([], [self])
 
 
 # ---- many at once ---------------------------------------------------------------
@@ -797,6 +780,38 @@ def put_down(parts: list[PartView], wires: list[WireView], dx: float, dy: float)
         buf.set_lift(slots, False)
         if dx or dy:
             buf.shift(slots, dx, dy)
+
+
+def delete_views(parts: list[PartView], wires: list[WireView]) -> None:
+    """delete() for many parts and wires at once: their shapes are freed per buffer."""
+    Touched.parts.update(v.part.uid for v in parts)
+    Touched.paint_parts.update(v.part.uid for v in parts)
+    Touched.wires.update(v.wire.uid for v in wires)
+    Touched.paint_wires.update(v.wire.uid for v in wires)
+    by_index: dict[int, tuple] = {}
+    for v in (*parts, *wires):
+        if v.index is not None:
+            by_index.setdefault(id(v.index), (v.index, []))[1].append(v)
+    for index, members in by_index.values():
+        index.remove_many(members)
+    for buf, slots in _Slots().parts(parts).wires(wires):
+        buf.free_many(slots)
+    # the views are dead: they hold no slots any more (a second delete is a no-op)
+    empty = np.empty(0, np.intp)
+    for v in parts:
+        v.body.slot = None
+        for dot in v.pin_dots:
+            dot.slot = None
+        v.kind_text.slots = v.name.slots = empty
+        v.outline, v.pin_tags = None, []
+    for v in wires:
+        for line in (v.line, v.highlight):
+            if line is not None:
+                line.segments.clear()
+                line._slots = empty
+        for dot in v.dots.values():
+            dot.slot = None
+        v.highlight = None
 
 
 # What the views remember of their shapes (coordinates, lift), and the spatial index:

@@ -99,6 +99,10 @@ def main() -> None:
         report(f"drag {n // 2} parts: one mouse move",
                timed(lambda: ev("on_mouse_drag", tx + 10 + next(moves), ty, 1, 0, mouse.LEFT, 0), 10), 10)
         ev("on_mouse_release", tx + 20, ty, mouse.LEFT, 0)
+    if only is None or "delete" in only:
+        ev("on_key_press", key.A, key.MOD_CTRL)
+        report(f"delete all {n} parts", timed(lambda: ev("on_key_press", key.DELETE, 0)))
+        report("... and undo that", timed(undo))
     ed.close()
 
 

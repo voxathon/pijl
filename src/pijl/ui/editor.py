@@ -109,7 +109,7 @@ from .selection import Selection
 from .spatial import SpatialIndex, ordered
 from .status_bar import BAR_H, StatusBar
 from .views import (PartView, Layers, Point, Polyline, Touched, WireView, arc_length_at, points_before,
-                    lift, project_onto, put_down, theme_color)
+                    delete_views, lift, project_onto, put_down, theme_color)
 from .wire_edit import WireEditSession
 
 SIM_STEPS_PER_FRAME = 1
@@ -260,20 +260,28 @@ class Editor(pyglet.window.Window):
 
     def remove_part(self, view: PartView) -> list[Wire]:
         """Returns the wires that went with it."""
-        if view is self.hover_view:
+        return self.remove_parts([view])
+
+    def remove_parts(self, views: list[PartView]) -> list[Wire]:
+        """Remove many parts at once (a big selection: one by one was seconds).
+        Returns the wires that went with them."""
+        if self.hover_view in views:
             self.hover_view = None
-        removed = self.circuit.remove_part(view.part)
-        for wire in removed:
-            self._drop_wire_view(wire)
-        self.selection.discard(view)
-        del self.part_views[view.part]
-        view.delete()
+        removed = self.circuit.remove_parts([v.part for v in views])
+        for v in views:
+            del self.part_views[v.part]
+        self._drop_views(views, removed)
         return removed
 
     def _drop_wire_view(self, wire: Wire) -> None:
-        view = self.wire_views.pop(wire)
-        self.selection.discard(view)
-        view.delete()
+        self._drop_views([], [wire])
+
+    def _drop_views(self, parts: list[PartView], wires: list[Wire]) -> None:
+        """Forget and delete these part views and the views of these (removed) wires."""
+        wire_views = [self.wire_views.pop(w) for w in wires]
+        self.selection.parts.difference_update(parts)  # (their highlights go with the views)
+        self.selection.wires.difference_update(wire_views)
+        delete_views(parts, wire_views)
 
     def connect(self, a: Pin | Wire, b: Pin | Wire, bends: list[Point] = (),
                 a_pos: Point | None = None, b_pos: Point | None = None, uid: int | None = None,
@@ -295,9 +303,11 @@ class Editor(pyglet.window.Window):
 
     def remove_wire(self, view: WireView) -> list[Wire]:
         """Returns the wires removed: this one and its branches."""
-        removed = self.circuit.remove_wire(view.wire)
-        for wire in removed:
-            self._drop_wire_view(wire)
+        return self.remove_wires([view])
+
+    def remove_wires(self, views: list[WireView]) -> list[Wire]:
+        removed = self.circuit.remove_wires([v.wire for v in views])
+        self._drop_views([], removed)
         return removed
 
     def cut_wire(self, view: WireView, at: Point) -> None:
@@ -359,11 +369,8 @@ class Editor(pyglet.window.Window):
         return x.dst if x.src is parent else x.src
 
     def delete_selection(self) -> None:
-        for view in list(self.selection.wires):
-            if view.wire in self.wire_views:  # may already be gone with a deleted part
-                self.remove_wire(view)
-        for view in list(self.selection.parts):
-            self.remove_part(view)
+        self.remove_wires(list(self.selection.wires))
+        self.remove_parts(list(self.selection.parts))
         self.selection.clear()
 
     def pin_pos(self, pin: Pin) -> Point:

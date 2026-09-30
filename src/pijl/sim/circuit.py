@@ -47,7 +47,7 @@ import time
 import traceback
 import copy
 from dataclasses import dataclass, field
-from typing import Any, Callable, Union
+from typing import Any, Callable, Iterable, Union
 
 import numpy as np
 from scipy.sparse import coo_matrix
@@ -354,22 +354,28 @@ class Circuit:
 
     def remove_part(self, part: Part) -> list[Wire]:
         """Removes the part, every wire touching it, and every wire hanging off
-        those. Returns all removed wires."""
-        self.close_part(part)
-        removed: list[Wire] = []
-        for w in _by_uid({w for pin in part.pins for w in self._at.get(pin, ())}):
-            if w in self._wires:  # may already be gone as a branch of an earlier one
-                removed += self.remove_wire(w)
-        del self._parts[part]
-        del self.part_by_uid[part.uid]
+        those. Returns all removed wires (parents first)."""
+        return self.remove_parts([part])
+
+    def remove_parts(self, parts: Iterable[Part]) -> list[Wire]:
+        """remove_part for many parts at once."""
+        parts = list(parts)
+        if not parts:
+            return []
+        for part in parts:
+            self.close_part(part)
+        removed = self.remove_wires({w for part in parts for pin in part.pins for w in self._at.get(pin, ())})
+        for part in parts:
+            del self._parts[part]
+            del self.part_by_uid[part.uid]
         self.revision += 1
-        tree = self._tree(part)
+        tree = [p for part in parts for p in self._tree(part)]
         self._pins.alive[[pin.slot for p in tree for pin in p.pins]] = False
         self._wire_slots.alive[[w.slot for p in tree for w in p.inner_wires]] = False
         self._settle[[p.slot for p in tree]] = 0
         for p in tree:
             self._macros.pop(p, None)
-        if part.inner:  # a macro instance: its insides go too
+        if any(part.inner for part in parts):  # macro instances: their insides go too
             dead = set(tree)
             dead_wires = {w for p in dead for w in p.inner_wires}
             self.hidden_parts = [p for p in self.hidden_parts if p not in dead]
@@ -443,12 +449,19 @@ class Circuit:
 
     def remove_wire(self, wire: Wire) -> list[Wire]:
         """Removes the wire and everything attached to it. Returns them, parents first."""
-        removed = [wire, *self.descendants(wire)]
+        return self.remove_wires([wire])
+
+    def remove_wires(self, wires: Iterable[Wire]) -> list[Wire]:
+        """remove_wire for many wires at once (ones already gone are skipped)."""
+        wires = [w for w in wires if w in self._wires]
+        if not wires:
+            return []
+        removed = _by_uid({*wires, *self.descendants(*wires)})
         for w in removed:
             del self._wires[w]
             del self.wire_by_uid[w.uid]
             self._unlink(w)
-            self._wire_slots.alive[w.slot] = False
+        self._wire_slots.alive[[w.slot for w in removed]] = False
         self._nets_dirty = True
         self.revision += 1
         return removed

@@ -92,6 +92,17 @@ class SpatialIndex:
         for row in self.where.pop(obj, ()):
             self._release(row)
 
+    def remove_many(self, objs: Iterable[Hashable]) -> None:
+        pop = self.where.pop
+        rows = [r for obj in objs for r in pop(obj, ())]
+        if rows:
+            owner = self._owner
+            for r in rows:
+                owner[r] = None
+            self._free.extend(rows)
+            rows = np.array(rows, np.intp)
+            self._cols[:2, rows], self._cols[2:, rows] = np.inf, -np.inf
+
     def shift(self, objs: Iterable[Hashable], dx: float, dy: float) -> None:
         """Move these objects' boxes by (dx, dy), all at once."""
         where = self.where
