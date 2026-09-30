@@ -64,6 +64,8 @@ Controls
                            current one (Enter keeps it; type another to save a copy)
   Ctrl+O                   open a macro: type to filter, arrows + Enter (or click); saved macros
                            are also in the picker's MACROS section: right-click -> Open
+                           (or Rename..., which changes only its title: boards using it
+                           keep working)
   Ctrl+N                   new, empty board
   Tab                      pin names on placed parts: hidden -> on hover -> always -> hidden
                            (opening, new and closing the window ask first if there are unsaved changes)
@@ -231,7 +233,7 @@ class Editor(pyglet.window.Window):
             1280, 720, caption="pijl", resizable=True, vsync=True, config=_make_config()
         )
         # the open document: a macro, or an untitled board (set early: the picker asks about it)
-        self.doc: str | None = None  # its name; None = untitled
+        self.doc: str | None = None  # its macro's id (see storage.py); None = untitled
         self.saved_state = 0  # history.state of what's on disk (dirty = it differs)
         self.load_problems: list[str] = []
         try:
@@ -265,7 +267,7 @@ class Editor(pyglet.window.Window):
             self.height,
             self._pixel_ratio(),
             swatch=self._swatch,
-            name_of=lambda entry: entry.removeprefix(MACRO),
+            name_of=self._entry_title,
             disabled=self._unplaceable,
         )
         # Screen-space things that belong to the board, drawn over the HUD: the selection
@@ -1666,10 +1668,13 @@ class Editor(pyglet.window.Window):
                 MenuItem("Move to new collection", lambda: into_new_collection(p, at))
             ]
             if p.startswith(MACRO):
-                items.insert(
-                    0,
+                items[:0] = [
                     MenuItem("Open", lambda: self._request_open(p.removeprefix(MACRO))),
-                )
+                    MenuItem(
+                        "Rename...",
+                        lambda: self._rename_macro_dialog(p.removeprefix(MACRO)),
+                    ),
+                ]
             if hit.collection is not None:
                 items.append(MenuItem("Remove from collection", lambda: move(p, None)))
             if p.startswith(MACRO):  # part scripts (shipped or the user's own) never
@@ -1695,7 +1700,7 @@ class Editor(pyglet.window.Window):
 
     def _delete_macros_dialog(self, names: list[str]) -> None:
         forever = self._shift()
-        what = names[0] if len(names) == 1 else f"{len(names)} macros"
+        what = self._title(names[0]) if len(names) == 1 else f"{len(names)} macros"
         self._confirm_delete(
             f"Delete {what}{' permanently' if forever else ''}?",
             [self._usage(names), _where_to(forever)],
@@ -1747,12 +1752,12 @@ class Editor(pyglet.window.Window):
         self._open_prompt(p, enter)
 
     def _usage(self, names: list[str]) -> str:
-        """What else the macros `names` are in: other saved macros (at any depth) and
-        the open board. "" if nothing."""
+        """What else the macros `names` (ids) are in: other saved macros (at any depth)
+        and the open board. "" if nothing."""
         gone = {n.casefold() for n in names}
         users = [
-            outer
-            for outer in self.store.names()
+            self._title(outer)
+            for outer in self.store.ids()
             if outer.casefold() not in gone
             and any(self.catalog.book.contains(outer, n) for n in names)
         ]
@@ -1778,11 +1783,12 @@ class Editor(pyglet.window.Window):
         together with whatever the library went through since the last one."""
         trash = None if forever else self.project.trash_dir
         trashed = []
+        titles = {name: self._title(name) for name in names}  # (before the files go)
         for name in names:
             try:
                 where = self.store.remove(name, trash)
             except OSError as e:
-                self._report(f"couldn't delete {name}: {e}")
+                self._report(f"couldn't delete {titles[name]}: {e}")
                 continue
             trashed.append([name, str(where)])
         done = [name for name, _ in trashed]
@@ -1790,7 +1796,7 @@ class Editor(pyglet.window.Window):
         self.catalog.book.forget()
         self._sync_library(None if forever else trashed)
         if done and len(done) == len(names):
-            what = done[0] if len(done) == 1 else _n(len(done), "macro")
+            what = titles[done[0]] if len(done) == 1 else _n(len(done), "macro")
             self._notice(
                 f"deleted {what}"
                 if forever
@@ -1847,14 +1853,21 @@ class Editor(pyglet.window.Window):
             try:
                 if undo:
                     self.store.put_back(name, Path(where))
+                    title = self._title(name)
                 else:
+                    title = self._title(name)
                     entry[1] = str(self.store.remove(name, self.project.trash_dir))
                     self._forget_doc([name])
             except OSError as e:
                 self._report(f"couldn't {'put back' if undo else 'delete'} {name}: {e}")
                 continue
-            moved.append(name)
+            moved.append(title)
+        renamed = self._retitle(
+            [(id, old if undo else new) for id, old, new in step.retitled]
+        )
         self.catalog.book.forget()
+        if renamed:
+            self._rebuild_macros(renamed)
         self.library.restore(
             step.before if undo else step.after, self._library_entries()
         )
@@ -1866,6 +1879,94 @@ class Editor(pyglet.window.Window):
             self._notice(
                 f"put {what} back" if undo else f"moved {what} to the trash again"
             )
+        elif renamed:
+            self._notice(
+                f"renamed it back to {self._title(renamed[0])}"
+                if undo
+                else f"renamed it to {self._title(renamed[0])}"
+            )
+
+    # ---- renaming macros ----------------------------------------------------------
+    # Only the title in the macro's file changes (see storage.py): nothing that uses
+    # it needs rewriting. Undoable, as a library step.
+
+    def _rename_macro_dialog(self, id: str) -> None:
+        old = self._title(id)
+        p = Prompt(
+            self.hud,
+            self.width,
+            self.height,
+            f"Rename {old}",
+            text=old,
+            max_len=NAME_MAX,
+            hint="Enter: rename   Esc: cancel",
+        )
+
+        def enter(p: Prompt) -> None:
+            try:
+                title = check_name(p.text)
+            except ValueError as e:
+                p.set_hint(str(e), danger=True)
+                return
+            taken = self.store.find(title)
+            if taken is not None and taken != id:
+                p.set_hint(f"{self._title(taken)} already exists", danger=True)
+                return
+            self._close_prompt()
+            if title == old:
+                return
+            if self._retitle([(id, title)]):
+                self.catalog.book.forget()
+                self._rebuild_macros([id])
+                self.library.sync(self._library_entries())
+                self.lib_history.record(
+                    self.library.to_dict(), retitled=[(id, old, title)]
+                )
+                self.history.redo_stack.clear()  # (see _record_touched)
+                self.picker.refresh()
+                self._notice(f"renamed {old} to {title}")
+
+        self._open_prompt(p, enter)
+
+    def _retitle(self, titles: list[tuple[str, str]]) -> list[str]:
+        """Give macros (id, title) those titles. Returns the ids that took it; the others
+        are reported (can't write the file, or the title is someone else's by now)."""
+        done = []
+        for id, title in titles:
+            taken = self.store.find(title)
+            if taken is not None and taken != id:
+                self._report(
+                    f"can't rename {self._title(id)} to {title}: that's taken now"
+                )
+                continue
+            try:
+                self.store.retitle(id, title)
+            except (OSError, FormatError) as e:
+                self._report(f"couldn't rename {self._title(id)}: {e}")
+                continue
+            done.append(id)
+        return done
+
+    def _rebuild_macros(self, ids: list[str]) -> None:
+        """Build the board's copies of these macros again, from their definitions now:
+        a new title is drawn on them, and a longer one widens them. The board itself
+        (the snapshot) doesn't change, so neither does its undo history."""
+        kinds = {MACRO + id for id in ids}
+        snap = capture(self)
+        uids = [uid for uid, d in snap.parts.items() if d[0] in kinds]
+        if not uids:
+            return
+        self._cancel()
+        self.selection.clear()
+        self.tiling = None
+        # (no wires in `without`: only the parts' are looked at, and those all go)
+        without = Snapshot(
+            {u: d for u, d in snap.parts.items() if u not in set(uids)}, {}
+        )
+        restore(self, without, only=(uids, ()))  # (their wires go with them...)
+        restore(self, snap, only=(uids, snap.wires.keys()))  # (...and come back)
+        Touched.take()
+        paint(self)
 
     def _start_rename(self, c, fresh: bool = False) -> None:
         self.picker.start_rename(c, fresh)
@@ -1888,7 +1989,7 @@ class Editor(pyglet.window.Window):
     def _start_placing(self, kind: str) -> None:
         if self._unplaceable(kind):
             self._notice(
-                f"{kind.removeprefix(MACRO)} can't go in here: it contains {self.doc}"
+                f"{self._entry_title(kind)} can't go in here: it contains {self.doc_title}"
                 if kind != MACRO + self.doc
                 else "a macro can't contain itself"
             )
@@ -1897,7 +1998,7 @@ class Editor(pyglet.window.Window):
             self.catalog.get(kind)
         except KeyError as e:
             self._report(
-                f"can't place {kind.removeprefix(MACRO)}: {e.args[0] if e.args else e}"
+                f"can't place {self._entry_title(kind)}: {e.args[0] if e.args else e}"
             )
             return
         self._carry(
@@ -2494,13 +2595,13 @@ class Editor(pyglet.window.Window):
         """Reopen what was open last time. With nothing to reopen: an untitled board,
         with the demo on it if there are no macros at all yet (a first run)."""
         self.history = History(EMPTY)
-        name = self.project.last_open()
-        name = name and self.store.find(name)
-        if name:
-            self._load(name)
+        id = self.project.last_open()
+        id = id and self.store.find_id(id)
+        if id:
+            self._load(id)
             if self.doc is not None:
                 return
-        if not self.store.names():
+        if not self.store.ids():
             self._build_demo()
         self._reset_history(None)
         self.camera.center_on(*HOME, self.width, self.height)
@@ -2541,9 +2642,10 @@ class Editor(pyglet.window.Window):
         self.tiling = None
         restore(self, EMPTY)  # removes (and closes) everything
 
-    def _load(self, name: str) -> None:
+    def _load(self, id: str) -> None:
+        name = self._title(id)
         try:
-            loaded = self.store.load(name, self.catalog)
+            loaded = self.store.load(id, self.catalog)
         except (OSError, FormatError) as e:
             self._report(f"can't open {name}: {e}")
             return
@@ -2551,8 +2653,8 @@ class Editor(pyglet.window.Window):
         restore(self, loaded.snapshot)
         # Undo starts at what was actually built, which is also what counts as saved:
         # if the file needed repairs, the board shows them and saving writes them.
-        self._reset_history(name)
-        self.project.remember_open(name)
+        self._reset_history(id)
+        self.project.remember_open(id)
         self._fit_camera()
         if loaded.warnings:
             for w in loaded.warnings:
@@ -2574,7 +2676,7 @@ class Editor(pyglet.window.Window):
         self.camera.center_on(*HOME, self.width, self.height)
 
     def _save(self, then=None) -> None:
-        """Save under the current name (asking for one if untitled), then call `then`."""
+        """Save under the current title (asking for one if untitled), then call `then`."""
         if self.doc is None:
             self._save_as(then)
         elif self._write(self.doc) and then is not None:
@@ -2586,63 +2688,65 @@ class Editor(pyglet.window.Window):
             self.width,
             self.height,
             "Save macro as",
-            text=self.doc or "",
+            text=self.doc_title or "",
             max_len=NAME_MAX,
             hint="Enter: save   Esc: cancel",
         )
-        confirmed = [None]  # the existing name the user already agreed to overwrite
+        confirmed = [None]  # the existing title the user already agreed to overwrite
 
         def enter(p: Prompt) -> None:
             try:
-                name = check_name(p.text)
+                title = check_name(p.text)
             except ValueError as e:
                 p.set_hint(str(e), danger=True)
                 return
-            existing = self.store.find(name)
-            mine = (
-                self.doc is not None
-                and existing is not None
-                and existing.casefold() == self.doc.casefold()
-            )
-            if existing is not None and not mine and confirmed[0] != name:
-                confirmed[0] = name
+            existing = self.store.find(title)  # (its id)
+            mine = existing is not None and existing == self.doc
+            if existing is not None and not mine and confirmed[0] != title:
+                confirmed[0] = title
                 p.set_hint(
-                    f"{existing} already exists. Enter again to overwrite it.",
+                    f"{self._title(existing)} already exists. Enter again to overwrite it.",
                     danger=True,
                 )
                 return
             self._close_prompt()
-            if self._write(name) and then is not None:
+            # Its own title (maybe recapitalized) or another macro's: into that file.
+            # A new title: a new macro, and this one stays as it was on disk.
+            id = existing if existing is not None else self.store.new_id(title)
+            if self._write(id, title) and then is not None:
                 then()
 
         self._open_prompt(p, enter)
 
-    def _write(self, name: str) -> bool:
+    def _write(self, id: str, title: str | None = None) -> bool:
+        """Save the board as macro `id` (titled `title`; None keeps its title)."""
         snap = self.history.current
-        name = check_name(name)
+        id = check_name(id)
+        shown = title or self._title(id)
         for kind in {d[0] for d in snap.parts.values() if d[0].startswith(MACRO)}:
             inner = kind.removeprefix(MACRO)
-            if inner.casefold() == name.casefold() or self.catalog.book.contains(
-                inner, name
+            if inner.casefold() == id.casefold() or self.catalog.book.contains(
+                inner, id
             ):
                 self._report(
-                    f"can't save as {name}: the board has {inner} on it, which would then contain itself"
+                    f"can't save as {shown}: the board has {self._title(inner)} on it, which would then contain itself"
                 )
                 return False
         try:
-            self.store.save(name, snap, self.catalog)
+            self.store.save(id, snap, self.catalog, title)
         except (OSError, ValueError, KeyError) as e:
-            self._report(f"couldn't save {name}: {e}")
+            self._report(f"couldn't save {shown}: {e}")
             return False
         self.catalog.book.forget()  # definitions changed; boards opened later see the new version
-        self.doc, self.saved_state = check_name(name), self.history.state
+        self.doc, self.saved_state = id, self.history.state
         self.project.remember_open(self.doc)
         self._sync_library()
-        self._notice(f"saved {self.doc}")
+        self._notice(f"saved {self.doc_title}")
         return True
 
     def _open_dialog(self) -> None:
-        names = self.store.names()
+        by_title = {t: id for id, t in self.store.titles().items()}
+        names = list(by_title)
         p = Prompt(
             self.hud,
             self.width,
@@ -2660,19 +2764,19 @@ class Editor(pyglet.window.Window):
         def enter(p: Prompt) -> None:
             if p.choice is not None:
                 self._close_prompt()
-                self._request_open(p.choice)
+                self._request_open(by_title[p.choice])
 
         self._open_prompt(p, enter)
 
-    def _request_open(self, name: str) -> None:
+    def _request_open(self, id: str) -> None:
         if (
             self.doc is not None
-            and name.casefold() == self.doc.casefold()
+            and id.casefold() == self.doc.casefold()
             and not self.dirty
         ):
-            self._notice(f"{name} is already open")
+            self._notice(f"{self._title(id)} is already open")
             return
-        self._unsaved_then(lambda: self._load(name))
+        self._unsaved_then(lambda: self._load(id))
 
     def _unsaved_then(self, then) -> None:
         """Run `then` -- right away, or once unsaved changes are saved or discarded."""
@@ -2693,7 +2797,7 @@ class Editor(pyglet.window.Window):
             self.hud,
             self.width,
             self.height,
-            f"Unsaved changes to {self.doc or 'the untitled board'}",
+            f"Unsaved changes to {self.doc_title or 'the untitled board'}",
             hint="Enter: save them   D: discard them   Esc: cancel",
         )
         self._open_prompt(p, save, discard)
@@ -2711,11 +2815,12 @@ class Editor(pyglet.window.Window):
         self.mode = Mode.IDLE
 
     def _update_caption(self) -> None:
-        state = (self.history.state, self.saved_state, self.doc, self.project)
+        title = self.doc_title
+        state = (self.history.state, self.saved_state, title, self.project)
         if state == self._caption_for:
             return  # nothing changed since last frame
         self._caption_for = state
-        name = f"{self.doc or 'untitled'}{' *' if self.dirty else ''}"
+        name = f"{title or 'untitled'}{' *' if self.dirty else ''}"
         self.set_caption(f"pijl - {name}")
         self.bar.set_doc(f"{self.project.name} / {name}")
 
@@ -2751,7 +2856,9 @@ class Editor(pyglet.window.Window):
         self.store = MacroStore(project.macros_dir)
         # Part scripts plus macros. A macro's definition is read from its file when first needed.
         self.catalog = Catalog(
-            self.parts, lambda name: self.store.load(name, self.catalog).snapshot
+            self.parts,
+            lambda name: self.store.load(name, self.catalog).snapshot,
+            self.store.title,
         )
         self.circuit = Circuit(self.catalog, settle_ticks=SETTLE_TICKS)
 
@@ -2841,8 +2948,22 @@ class Editor(pyglet.window.Window):
 
     def _library_entries(self) -> list[tuple[str, str]]:
         return [(t.kind, t.category) for t in self.parts] + [
-            (MACRO + name, MACROS) for name in self.store.names()
+            (MACRO + id, MACROS) for id in self.store.ids()
         ]
+
+    def _title(self, id: str) -> str:
+        """What macro `id` is called (see storage.py: ids vs titles)."""
+        return self.store.title(id)
+
+    def _entry_title(self, entry: str) -> str:
+        """A library entry as the picker shows it: a macro's title, a part's kind."""
+        return (
+            self._title(entry.removeprefix(MACRO)) if entry.startswith(MACRO) else entry
+        )
+
+    @property
+    def doc_title(self) -> str | None:
+        return None if self.doc is None else self._title(self.doc)
 
     def _load_library(self) -> Library:
         entries = self._library_entries()

@@ -85,6 +85,10 @@ CONTROLS: list[tuple[str, list[tuple[str, str]]]] = [
             ("Ctrl+S", "save the board as a macro (Enter keeps the name)"),
             ("Ctrl+O", "open a macro (or right-click it in the picker -> Open)"),
             ("Ctrl+N", "new, empty board"),
+            (
+                "right-click a macro",
+                "in the picker: Rename... (boards using it keep it)",
+            ),
             ("cogwheel -> Projects", "switch to another project, or make a new one"),
         ],
     ),

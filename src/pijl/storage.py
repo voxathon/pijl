@@ -1,13 +1,18 @@
 """Macro files: reading and writing boards on disk. Pure data, no pyglet.
 
-Every saved board is a macro: projects/<name>/macros/<macro name>.json. The file
-name *is* the macro's name, so there's exactly one place a name lives.
+Every saved board is a macro: projects/<name>/macros/<id>.json. The file name is
+the macro's *id*: what other boards (and library.json) refer to it by, which never
+changes. What the user sees is its *title*, kept inside the file, so renaming a
+macro rewrites one line of one file and nothing that uses it. A new macro's id is
+its first title (numbered if that file is taken); a file without a title shows
+its id. Titles are unique in a project, ignoring case.
 
 Format (version 1). One part / wire per line and a fixed order, so files diff
 nicely in git:
 
     {
       "pijl": 1,
+      "title": "half adder",
       "parts": [
         {"uid": 1, "kind": "IN", "label": "a", "pos": [200, 360]},
         {"uid": 3, "kind": "NAND", "pos": [380, 280]}
@@ -69,14 +74,16 @@ class FormatError(ValueError):
 class Loaded:
     snapshot: Snapshot
     warnings: list[str] = field(default_factory=list)
+    title: str | None = None  # None: the file doesn't have one
 
 
 # ---- names ---------------------------------------------------------------------
 
 
 def check_name(name: str) -> str:
-    """The cleaned-up macro name, or ValueError saying what's wrong with it.
-    Names are file names, so Windows' rules apply."""
+    """The cleaned-up macro title (or project name), or ValueError saying what's
+    wrong with it. New macros' ids are made from titles and ids are file names, so
+    Windows' rules apply."""
     name = name.strip()
     if not name:
         raise ValueError("type a name")
@@ -95,7 +102,9 @@ def check_name(name: str) -> str:
 # ---- snapshot <-> dict -----------------------------------------------------------
 
 
-def encode(snap: Snapshot, types: Registry | None = None) -> dict[str, Any]:
+def encode(
+    snap: Snapshot, types: Registry | None = None, title: str | None = None
+) -> dict[str, Any]:
     """`types` is needed only if the board has macros on it (for their pin uids)."""
     parts = []
     for uid in sorted(snap.parts):
@@ -124,7 +133,10 @@ def encode(snap: Snapshot, types: Registry | None = None) -> dict[str, Any]:
         if uid in snap.wire_colors:
             d["color"] = snap.wire_colors[uid]
         wires.append(d)
-    return {"pijl": FORMAT, "parts": parts, "wires": wires}
+    head: dict[str, Any] = {"pijl": FORMAT}
+    if title is not None:
+        head["title"] = title
+    return {**head, "parts": parts, "wires": wires}
 
 
 def decode(data: Any, types: Registry) -> Loaded:
@@ -138,7 +150,7 @@ def decode(data: Any, types: Registry) -> Loaded:
         raise FormatError(
             f"made by a newer pijl (format {version}; this one reads up to {FORMAT})"
         )
-    out = Loaded(Snapshot({}, {}))
+    out = Loaded(Snapshot({}, {}), title=_title(data))
     warn = out.warnings.append
 
     kinds: dict[int, Any] = {}  # part uid -> its PartType, for checking pin indices
@@ -232,6 +244,11 @@ def dumps(data: dict[str, Any]) -> str:
         '{\n  "pijl": '
         + json.dumps(data["pijl"])
         + ",\n"
+        + (
+            f'  "title": {json.dumps(data["title"], ensure_ascii=False)},\n'
+            if "title" in data
+            else ""
+        )
         + block("parts")
         + ",\n"
         + block("wires")
@@ -243,40 +260,102 @@ def dumps(data: dict[str, Any]) -> str:
 
 
 class MacroStore:
-    """The macros of one project: one .json file per macro, named after it."""
+    """The macros of one project: one .json file per macro, named after its id.
+    Methods take ids, except find() and new_id(), which take titles."""
 
     def __init__(self, folder: Path) -> None:
         self.folder = Path(folder)
+        # id -> (the file's mtime, its title): titles are read once per change to the
+        # file, not every time the picker asks for one
+        self._titles: dict[str, tuple[int, str]] = {}
 
-    def names(self) -> list[str]:
+    def ids(self) -> list[str]:
         if not self.folder.is_dir():
             return []
         return sorted((p.stem for p in self.folder.glob("*.json")), key=str.casefold)
 
-    def find(self, name: str) -> str | None:
-        """The saved macro whose name matches `name` ignoring case (file names on
-        Windows do), or None."""
-        key = name.strip().casefold()
-        return next((n for n in self.names() if n.casefold() == key), None)
+    def title(self, id: str) -> str:
+        """What the macro is called (its id if the file has no title, or can't be read)."""
+        try:
+            mtime = self.path(id).stat().st_mtime_ns
+        except (OSError, ValueError):
+            return id
+        cached = self._titles.get(id)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        title = _read_title(self.path(id)) or id
+        self._titles[id] = (mtime, title)
+        return title
 
-    def path(self, name: str) -> Path:
-        return self.folder / f"{check_name(name)}.json"
+    def titles(self) -> dict[str, str]:
+        """id -> title for every macro, in title order."""
+        out = {id: self.title(id) for id in self.ids()}
+        return dict(sorted(out.items(), key=lambda item: item[1].casefold()))
 
-    def save(self, name: str, snap: Snapshot, types: Registry | None = None) -> None:
-        name = check_name(name)
-        old = self.find(name)
-        if old is not None and old != name:
+    def find(self, title: str) -> str | None:
+        """The id of the macro titled `title` (ignoring case), or None."""
+        key = title.strip().casefold()
+        return next(
+            (id for id, t in self.titles().items() if t.casefold() == key), None
+        )
+
+    def find_id(self, id: str) -> str | None:
+        """The id as spelled on disk of the macro `id` (ignoring case, like file names
+        on Windows), or None if there's no such file."""
+        key = id.casefold()
+        return next((i for i in self.ids() if i.casefold() == key), None)
+
+    def new_id(self, title: str) -> str:
+        """An id for a new macro titled `title`: the title, numbered if that file is taken."""
+        title = check_name(title)
+        taken = {i.casefold() for i in self.ids()}
+        id, n = title, 1
+        while id.casefold() in taken:
+            n += 1
+            suffix = f" ({n})"
+            id = title[: NAME_MAX - len(suffix)].rstrip(" .") + suffix
+        return id
+
+    def path(self, id: str) -> Path:
+        return self.folder / f"{check_name(id)}.json"
+
+    def save(
+        self,
+        id: str,
+        snap: Snapshot,
+        types: Registry | None = None,
+        title: str | None = None,
+    ) -> None:
+        """Write macro `id`; `title` None keeps the one it has (a new one: its id)."""
+        id = check_name(id)
+        title = check_name(title) if title is not None else self.title(id)
+        old = self.find_id(id)
+        if old is not None and old != id:
             self.path(
                 old
-            ).unlink()  # same name, new capitalization: rename, don't keep the old spelling
+            ).unlink()  # same id, new capitalization: rename, don't keep the old spelling
         self.folder.mkdir(parents=True, exist_ok=True)
-        write_atomic(self.path(name), dumps(encode(snap, types)))
+        write_atomic(self.path(id), dumps(encode(snap, types, title)))
+        self._titles.pop(id, None)
 
-    def remove(self, name: str, trash: Path | None) -> Path | None:
+    def retitle(self, id: str, title: str) -> None:
+        """Rename macro `id`: only the title in its file changes. FormatError / OSError
+        if the file can't be read or written."""
+        title = check_name(title)
+        data = _read(self.path(id))
+        if not isinstance(data, dict) or "pijl" not in data:
+            raise FormatError("not a pijl macro file")
+        data["title"] = title
+        for key in ("parts", "wires"):
+            data.setdefault(key, [])
+        write_atomic(self.path(id), dumps(data))
+        self._titles.pop(id, None)
+
+    def remove(self, id: str, trash: Path | None) -> Path | None:
         """Delete a macro's file: moved into the folder `trash` (made if needed; a
         numbered name if that's taken), or gone for good if `trash` is None.
         Returns where it went. OSError if it can't."""
-        src = self.path(name)
+        src = self.path(id)
         if trash is None:
             src.unlink()
             return None
@@ -288,21 +367,44 @@ class MacroStore:
         os.replace(src, dest)
         return dest
 
-    def put_back(self, name: str, trashed: Path) -> None:
-        """Undo remove(): the file at `trashed` becomes macro `name` again.
-        FileExistsError if there's a macro by that name now; OSError if it can't."""
-        if self.find(name) is not None:
-            raise FileExistsError(f"there's a macro called {self.find(name)} now")
+    def put_back(self, id: str, trashed: Path) -> None:
+        """Undo remove(): the file at `trashed` becomes macro `id` again.
+        FileExistsError if that id or its title is taken now; OSError if it can't."""
+        title = _read_title(trashed) or id
+        taken = self.find(title)
+        if taken is not None:
+            raise FileExistsError(f"there's a macro called {self.title(taken)} now")
+        if self.find_id(id) is not None:
+            raise FileExistsError(f"there's a macro with the file {id}.json now")
         self.folder.mkdir(parents=True, exist_ok=True)
-        os.replace(trashed, self.path(name))
+        os.replace(trashed, self.path(id))
 
-    def load(self, name: str, types: Registry) -> Loaded:
+    def load(self, id: str, types: Registry) -> Loaded:
         """FormatError / OSError if the file can't be used at all."""
-        try:
-            data = json.loads(self.path(name).read_text(encoding="utf-8"))
-        except json.JSONDecodeError as e:
-            raise FormatError(f"not valid JSON ({e.msg}, line {e.lineno})") from None
-        return decode(data, types)
+        return decode(_read(self.path(id)), types)
+
+
+def _read(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise FormatError(f"not valid JSON ({e.msg}, line {e.lineno})") from None
+
+
+def _read_title(path: Path) -> str | None:
+    try:
+        data = _read(path)
+    except (OSError, FormatError):
+        return None
+    return _title(data) if isinstance(data, dict) else None
+
+
+def _title(data: dict) -> str | None:
+    """A file's title, if it has a usable one."""
+    try:
+        return check_name(data["title"])
+    except (KeyError, TypeError, AttributeError, ValueError):
+        return None
 
 
 # ---- helpers ----------------------------------------------------------------------

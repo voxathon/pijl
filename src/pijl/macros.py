@@ -30,10 +30,12 @@ class CycleError(KeyError):
 
 
 class MacroType(PartType):
-    def __init__(self, name: str, body: Snapshot, catalog: Catalog) -> None:
-        self.name = name
+    def __init__(
+        self, name: str, body: Snapshot, catalog: Catalog, title: str | None = None
+    ) -> None:
+        self.name = name  # its id (see storage.py): what boards refer to it by
         self.kind = MACRO + name
-        self.title = name
+        self.title = title or name  # what it's called
         self.body = body
         self.look = Look(
             label="below", swatch="MACRO_SWATCH", body="MACRO_BODY", pin_labels=True
@@ -63,12 +65,19 @@ def _names(body: Snapshot, ids: tuple[int, ...]) -> tuple[str, ...]:
 
 
 class MacroBook:
-    """Macro definitions by name, loaded when first needed. `load(name)` gives a
-    macro's body Snapshot, or raises (KeyError / OSError / ValueError) if it can't."""
+    """Macro definitions by name (id), loaded when first needed. `load(name)` gives a
+    macro's body Snapshot, or raises (KeyError / OSError / ValueError) if it can't;
+    `title_of(name)` what it's called."""
 
-    def __init__(self, catalog: Catalog, load: Callable[[str], Snapshot]) -> None:
+    def __init__(
+        self,
+        catalog: Catalog,
+        load: Callable[[str], Snapshot],
+        title_of: Callable[[str], str] | None = None,
+    ) -> None:
         self.catalog = catalog
         self.load = load
+        self.title_of = title_of or (lambda name: name)
         self._types: dict[str, MacroType] = {}
         self._loading: list[
             str
@@ -92,7 +101,7 @@ class MacroBook:
                 raise KeyError(
                     f"macro {name!r}: {e.args[0] if isinstance(e, KeyError) and e.args else e}"
                 ) from None
-            t = MacroType(name, body, self.catalog)
+            t = MacroType(name, body, self.catalog, self.title_of(name))
         finally:
             self._loading.pop()
         self._types[name] = t
@@ -122,9 +131,14 @@ class MacroBook:
 class Catalog:
     """Every kind of part that exists: the part scripts' types plus macros ("macro:<name>")."""
 
-    def __init__(self, registry: Registry, load: Callable[[str], Snapshot]) -> None:
+    def __init__(
+        self,
+        registry: Registry,
+        load: Callable[[str], Snapshot],
+        title_of: Callable[[str], str] | None = None,
+    ) -> None:
         self.registry = registry
-        self.book = MacroBook(self, load)
+        self.book = MacroBook(self, load, title_of)
 
     def get(self, kind: str) -> PartType:
         if kind.startswith(MACRO):

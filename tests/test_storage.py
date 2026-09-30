@@ -175,10 +175,10 @@ def test_good_names_are_trimmed():
 
 def test_store_saves_lists_and_loads(tmp_path):
     store = MacroStore(tmp_path / "macros")
-    assert store.names() == []
+    assert store.ids() == []
     store.save("half adder", board())
     store.save("Alu", Snapshot({}, {}))
-    assert store.names() == ["Alu", "half adder"]
+    assert store.ids() == ["Alu", "half adder"]
     assert store.load("half adder", REG).snapshot == board()
     assert not list((tmp_path / "macros").glob("*.tmp"))
 
@@ -188,7 +188,7 @@ def test_names_match_ignoring_case_and_resaving_renames(tmp_path):
     store.save("adder", board())
     assert store.find("ADDER") == "adder" and store.find("subtractor") is None
     store.save("Adder", Snapshot({}, {}))
-    assert store.names() == ["Adder"]
+    assert store.ids() == ["Adder"]
     assert store.load("Adder", REG).snapshot == Snapshot({}, {})
 
 
@@ -198,7 +198,7 @@ def test_remove_moves_to_the_trash_without_clobbering(tmp_path):
     assert store.remove("adder", trash) == trash / "adder.json"
     store.save("adder", Snapshot({}, {}))
     assert store.remove("adder", trash) == trash / "adder (2).json"
-    assert store.names() == []
+    assert store.ids() == []
     assert MacroStore(trash).load("adder", REG).snapshot == board()
 
 
@@ -227,3 +227,40 @@ def test_broken_file_raises_format_error(tmp_path):
     (tmp_path / "bad.json").write_text("{ not json")
     with pytest.raises(FormatError, match="JSON"):
         store.load("bad", REG)
+
+
+def test_titles_live_in_the_file_and_default_to_the_id(tmp_path):
+    store = MacroStore(tmp_path)
+    store.save("adder", board(), title="Half Adder")
+    (tmp_path / "old.json").write_text('{"pijl": 1, "parts": [], "wires": []}')
+    assert store.titles() == {"adder": "Half Adder", "old": "old"}
+    assert store.find("half adder") == "adder" and store.find("adder") is None
+    assert '"title": "Half Adder"' in (tmp_path / "adder.json").read_text()
+    store.save("adder", Snapshot({}, {}))  # no title: keeps the one it has
+    assert store.title("adder") == "Half Adder"
+
+
+def test_retitle_changes_only_the_title(tmp_path):
+    store = MacroStore(tmp_path)
+    store.save("adder", board())
+    store.retitle("adder", "sum")
+    assert store.ids() == ["adder"] and store.title("adder") == "sum"
+    loaded = store.load("adder", REG)
+    assert loaded.snapshot == board() and loaded.title == "sum"
+
+
+def test_new_ids_are_numbered_when_the_file_is_taken(tmp_path):
+    store = MacroStore(tmp_path)
+    assert store.new_id("adder") == "adder"
+    store.save("adder", board(), title="sum")
+    assert store.new_id("Adder") == "Adder (2)"
+    assert len(store.new_id("x" * 40)) == 40
+
+
+def test_put_back_refuses_a_title_thats_taken_now(tmp_path):
+    store, trash = MacroStore(tmp_path / "macros"), tmp_path / "trash"
+    store.save("adder", board(), title="sum")
+    trashed = store.remove("adder", trash)
+    store.save("other", Snapshot({}, {}), title="SUM")
+    with pytest.raises(FileExistsError):
+        store.put_back("adder", trashed)

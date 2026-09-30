@@ -176,12 +176,14 @@ def layout(data: dict) -> dict:
 @dataclass
 class Step:
     """One undo step of the library: the arrangement before and after (to_dict()s),
-    and the macros it moved to the trash: [name, where the file is now in the trash]."""
+    the macros it moved to the trash: [id, where the file is now in the trash], and
+    the ones it renamed: (id, old title, new title)."""
 
     stamp: int  # when it happened, on the same clock as the board's history
     before: dict
     after: dict
     trashed: list[list] = field(default_factory=list)
+    retitled: list[tuple[str, str, str]] = field(default_factory=list)
 
 
 class LibraryHistory:
@@ -198,12 +200,19 @@ class LibraryHistory:
         self.undo_stack: list[Step] = []
         self.redo_stack: list[Step] = []
 
-    def record(self, now: dict, trashed: list[list] | None = None) -> bool:
+    def record(
+        self,
+        now: dict,
+        trashed: list[list] | None = None,
+        retitled: list[tuple[str, str, str]] | None = None,
+    ) -> bool:
         """A new step from `current` to `now`; no-op (False) if nothing changed."""
-        if not trashed and layout(now) == layout(self.current):
+        if not trashed and not retitled and layout(now) == layout(self.current):
             self.current = now  # (expanded / collapsed: kept, but not a step)
             return False
-        self.undo_stack.append(Step(self.stamp(), self.current, now, trashed or []))
+        self.undo_stack.append(
+            Step(self.stamp(), self.current, now, trashed or [], retitled or [])
+        )
         del self.undo_stack[: -self.limit]
         self.redo_stack.clear()
         self.current = now
