@@ -75,14 +75,21 @@ Controls
   Ctrl+Z / Ctrl+Y          undo / redo (also Ctrl+Shift+Z). During an action, Ctrl+Z cancels it.
                            Every finished edit is recorded automatically; see document.py.
   right-drag empty space   pan (middle-drag pans in any mode)
+  W A S D                  move the view (slower than dragging; speed in theme.py)
   hold Ctrl                snap parts and wire bends to the grid
   hold Ctrl+Shift          snap to the finer subgrid instead
   scroll                   zoom
   Home                     reset the camera
-  M                        minimap (top right): press (any button) or drag in it to go there;
-                           works mid-action too, like panning
-  G                        lens: magnifies the board around the cursor. Hold G + scroll, or
-                           scroll on the lens or the minimap, to change how much (see minimap.py)
+  Ctrl+Home                fit the camera to the parts (with a margin)
+  G                        miniview (top right): the board around the cursor again, at its
+                           own zoom (see miniview.py). Press (any button) or drag in it to go
+                           there; works mid-action too, like panning.
+    scroll on it, G+scroll its zoom (closer than the view, or further out: a map)
+    arrow keys             move it instead: it parks there (stops following the cursor)
+    hold G + move mouse    same, finer: the cursor stays put (theme: MINI_MOUSE_SENSITIVITY)
+    Ctrl+G                 park / unpark it
+    G + Home               park it on the Home spot
+    Ctrl+G + Home          park it on the parts, zoomed to fit them (with a margin)
 """
 
 from __future__ import annotations
@@ -139,7 +146,7 @@ from .grid import Grid
 from .library import Library, LibraryHistory, Step
 from .line_edit import LineEdit
 from .menu import RAINBOW, ContextMenu, MenuItem
-from .minimap import Panels
+from .miniview import Miniview
 from .paint import paint, part_color
 from .picker import PartPicker, Row
 from .popover import NumberPopover
@@ -210,7 +217,13 @@ class Mode(Enum):
     POPOVER = auto()  # editing a Number setting in its popover; see _open_popover
 
 
-# Modes you can steer with the minimap in (the rest hold a button down, or have the keyboard)
+# Modes where the keys belong to something else (typing, a list), or the board should
+# hold still (a menu is open on it): no moving the view or the miniview with them
+KEYS_TYPE = frozenset(
+    {Mode.EDITING_LABEL, Mode.RENAMING, Mode.PROMPT, Mode.POPOVER, Mode.MENU}
+)
+
+# Modes you can steer with the miniview in (the rest hold a button down, or have the keyboard)
 STEERABLE = frozenset({Mode.IDLE, Mode.PLACING_PART, Mode.WIRING, Mode.EDITING_WIRE})
 
 
@@ -223,6 +236,18 @@ def _make_config() -> pyglet.gl.Config | None:
         )
     except pyglet.window.NoSuchConfigException:
         return None
+
+
+def _direction(
+    left: float, right: float, up: float, down: float, dt: float
+) -> tuple[float, float] | None:
+    """How far held direction keys go in dt, at speed 1 (diagonals no faster); None if
+    they cancel out or none are held."""
+    dx, dy = right - left, up - down
+    if not (dx or dy):
+        return None
+    n = math.hypot(dx, dy)
+    return dx / n * dt, dy / n * dt
 
 
 class Editor(pyglet.window.Window):
@@ -272,7 +297,7 @@ class Editor(pyglet.window.Window):
             disabled=self._unplaceable,
         )
         # Screen-space things that belong to the board, drawn over the HUD: the selection
-        # box (the lens magnifies it with the board) and the context menu (the lens shows
+        # box (the miniview scales it with the board) and the context menu (the miniview shows
         # it at its own size, where it was opened)
         self.overlay = pyglet.graphics.Batch()
         self.menu = ContextMenu(pyglet.graphics.Batch())
@@ -288,11 +313,13 @@ class Editor(pyglet.window.Window):
             batch=self.hud,
         )
         self.bar = StatusBar(self.hud, self.width)
-        self.panels = Panels(
-            self.overlay, self.menu
-        )  # minimap (M) and lens (G), top right
-        self.lens_key: list | None = (
-            None  # while G is down: [lens was open before, scrolled since]
+        self.mini = Miniview(self.overlay, self.menu)  # top right: G, arrows
+        # While G is down: [it was open before, used since (scrolled / steered)] -- a
+        # plain tap toggles it
+        self.g_key: list | None = None
+        self.steer_glow: tuple | None = None  # directions G+mouse moved in since the last frame
+        self.mini_steer: tuple[float, float] | None = (
+            None  # G+mouse: where the cursor stays meanwhile (it's hidden, raw deltas steer)
         )
         # runtime numbers for the bar, summed over STATS_EVERY seconds
         self.stats = {"frames": 0, "time": 0.0, "sim": 0.0, "steps": 0, "draw": 0.0}
@@ -309,7 +336,7 @@ class Editor(pyglet.window.Window):
         self.mode = Mode.IDLE
         self.panning = False  # orthogonal to mode: you can pan while carrying things
         self.map_button: int | None = (
-            None  # same for steering with the minimap: the button held in it
+            None  # same for steering with the miniview: the button held in it
         )
         self.mouse = (0, 0)  # last known cursor position, screen space
         self.mouse_in = False  # is it over the window at all?
@@ -725,6 +752,9 @@ class Editor(pyglet.window.Window):
     # ======================================================================
 
     def on_mouse_press(self, x, y, button, modifiers):
+        if self.mini_steer is not None:  # clicked while steering it: at the cursor's spot
+            x, y = self.mini_steer
+            self._end_mini_steer()
         self.mouse = (x, y)
         wx, wy = self.camera.screen_to_world(x, y)
         in_picker = self.picker.hit(x, y)  # None unless the cursor is over the picker
@@ -756,7 +786,7 @@ class Editor(pyglet.window.Window):
             self._close_menu()
             if button == mouse.LEFT and item is not None:
                 # Done: the cursor goes back to where you right-clicked (what the menu was
-                # about, and where the lens still looks), so e.g. Branch starts from there.
+                # about, and where the miniview still looks), so e.g. Branch starts from there.
                 # Only for board menus: the library's and the status bar's stay put.
                 ax, ay = self.menu.anchor
                 if not self.picker.contains(ax, ay) and not self.bar.contains(ax, ay):
@@ -776,12 +806,11 @@ class Editor(pyglet.window.Window):
             self._finish_rename(commit=True)  # same for collection names
             return
 
-        if self.panels.minimap.contains(x, y):
-            # Steer from the map (with any button, in any mode that isn't holding a button already).
+        if self.mini.contains(x, y):
+            # Steer from it (with any button, in any mode that isn't holding a button already).
             if self.map_button is None and not self.panning and self.mode in STEERABLE:
                 self.map_button = button
-                self.panels.minimap.held = True
-                self._look_at(*self.panels.minimap.to_world(x, y))
+                self._look_at(*self.mini.to_world(x, y))
             return
         if button == mouse.MIDDLE:
             self.panning = True
@@ -794,9 +823,6 @@ class Editor(pyglet.window.Window):
             ):
                 self._cog_menu()
             return  # the bar isn't board: no placing, bends or selecting under it
-        if self.panels.contains(x, y):
-            return  # nor is the lens
-
         if self.mode is Mode.EDITING_WIRE and in_picker:
             self._finish_wire_edit(commit=True)  # like any click away from the wire
             return
@@ -983,12 +1009,14 @@ class Editor(pyglet.window.Window):
                 self.panning = True
 
     def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers):
+        if self.mini_steer is not None:
+            return  # (can't happen: a press ends it)
         self.mouse = (x, y)
         if self.mode is Mode.POPOVER:
             self._popover_drag(x)
             return
         if self.map_button is not None:
-            self._look_at(*self.panels.minimap.to_world(x, y))
+            self._look_at(*self.mini.to_world(x, y))
             return
         if self.panning:
             self.camera.pan(dx, dy)
@@ -1023,6 +1051,8 @@ class Editor(pyglet.window.Window):
         self._follow_cursor()
 
     def on_mouse_motion(self, x, y, dx, dy):
+        if self._steer_mini(dx, dy):
+            return  # (the cursor stays where it was)
         self.mouse, self.mouse_in = (x, y), True
         self.bar.set_hover(self.mode is Mode.IDLE and self.bar.cog_hit(x, y))
         if self.mode is Mode.PROMPT:
@@ -1048,7 +1078,7 @@ class Editor(pyglet.window.Window):
 
     def on_mouse_release(self, x, y, button, modifiers):
         if button == self.map_button:
-            self.map_button, self.panels.minimap.held = None, False
+            self.map_button = None
             return
         if self.mode is Mode.POPOVER:
             if button == mouse.LEFT:
@@ -1113,29 +1143,15 @@ class Editor(pyglet.window.Window):
         ):
             self._space_tiling(scroll_y)
             return
-        if self.panels.scrolls_lens(x, y) or (
-            self.lens_key is not None and self.keys[key.G] and self.panels.lens.open
-        ):
-            self.panels.lens.adjust(
-                scroll_y
-            )  # the lens's magnification; the view stays put
-            if self.lens_key is not None:
-                self.lens_key[1] = True
+        if self.mini.scrolls(x, y) or (self._g_held() and self.mini.open):
+            self.mini.adjust(scroll_y)  # its zoom; the view stays put
+            self._mini_used()
             return
         if (
             self.mode is Mode.MENU
         ):  # zoom around what the menu belongs to, so it stays on it
             self.camera.scroll(*self.menu.anchor, scroll_y)
             return
-        if (at := self.panels.anchor(x, y, self._visible_world())) is not None:
-            # On the map: zoom around the spot pointed at -- after jumping there if it's
-            # outside the view (zooming around a point off screen would slide the view away).
-            p, jump = at
-            if jump:
-                self._look_at(*p)
-            x, y = self.camera.world_to_screen(*p)
-        elif self.panels.contains(x, y):
-            x, y = self._board_center()
         self.camera.scroll(x, y, scroll_y)
         self._follow_cursor()
 
@@ -1234,24 +1250,16 @@ class Editor(pyglet.window.Window):
             self.pin_label_mode = (self.pin_label_mode + 1) % len(PIN_LABEL_MODES)
             self._update_pin_labels()
             self._notice(f"pin names: {PIN_LABEL_MODES[self.pin_label_mode]}")
-        elif symbol == key.M and not modifiers & (key.MOD_CTRL | key.MOD_ALT):
-            self.panels.minimap.open = not self.panels.minimap.open
+        elif symbol == key.G and modifiers & key.MOD_CTRL and not modifiers & key.MOD_ALT:
+            self._toggle_park()
         elif symbol == key.G and not modifiers & (key.MOD_CTRL | key.MOD_ALT):
-            # Opens right away (so G+scroll has something to adjust); closes on release,
-            # unless it was just opened or you scrolled while holding G.
-            self.lens_key = [self.panels.lens.open, False]
-            self.panels.lens.open = True
+            self._g_press()
         elif symbol == key.HOME:
-            self.camera.set_level(0, 0, 0)
-            self.camera.center_on(*HOME, self.width, self.height)
-            self._follow_cursor()
+            self._home(fit=bool(modifiers & key.MOD_CTRL))
 
     def on_key_release(self, symbol, modifiers):
-        if symbol == key.G and self.lens_key is not None:
-            was_open, scrolled = self.lens_key
-            self.lens_key = None
-            if was_open and not scrolled:
-                self.panels.lens.open = False
+        if symbol == key.G and self.g_key is not None:
+            self._g_release()
         if symbol in (key.LCTRL, key.RCTRL, key.LSHIFT, key.RSHIFT):
             self._follow_cursor()  # un-snap / back to the normal grid
 
@@ -2418,7 +2426,8 @@ class Editor(pyglet.window.Window):
         self._update_caption()
         self.status.x = self.picker.width + 8  # follows the panel sliding in / out
         self.bar.place(self.picker.width, self.width)
-        self._update_panels(dt)
+        self._move_keys(dt)
+        self._update_mini(dt)
         t0 = time.perf_counter()
         self.circuit.frame()
         for _ in range(SIM_STEPS_PER_FRAME):
@@ -2465,7 +2474,7 @@ class Editor(pyglet.window.Window):
         self.view = self.camera.matrix()
         self.world.draw()
         self.view = Mat4()  # identity: HUD is in screen pixels
-        self.panels.draw(self, self.world, self.grid)
+        self.mini.draw(self, self.world, self.grid)
         self.hud.draw()
         self.overlay.draw()
         self.menu.batch.draw()
@@ -2520,13 +2529,110 @@ class Editor(pyglet.window.Window):
             MIN_LEVEL if board is None else min(MIN_LEVEL, self._fit(board)[1])
         )
 
-    def _update_panels(self, dt: float) -> None:
+    # ---- the miniview's keys: G, arrows, G+mouse (see the module docstring) ----
+
+    def _g_press(self) -> None:
+        """G down: opens it right away (so G+scroll etc. have something to act on)."""
+        self.g_key = [self.mini.open, False]
+        self.mini.open = True
+
+    def _g_release(self) -> None:
+        """G up. A plain tap (nothing done while held) closes it if it was open."""
+        was_open, used = self.g_key
+        self.g_key = None
+        self._end_mini_steer()
+        if was_open and not used:
+            self.mini.open = False
+
+    def _toggle_park(self) -> None:
+        """Ctrl+G: park it where it looks, or have it follow the cursor again."""
+        if self.mini.parked:
+            self.mini.unpark()
+        else:
+            self._park_mini()
+
+    def _mini_used(self) -> None:
+        if self.g_key is not None:
+            self.g_key[1] = True
+
+    def _g_held(self) -> bool:
+        return self.g_key is not None and self.keys[key.G]
+
+    def _park_mini(self) -> None:
+        mini = self.mini
+        mini.park(mini.pointer or self._board_center_world())
+        mini.open = True
+        self._mini_used()
+
+    def _board_center_world(self) -> Point:
+        return self.camera.screen_to_world(*self._board_center())
+
+    def _steer_mini(self, dx: float, dy: float) -> bool:
+        """G+mouse: the motion moves it (parked), finely, and the cursor stays put: the
+        first such motion takes the mouse (hidden, raw deltas) until G is let go."""
+        if self.mini_steer is None:
+            if not self._g_held() or self.mode not in STEERABLE:
+                return False
+            self.mini_steer = self.mouse  # (this event's x, y is already past it)
+            self.set_exclusive_mouse(True)
+        self._park_mini()
+        k = T.MINI_MOUSE_SENSITIVITY
+        self.mini.nudge(dx * k, dy * k)
+        n = math.hypot(dx, dy) or 1.0
+        self.steer_glow = (
+            max(0.0, -dx / n),
+            max(0.0, dx / n),
+            max(0.0, dy / n),
+            max(0.0, -dy / n),
+        )  # lights the arrows it moves along, for a moment (see _move_keys)
+        return True
+
+    def _end_mini_steer(self) -> None:
+        if self.mini_steer is not None:
+            self.set_exclusive_mouse(False)
+            self._warp(*self.mini_steer)  # back where it was, visible again
+            self.mini_steer = None
+
+    def on_deactivate(self):
+        # G's release never arrives while we're not focused: let go of it now
+        if self.g_key is not None:
+            self._mini_used()  # (not a tap)
+            self._g_release()
+
+    def _move_keys(self, dt: float) -> None:
+        """Held keys: WASD move the view, arrows the miniview (parking it). Also lights
+        its key hint."""
+        k = self.keys
+        busy = (
+            self.mode in KEYS_TYPE
+            or k[key.LCTRL]
+            or k[key.RCTRL]
+            or k[key.LALT]
+            or k[key.RALT]
+        )
+        arrows = [float(k[s]) for s in (key.LEFT, key.RIGHT, key.UP, key.DOWN)]
+        glow = [0.0] * 4 if busy else list(arrows)
+        if self.steer_glow is not None:  # G+mouse: what it just moved along
+            glow = [max(a, b) for a, b in zip(glow, self.steer_glow)]
+            self.steer_glow = None
+        self.mini.hint.light(self._g_held(), tuple(glow))
+        if busy:
+            return
+        if d := _direction(*arrows, dt):
+            self._park_mini()
+            self.mini.nudge(d[0] * T.MINI_ARROW_SPEED, d[1] * T.MINI_ARROW_SPEED)
+        wasd = [float(k[s]) for s in (key.A, key.D, key.W, key.S)]
+        if d := _direction(*wasd, dt):
+            self.camera.pan(-d[0] * T.VIEW_KEY_SPEED, -d[1] * T.VIEW_KEY_SPEED)
+            self._follow_cursor()
+
+    def _update_mini(self, dt: float) -> None:
         board = self._board_bounds()
         self._update_zoom_floor(board)
         on_board = not self.picker.contains(*self.mouse) and not self.bar.contains(
             *self.mouse
         )
-        self.panels.update(
+        self.mini.update(
             dt,
             self.camera,
             board,
@@ -2648,6 +2754,7 @@ class Editor(pyglet.window.Window):
 
     def _clear_board(self) -> None:
         self._cancel()
+        self.mini.unpark()  # (its spot was on the old board)
         self.selection.clear()
         self.tiling = None
         restore(self, EMPTY)  # removes (and closes) everything
@@ -2854,6 +2961,25 @@ class Editor(pyglet.window.Window):
         name = f"{title or 'untitled'}{' *' if self.dirty else ''}"
         self.set_caption(f"pijl - {name}")
         self.bar.set_doc(f"{self.project.name} / {name}")
+
+    def _home(self, fit: bool) -> None:
+        """Home: the camera back to the Home spot at 1:1, or (Ctrl) fitted to the parts.
+        With G held (G+Home, Ctrl+G+Home), the miniview instead (parking it there)."""
+        if self.keys[key.G]:  # (with Ctrl+G, G's press toggled parking: this parks it anyway)
+            board = self._board_bounds()
+            if fit and board is not None:
+                self.mini.fit(self._fit(board)[0])
+            else:
+                self.mini.look_at(HOME)
+            self.mini.open = True
+            self._mini_used()  # (letting go of G leaves it open)
+            return
+        if fit:
+            self._fit_camera()
+        else:
+            self.camera.set_level(0, 0, 0)
+            self.camera.center_on(*HOME, self.width, self.height)
+        self._follow_cursor()
 
     def _fit_camera(self) -> None:
         """Show everything on the board, centered in the space right of the picker.

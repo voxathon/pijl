@@ -274,7 +274,7 @@ class Canvas:
         self.batch.draw()
 
     def draw_instances(self) -> None:
-        """Just the instance buffers (what the minimap draws again, smaller)."""
+        """Just the instance buffers (what the miniview draws again, at its own zoom)."""
         gl.glEnable(gl.GL_BLEND)
         gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
         now = time.monotonic() % 3600.0  # (kept small: it's a float32 in the shaders)

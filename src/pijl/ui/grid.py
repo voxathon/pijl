@@ -96,7 +96,7 @@ class Grid:
         divisions: int = 1,
     ) -> None:
         """The grid for any view: `translate` is where the world's origin is on screen (px).
-        Fills the whole window; clip it with glScissor (the minimap panels do)."""
+        Fills the whole window; clip it with glScissor (the miniview does)."""
         p = self.program
         p.use()
         p["translate"] = translate
