@@ -27,6 +27,9 @@ from pathlib import Path
 
 from .contract import API, LABEL_SIDES, SUPPORTED_APIS, Look, PartType
 from .ports import PORTS
+from .settings import Action, Setting
+
+RESERVED_PROPS = frozenset({"color"})  # props the editor keeps on every part (Recolor)
 
 _package_ids = itertools.count(1)
 
@@ -89,10 +92,33 @@ class Registry:
             raise ValueError(f"{name}: a pure part needs an eval")
         if not isinstance(t.props, dict):
             raise TypeError(f"{name}: props must be a dict")
-        t.choices = {key: tuple(values) for key, values in t.choices.items()}
-        for key, values in t.choices.items():
-            if key not in t.props or not values:
-                raise ValueError(f"{name}: choices[{key!r}] needs a default in props and some values")
+        if hasattr(t, "choices"):
+            raise ValueError(f"{name}: `choices` was replaced by `settings` (see pijl/parts/settings.py)")
+        if not isinstance(t.settings, dict) or not isinstance(t.actions, dict):
+            raise TypeError(f"{name}: settings and actions must be dicts")
+        t.settings, t.actions = dict(t.settings), dict(t.actions)
+        for key, s in t.settings.items():
+            where = f"{name}: settings[{key!r}]"
+            if not isinstance(key, str) or not key.isidentifier():
+                raise ValueError(f"{where}: keys must be identifiers")
+            if not isinstance(s, Setting):
+                raise TypeError(f"{where}: not a Setting")
+            if key in t.props:
+                raise ValueError(f"{where}: its default lives in the setting, not also in props")
+            try:
+                s.check()
+            except ValueError as e:
+                raise ValueError(f"{where}: {e}") from None
+        taken = RESERVED_PROPS & (t.props.keys() | t.settings.keys())
+        if taken and not engine:
+            raise ValueError(f"{name}: {', '.join(sorted(taken))} is reserved for the editor")
+        for action_name, a in t.actions.items():
+            if not isinstance(action_name, str) or not action_name.isidentifier():
+                raise ValueError(f"{name}: actions[{action_name!r}]: names must be identifiers")
+            if not isinstance(a, Action):
+                raise TypeError(f"{name}: actions[{action_name!r}]: not an Action")
+        if t.actions and not t.has("action"):
+            raise ValueError(f"{name}: has actions but no action() hook")
         if not isinstance(t.look, Look) or t.look.label not in LABEL_SIDES:
             raise ValueError(f"{name}: bad look {t.look!r}")
 
@@ -149,5 +175,24 @@ def load(*folders: Path) -> Registry:
 
 
 def fresh_props(t: PartType) -> dict:
-    """A new instance's own copy of its type's default props."""
-    return copy.deepcopy(t.props)
+    """A new instance's own copy of its type's default props, settings included."""
+    props = copy.deepcopy(t.props)
+    for key, s in t.settings.items():
+        props[key] = s.initial
+    return props
+
+
+def check_props(t: PartType, props: dict) -> tuple[dict, list[str]]:
+    """Saved props -> what an instance gets: defaults for what's missing, every setting's
+    value through its parse(). A value that doesn't parse is reset to the default; the
+    second item says which ones were. Keys the type doesn't know are kept (the script
+    may have dropped a setting; its value isn't thrown away on load)."""
+    out = {**fresh_props(t), **props}
+    bad = []
+    for key, s in t.settings.items():
+        try:
+            out[key] = s.parse(out[key])
+        except ValueError as e:
+            out[key] = s.initial
+            bad.append(f"{key}: {e}, reset to {s.show(s.initial)}")
+    return out, bad

@@ -32,7 +32,9 @@ CONTROLS: list[tuple[str, list[tuple[str, str]]]] = [
         ("right-click / Esc", "put it back"),
         ("click a part", "select it; a plain click on an IN switch toggles it"),
         ("drag a part", "move it (a selected part moves the whole selection)"),
-        ("right-click a part", "label, recolor, delete"),
+        ("right-click a part", "label, recolor, its settings and actions, delete"),
+        ("  ...in a selection", "parts all of one kind: edit them all (Ctrl: just this one)"),
+        ("  number slider", "drag (live), or type + Enter; Esc takes a drag back"),
     ]),
     ("Wires", [
         ("click a pin", "start a wire; it follows the cursor"),

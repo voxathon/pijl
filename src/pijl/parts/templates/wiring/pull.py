@@ -8,7 +8,7 @@ and if those disagree it's a conflict (X). Raise one's priority to settle it
 """
 
 from pijl.logic import ONE, ZERO
-from pijl.parts import PartType
+from pijl.parts import Choice, PartType
 
 API = 2
 
@@ -18,8 +18,9 @@ class Pull(PartType):
     outs = ("out",)
     joins = (("in", "out"),)  # one net through the part...
     weak = ("out",)           # ...which it drives weakly
-    props = {"priority": 0}
-    choices = {"priority": tuple(range(10))}  # (the part's context menu)
+    # (the part's context menu) The strongest pull on a net wins; equally strong ones that disagree fight
+    settings = {"priority": Choice(range(10), 0,
+                                   labels=("0 (weakest)", *map(str, range(1, 9)), "9 (strongest)"))}
     pure = True
     category = "WIRING"
 

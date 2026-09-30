@@ -41,8 +41,13 @@ Controls
     Label...               type in place; Enter commits, Esc reverts, clicking elsewhere commits
     Recolor                wires and IN/OUT parts: 8 colors, or Default (inherit). Colors blend
                            along wires, see paint.py. New branches take their wire's color
-    (settings)             whatever props a part's type offers (PartType.choices), e.g. a
-                           pull's Priority: pick a value
+    (settings)             whatever settings a part's type offers (PartType.settings, e.g. a
+                           pull's Priority) and its actions. On a part inside a selection of
+                           parts all of one kind, the menu edits all of them ("mixed" where
+                           their values differ); Ctrl+right-click: just the part clicked.
+                           Numbers open a popover: drag the slider (the parts follow live;
+                           each release is one undo step), or type + Enter. Esc takes back
+                           a drag in progress; a click outside closes it. See popover.py.
     Edit (wires)           hold+drag square handles to move bends, "+" handles or the wire
                            itself to add one; right-click a square to remove it. Round handles
                            are junctions (its own ends and branches off it): drag to slide
@@ -81,6 +86,7 @@ import math
 import sys
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum, auto
 
 import pyglet
@@ -89,6 +95,7 @@ from pyglet.math import Mat4
 from pyglet.window import key, mouse
 
 from ..macros import Catalog
+from ..parts import Choice, Number, Toggle
 from ..parts import load as load_parts
 from ..project import Project, last_project, project_names, remember_project, write_atomic
 from ..storage import NAME_MAX, FormatError, MacroStore, check_name
@@ -107,6 +114,7 @@ from .line_edit import LineEdit
 from .menu import RAINBOW, ContextMenu, MenuItem
 from .paint import paint, part_color
 from .picker import PartPicker, Row
+from .popover import NumberPopover
 from .prompt import Prompt
 from .sdf_text import SDFText
 from .selection import Selection
@@ -143,6 +151,7 @@ class Mode(Enum):
     PICKER_DRAG = auto()    # carrying a picker row to another spot in the list
     RENAMING = auto()       # typing a collection's name in the picker
     PROMPT = auto()         # a Prompt box is up (save as / open / unsaved changes); see _open_prompt
+    POPOVER = auto()        # editing a Number setting in its popover; see _open_popover
 
 
 def _make_config() -> pyglet.gl.Config | None:
@@ -246,6 +255,9 @@ class Editor(pyglet.window.Window):
         self.prompt: Prompt | None = None
         self.prompt_enter = None  # what Enter (or clicking a list item) does: fn(prompt)
         self.prompt_key = None    # other keys: fn(symbol) -> handled
+        # Number setting popover (Mode.POPOVER)
+        self.popover: NumberPopover | None = None
+        self.pop_edit: _NumberEdit | None = None
         self._caption_for: tuple = ()
 
         self._start_document()
@@ -507,6 +519,10 @@ class Editor(pyglet.window.Window):
         in_picker = self.picker.hit(x, y)  # None unless the cursor is over the picker
         tool = in_picker.part if isinstance(in_picker, Row) and in_picker.what == "part" else None
 
+        if self.mode is Mode.POPOVER:
+            self._popover_press(x, y, button)
+            return
+
         if self.mode is Mode.PROMPT:
             item = self.prompt.item_at(x, y)
             if button == mouse.LEFT and item is not None:
@@ -640,16 +656,22 @@ class Editor(pyglet.window.Window):
                 self.mode = Mode.BOX_SELECTING
 
         elif button == mouse.RIGHT:
-            # Right-clicking narrows the selection to the clicked item, so the
-            # highlight shows exactly what the menu will act on.
+            # Right-clicking narrows the selection to what the menu will act on, so the
+            # highlight shows exactly that: the clicked item -- or, on a part inside a
+            # selection of parts all of one kind, those parts (Ctrl: just the clicked one).
             if view := self.part_at(wx, wy):
-                self.selection.set(parts=[view])
-                items = [MenuItem("Label...", lambda: self._start_edit(view))]
+                sel = self.selection.parts
+                group = (sorted(sel, key=lambda v: v.part.uid)
+                         if view in sel and not modifiers & key.MOD_CTRL
+                         and len({v.part.type for v in sel}) == 1 else [view])
+                self.selection.set(parts=group)
+                items = [MenuItem("Label...", lambda: self._start_edit(view))] if len(group) == 1 else []
                 if view.look.lit:  # switches and LEDs are color sources (paint.py)
                     items.append(MenuItem("Recolor", submenu=self._recolor_items(
-                        part_color(view.part), lambda c: self._set_part_color(view, c))))
-                items += self._choice_items(view)
-                items.append(MenuItem("Delete", lambda: self.remove_part(view), danger=True))
+                        _common(part_color(v.part) for v in group),
+                        lambda c: [self._set_part_color(v, c) for v in group])))
+                items += self._settings_items(group)
+                items.append(MenuItem("Delete", lambda: self.remove_parts(group), danger=True))
                 self._open_menu(x, y, items)
             elif wire := self.wire_at(wx, wy):
                 self.selection.set(wires=[wire])
@@ -664,6 +686,9 @@ class Editor(pyglet.window.Window):
 
     def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers):
         self.mouse = (x, y)
+        if self.mode is Mode.POPOVER:
+            self._popover_drag(x)
+            return
         if self.panning:
             self.camera.pan(dx, dy)
         elif self.mode is Mode.PRESSING_PART:
@@ -710,6 +735,10 @@ class Editor(pyglet.window.Window):
         self._update_pin_labels()
 
     def on_mouse_release(self, x, y, button, modifiers):
+        if self.mode is Mode.POPOVER:
+            if button == mouse.LEFT:
+                self._popover_release()
+            return
         # Releases never *finish* a click-to-place or click-to-wire action.
         # That is what makes press-and-hold on a picker part or pin harmless.
         if button in (mouse.MIDDLE, mouse.RIGHT) and self.panning:
@@ -746,6 +775,8 @@ class Editor(pyglet.window.Window):
 
     def on_mouse_scroll(self, x, y, scroll_x, scroll_y):
         self.mouse = (x, y)
+        if self.mode is Mode.POPOVER:
+            return  # (it's pinned to where it opened: don't let the board move away under it)
         if self.mode is Mode.PROMPT:
             if scroll_y:
                 self.prompt.move(-1 if scroll_y > 0 else 1)
@@ -765,6 +796,14 @@ class Editor(pyglet.window.Window):
 
     def on_key_press(self, symbol, modifiers):
         # Deliberately NOT calling super(): pyglet's default closes the window on Esc.
+        if self.mode is Mode.POPOVER:
+            # Typing goes through on_text / on_text_motion. No editor shortcuts while it's up.
+            if symbol in (key.ENTER, key.NUM_ENTER):
+                if self.pop_edit.drag_old is None and self._popover_enter():
+                    self._close_popover()
+            elif symbol == key.ESCAPE:
+                self._close_popover()
+            return
         if self.mode is Mode.PROMPT:
             # Typing goes through on_text / on_text_motion. No editor shortcuts while it's up.
             if symbol in (key.ENTER, key.NUM_ENTER):
@@ -848,7 +887,9 @@ class Editor(pyglet.window.Window):
             self._follow_cursor()  # un-snap / back to the normal grid
 
     def on_text(self, text):
-        if self.mode is Mode.PROMPT:
+        if self.mode is Mode.POPOVER:
+            self.popover.type_text(text)
+        elif self.mode is Mode.PROMPT:
             self.prompt.type_text(text)
         elif self.mode is Mode.EDITING_LABEL:
             self.edit.insert(text)
@@ -857,7 +898,9 @@ class Editor(pyglet.window.Window):
             self.picker.rename_text(text)
 
     def on_text_motion(self, motion):
-        if self.mode is Mode.PROMPT:
+        if self.mode is Mode.POPOVER:
+            self.popover.motion(motion)
+        elif self.mode is Mode.PROMPT:
             self.prompt.motion(motion)
         elif self.mode is Mode.EDITING_LABEL:
             self.edit.motion(motion)
@@ -879,21 +922,137 @@ class Editor(pyglet.window.Window):
                   for name, (_, on) in T.WIRE_COLORS.items()),
                 MenuItem("Default", lambda: set_color(None), swatch=RAINBOW, checked=current is None)]
 
-    def _choice_items(self, view: PartView) -> list[MenuItem]:
-        """A submenu per prop the part's type lets the user pick (PartType.choices)."""
-        part = view.part
-        return [MenuItem(key.replace("_", " ").capitalize(), submenu=[
-                    MenuItem(str(value), lambda k=key, v=value: self._set_prop(view, k, v),
-                             checked=part.props.get(key) == value)
-                    for value in values])
-                for key, values in part.type.choices.items()]
+    def _settings_items(self, views: list[PartView]) -> list[MenuItem]:
+        """Menu rows for the settings and actions of the parts' type (PartType.settings,
+        .actions): all of `views` are of that one kind, and every row acts on all of them.
+        Where their values differ, a row says "mixed" and nothing is checked."""
+        t = views[0].part.type
+        items = []
+        for k, s in t.settings.items():
+            value = _common(v.part.props.get(k) for v in views)
+            shown = MIXED if value is MIXED else s.show(value)
+            title = f"{s.title(k)}: {shown}"
+            if isinstance(s, Choice):
+                items.append(MenuItem(title, submenu=[
+                    MenuItem(s.show(c), lambda k=k, c=c: self._set_setting(views, k, c),
+                             checked=value is not MIXED and value == c and type(value) is type(c))
+                    for c in s.values]))
+            elif isinstance(s, Toggle):  # (a mixed one turns on)
+                items.append(MenuItem(title, lambda k=k, on=value is not True: self._set_setting(views, k, on),
+                                      checked=value is True))
+            elif isinstance(s, Number):
+                items.append(MenuItem(title + "...", lambda k=k, s=s, value=value:
+                                      self._open_popover(views, k, s, value)))
+            else:  # Text: typed into a prompt
+                items.append(MenuItem(title + "...", lambda k=k, s=s, value=value:
+                                      self._setting_prompt(views, k, s, value)))
+        for name, a in t.actions.items():
+            items.append(MenuItem(a.title(name), lambda name=name: self._run_action(views, name), danger=a.danger))
+        return items
 
-    def _set_prop(self, view: PartView, key: str, value) -> None:
-        part = view.part
-        if part.props.get(key) != value:
-            part.props[key] = value
-            self.circuit.props_changed(part)
-            Touched.part(part.uid)
+    def _set_setting(self, views: list[PartView], key: str, value) -> bool:
+        """One finished edit of a setting on all of `views` (see Circuit.set_setting).
+        False (and the reason reported) if the value doesn't parse."""
+        try:
+            self.circuit.set_setting([v.part for v in views], key, value)
+        except ValueError as e:
+            self._report(str(e))
+            return False
+        Touched.parts.update(v.part.uid for v in views)  # (settings don't change colors: no repaint)
+        return True
+
+    def _setting_prompt(self, views: list[PartView], key: str, s, value) -> None:
+        """Type a Text setting's new value (mixed values start out empty)."""
+        hint = f"{s.hint}   Enter: set   Esc: cancel" if s.hint else "Enter: set   Esc: cancel"
+        p = Prompt(self.hud, self.width, self.height, s.title(key) + _count(views),
+                   text="" if value is MIXED else value, max_len=s.max_len, hint=hint)
+
+        def enter(p: Prompt) -> None:
+            if self._set_setting(views, key, p.text):
+                self._close_prompt()
+
+        self._open_prompt(p, enter)
+
+    # ---- the Number popover: a slider and a typed field ---------------------------
+    # Dragging the slider changes the props live (applied once a frame, in update());
+    # the part's changed() hook runs on release, unless the setting is live. Every
+    # release and every Enter is one undo step. Esc takes back a drag in progress and
+    # closes; a click outside closes (taking a typed, valid value first).
+
+    def _open_popover(self, views: list[PartView], key: str, s: Number, value) -> None:
+        self._cancel()
+        hint = s.hint or f"{s.show(s.min)} to {s.show(s.max)}"
+        self.popover = NumberPopover(self.hud, self.width, self.height, self.mouse, s.title(key) + _count(views),
+                                     s, None if value is MIXED else value, hint)
+        self.pop_edit = _NumberEdit([v.part for v in views], key, s)
+        self.mode = Mode.POPOVER
+
+    def _popover_press(self, x: float, y: float, button: int) -> None:
+        pop, e = self.popover, self.pop_edit
+        if not pop.contains(x, y):
+            self._close_popover(take_typed=True)  # a click outside: done (the click goes no further)
+        elif button == mouse.LEFT and pop.on_slider(x, y):
+            e.drag_old = [p.props.get(e.key) for p in e.parts]
+            e.pending = pop.value_at(x)
+
+    def _popover_drag(self, x: float) -> None:
+        if self.pop_edit.drag_old is not None:
+            self.pop_edit.pending = self.popover.value_at(x)  # applied in update(): once a frame
+
+    def _popover_apply(self) -> None:
+        """Write the slider's latest value (at most once a frame)."""
+        e = self.pop_edit
+        if e is not None and e.pending is not None:
+            value, e.pending = e.pending, None
+            self.circuit.set_setting(e.parts, e.key, value, notify=False)  # (a live setting notifies)
+            self.popover.set_value(value)
+
+    def _popover_release(self) -> None:
+        e = self.pop_edit
+        if e.drag_old is None:
+            return
+        self._popover_apply()
+        if not e.setting.live:  # (a live one heard about every frame already)
+            self.circuit.settings_changed(e.parts, e.key, e.drag_old)
+        e.drag_old = None
+        self._record_setting(e.parts)
+
+    def _popover_enter(self) -> bool:
+        """Set the typed value. False (the reason in the hint line) if it isn't one."""
+        e, pop = self.pop_edit, self.popover
+        try:
+            value = e.setting.parse_text(pop.text)
+            self.circuit.set_setting(e.parts, e.key, value)
+        except ValueError as err:
+            pop.set_hint(str(err), danger=True)
+            return False
+        pop.set_value(value)
+        self._record_setting(e.parts)
+        return True
+
+    def _record_setting(self, parts: list[Part]) -> None:
+        """One undo step for a settings edit, now (the popover isn't idle, so the
+        after-event recording in dispatch_event doesn't do it)."""
+        Touched.parts.update(p.uid for p in parts)  # (no repaint: settings don't change colors)
+        self._record()
+
+    def _close_popover(self, take_typed: bool = False) -> None:
+        e, pop = self.pop_edit, self.popover
+        if e.drag_old is not None:  # Esc mid-drag: take it back
+            e.pending = None
+            self.circuit.put_setting(e.parts, e.key, e.drag_old, notify=e.setting.live)
+        elif take_typed and pop.text.strip() and pop.text != pop.shown_text:
+            if not self._popover_enter():
+                return  # not a number: stay open, the hint says why
+        pop.delete()
+        self.popover = self.pop_edit = None
+        self.mode = Mode.IDLE
+
+    def _run_action(self, views: list[PartView], name: str) -> None:
+        """Run a part action; whatever props it changed become an undo step."""
+        before = [copy.deepcopy(v.part.props) for v in views]
+        self.circuit.run_action([v.part for v in views], name)
+        Touched.parts.update(v.part.uid for v, was in zip(views, before) if v.part.props != was)
 
     @staticmethod
     def _set_part_color(view: PartView, color: str | None) -> None:
@@ -1315,6 +1474,8 @@ class Editor(pyglet.window.Window):
             self._finish_rename(commit=False)
         elif self.mode is Mode.PROMPT:
             self._close_prompt()
+        elif self.mode is Mode.POPOVER:
+            self._close_popover()
         self.pressed_wire = None
         self.picker_row = None
         if self.mode in (Mode.DRAGGING_PART, Mode.PLACING_PART):
@@ -1361,6 +1522,9 @@ class Editor(pyglet.window.Window):
         self.picker.update(dt)
         if self.prompt is not None:
             self.prompt.tick(dt)
+        if self.popover is not None:
+            self._popover_apply()  # the slider's latest value, once a frame
+            self.popover.tick(dt)
         self._update_caption()
         self.status.x = self.picker.width + 8  # follows the panel sliding in / out
         self.bar.place(self.picker.width, self.width)
@@ -1392,6 +1556,8 @@ class Editor(pyglet.window.Window):
         self.bar.place(self.picker.width, width)
         if self.prompt is not None:
             self.prompt.layout(width, height)
+        if self.popover is not None:
+            self.popover.layout(width, height)
         self.picker.resize(height, self._pixel_ratio())
 
     def on_draw(self):
@@ -1812,6 +1978,30 @@ class Editor(pyglet.window.Window):
         if entry.startswith(MACRO):
             return T.MACRO_SWATCH
         return theme_color(self.parts.get(entry).look.swatch)
+
+
+MIXED = "mixed"  # what a menu row shows when the edited parts' values differ
+
+
+@dataclass
+class _NumberEdit:
+    """The popover's edit: which parts and setting, and the slider drag in progress."""
+    parts: list[Part]
+    key: str
+    setting: Number
+    drag_old: list | None = None  # each part's value when the drag started; None: not dragging
+    pending: object = None        # the slider's latest value, not written yet (see update)
+
+
+def _count(views) -> str:
+    return f" ({len(views)} parts)" if len(views) > 1 else ""
+
+
+def _common(values):
+    """The one value all of them have, or MIXED."""
+    values = iter(values)
+    first = next(values)
+    return first if all(v == first and type(v) is type(first) for v in values) else MIXED
 
 
 def _pin_part_uids(wire_data) -> set[int]:

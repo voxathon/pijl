@@ -442,6 +442,61 @@ class Circuit:
         if part.type.weak:
             self._nets_dirty = True
 
+    # ---- settings and actions (see pijl/parts/settings.py) ---------------------
+
+    def set_setting(self, parts: list[Part], key: str, value, notify: bool = True) -> list:
+        """Set setting `key` of `parts` (all of one kind) to `value`, through the setting's
+        parse() (ValueError if it doesn't parse). Returns the old values, one per part.
+        `notify=False` while a slider drags: the changed hook waits for the caller's
+        settings_changed() when the edit is done (unless the setting is live)."""
+        t = _one_type(parts)
+        s = t.settings[key]
+        value = s.parse(value)
+        old = [p.props.get(key) for p in parts]
+        for p in parts:
+            p.props[key] = value
+        if t.weak:
+            self._nets_dirty = True
+        if notify or getattr(s, "live", False):
+            self.settings_changed(parts, key, old)
+        return old
+
+    def put_setting(self, parts: list[Part], key: str, values: list, notify: bool = True) -> None:
+        """Give each part its own value back (values[i] for parts[i]): an edit taken back
+        with Esc. `notify=False` when the changed hook never heard of the edit."""
+        old = [p.props.get(key) for p in parts]
+        for p, v in zip(parts, values):
+            p.props[key] = v
+        if parts and parts[0].type.weak:
+            self._nets_dirty = True
+        if notify:
+            self.settings_changed(parts, key, old)
+
+    def settings_changed(self, parts: list[Part], key: str, old: list) -> None:
+        """Tell the parts' type (all one kind) that setting `key` changed from `old`
+        (one value per part): one changed() call for the parts whose value differs."""
+        if not parts:
+            return
+        t = parts[0].type
+        if t.weak:
+            self._nets_dirty = True
+        if not t.has("changed") or t.kind in self.faults:
+            return
+        moved = [(p, o) for p, o in zip(parts, old) if p.props.get(key) != o]
+        if moved:
+            ctx = Ctx([p for p, _ in moved], self.tick)
+            self._guard(t, "changed", lambda: t.changed(ctx, key, [o for _, o in moved]))
+
+    def run_action(self, parts: list[Part], name: str) -> None:
+        """The user picked action `name` for `parts` (all one kind): one action() call,
+        for the live ones."""
+        t = _one_type(parts)
+        if name not in t.actions:
+            raise KeyError(f"{t.kind} has no action {name!r}")
+        live = [p for p in parts if p.live]
+        if live and t.kind not in self.faults:
+            self._guard(t, "action", lambda: t.action(Ctx(live, self.tick), name))
+
     def can_connect(self, a: Endpoint, b: Endpoint) -> bool:
         if a is b:
             return False
@@ -796,6 +851,13 @@ def _grouped(slots: np.ndarray, net_of: np.ndarray) -> tuple[np.ndarray, np.ndar
     slots = slots[np.argsort(net_of[slots], kind="stable")]
     nets, starts = np.unique(net_of[slots], return_index=True)
     return slots, nets, starts
+
+
+def _one_type(parts: list[Part]) -> PartType:
+    types = {p.type for p in parts}
+    if len(types) != 1:
+        raise ValueError("settings and actions work on parts of one kind at a time")
+    return types.pop()
 
 
 def _priority(part: Part) -> int:

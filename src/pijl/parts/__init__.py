@@ -11,7 +11,8 @@ from functools import cache
 from pathlib import Path
 
 from .contract import API, Ctx, Look, PartType, part
-from .registry import Registry, fresh_props, load
+from .registry import Registry, check_props, fresh_props, load
+from .settings import Action, Choice, Number, Setting, Text, Toggle
 
 TEMPLATES = Path(__file__).parent / "templates"
 
@@ -23,5 +24,5 @@ def builtin_registry() -> Registry:
     return load(TEMPLATES)
 
 
-__all__ = ["API", "Ctx", "Look", "PartType", "Registry", "TEMPLATES", "builtin_registry",
-           "fresh_props", "load", "part"]
+__all__ = ["API", "Action", "Choice", "Ctx", "Look", "Number", "PartType", "Registry", "Setting",
+           "TEMPLATES", "Text", "Toggle", "builtin_registry", "check_props", "fresh_props", "load", "part"]

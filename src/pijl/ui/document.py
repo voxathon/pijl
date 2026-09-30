@@ -135,6 +135,7 @@ def _restore(editor: Editor, target: Snapshot, only: tuple[Iterable[int], Iterab
     # 3. parts: add missing (all at once), update moved/relabeled/re-propped
     moved = set()
     missing = []
+    edited: dict[tuple, list] = {}  # (type, setting key) -> [(part, old value)]
     for uid in part_uids & target.parts.keys():
         kind, label, x, y, props = target.parts[uid]
         view = view_of(uid)
@@ -148,11 +149,20 @@ def _restore(editor: Editor, target: Snapshot, only: tuple[Iterable[int], Iterab
             view.part.label = label
             view.refresh_name()
             view.name.move_to(*view.name_pos())
-        if view.part.props != props:
-            view.part.props = copy.deepcopy(props)
-            c.props_changed(view.part)
-            Touched.part(uid)
+        part = view.part
+        if part.props != props:
+            was, part.props = part.props, copy.deepcopy(props)
+            c.props_changed(part)
+            for key in part.type.settings:
+                if was.get(key) != props.get(key):
+                    edited.setdefault((part.type, key), []).append((part, was.get(key)))
+            if was.get("color") != props.get("color"):
+                Touched.part(uid)
+            else:
+                Touched.parts.add(uid)  # (settings don't change colors)
     editor.add_parts(missing)
+    for (_t, key), group in edited.items():  # one changed() per kind and setting
+        c.settings_changed([p for p, _ in group], key, [o for _, o in group])
     # 4. wires, parents first: add missing (their views all at once), update bends / junction points
     changed: list[WireView] = []
     with editor.wire_batch():

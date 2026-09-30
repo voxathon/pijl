@@ -349,15 +349,13 @@ def test_joins_must_name_pins_once():
             Registry().add(t)
 
 
-def test_choices_need_a_default_and_values():
+def test_choices_were_replaced_by_settings():
     from pijl.parts import PartType, Registry
 
-    class NoDefault(PartType):
-        kind, choices = "NODEF", {"speed": (1, 2)}
-
-    class Empty(PartType):
-        kind, props, choices = "EMPTY", {"speed": 1}, {"speed": ()}
-    for t in (NoDefault, Empty):
-        with pytest.raises(ValueError, match="choices"):
-            Registry().add(t)
-    assert builtin_registry().get("PULLUP").choices == {"priority": tuple(range(10))}
+    class Old(PartType):
+        kind, props, choices = "OLD", {"speed": 1}, {"speed": (1, 2)}
+    with pytest.raises(ValueError, match="replaced by `settings`"):
+        Registry().add(Old)
+    priority = builtin_registry().get("PULLUP").settings["priority"]
+    assert priority.values == tuple(range(10)) and priority.default == 0
+    assert (priority.show(0), priority.show(5), priority.show(9)) == ("0 (weakest)", "5", "9 (strongest)")

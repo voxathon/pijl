@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .parts import Registry
+from .parts import Registry, check_props
 from .project import write_atomic
 from .snapshot import MACRO, EndRef, Point, Snapshot
 
@@ -149,7 +149,10 @@ def decode(data: Any, types: Registry) -> Loaded:
             if not isinstance(label, str) or not isinstance(props, dict):
                 raise ValueError("bad label or props")
             x, y = _pair(d["pos"])
-            out.snapshot.parts[uid] = (kind, label, x, y, {**t.props, **props})
+            props, bad = check_props(t, props)
+            for why in bad:
+                warn(f"part {uid} ({kind}): {why}")
+            out.snapshot.parts[uid] = (kind, label, x, y, props)
             kinds[uid] = t
         except (KeyError, TypeError, ValueError) as e:
             warn(f"a part was unreadable ({_why(e)}), dropped")

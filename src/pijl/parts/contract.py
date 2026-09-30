@@ -34,6 +34,15 @@ What the engine promises:
     the cursor before placement -- and every opened instance gets a close().
   - Parts that aren't `pure` are never skipped, cached or reordered; only live
     (opened) instances of them are evaluated.
+  - Settings (see settings.py) are props the user edits from the context menu,
+    on one part or on a selection of parts of the same kind. Every value written
+    has been through the setting's parse(). changed() runs once per finished edit
+    (and on undo / redo), for all the edited parts at once; while a slider drags
+    the props change but changed() waits, unless the setting says live=True.
+    eval sees the new props on the next step either way.
+  - action() runs once per click on one of the part's actions, for all the
+    clicked parts at once (live ones only). Prop changes it makes are undoable;
+    anything else it does (part.state, the outside world) isn't.
 """
 
 from __future__ import annotations
@@ -41,6 +50,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
+
+from .settings import Action, Setting
 
 if TYPE_CHECKING:
     from ..sim.circuit import Part
@@ -68,9 +79,10 @@ class PartType:
     title: str = ""                  # what the body says, if not the kind
     ins: tuple[str, ...] = ()        # input pin names, top to bottom
     outs: tuple[str, ...] = ()       # output pin names, top to bottom
-    props: dict[str, Any] = {}       # per-instance settings (JSON values); each instance gets a copy
-    choices: dict[str, tuple] = {}   # props the user can set from the part's context menu:
-                                     # prop name -> the values to offer (each prop needs a default)
+    props: dict[str, Any] = {}       # per-instance data (JSON values); each instance gets a copy
+    settings: dict[str, Setting] = {}  # props the user can set from the context menu (settings.py);
+                                     # prop name -> Setting, in menu order. Not also in `props`
+    actions: dict[str, Action] = {}  # context menu rows that call action(); name -> Action
     pure: bool = False               # outputs depend only on inputs: the engine may optimize it
     category: str = ""               # default collection in the part picker ("" = loose)
     look: Look = Look()
@@ -93,6 +105,13 @@ class PartType:
 
     def frame(self, ctx: Ctx) -> None:
         """Once per frame, outside the step loop, for the live instances."""
+
+    def changed(self, ctx: Ctx, key: str, old: list) -> None:
+        """The user (or an undo / redo) changed setting `key` of ctx.parts; old[i] is
+        what ctx.parts[i] had before. The new values are already in the props."""
+
+    def action(self, ctx: Ctx, name: str) -> None:
+        """The user picked action `name` (a key of `actions`) for ctx.parts."""
 
     def click(self, part: Part) -> None:
         """The user clicked a placed instance. Overriding this makes the part clickable
