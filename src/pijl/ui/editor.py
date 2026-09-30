@@ -2244,19 +2244,20 @@ class Editor(pyglet.window.Window):
         n, c = st["frames"], self.circuit
         hidden = len(c.hidden_parts)
         self.bar.set_stats(
-            "   ".join(
+            [  # (rank, text): the bar leaves out the highest ranks first when short on room
+                (0, f"{n / st['time']:.0f} fps"),
+                (1, f"sim {1000 * st['sim'] / n:.2f} ms"),
+                (2, f"draw {1000 * st['draw'] / n:.1f} ms"),
+                (6, f"tick {c.tick}"),
                 (
-                    f"{n / st['time']:.0f} fps",
-                    f"sim {1000 * st['sim'] / n:.2f} ms",
-                    f"draw {1000 * st['draw'] / n:.1f} ms",
-                    f"tick {c.tick}",
+                    3,
                     f"{len(c.parts)} parts"
                     + (f" (+{hidden} in macros)" if hidden else ""),
-                    f"{len(c.wires)} wires",
-                    f"{len(c.net_value)} nets",
-                    f"zoom {100 * self.camera.zoom:.0f}%",
-                )
-            )
+                ),
+                (4, f"{len(c.wires)} wires"),
+                (7, f"{len(c.net_value)} nets"),
+                (5, f"zoom {100 * self.camera.zoom:.0f}%"),
+            ]
         )
         self.stats = dict.fromkeys(st, 0)
 

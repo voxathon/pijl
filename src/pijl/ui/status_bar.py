@@ -20,6 +20,7 @@ COG = BAR_H  # the cog button is a square this big, at the right end
 COG_R = 5.5 * S  # outer radius of the gear's body
 TEETH, TOOTH = 8, (3 * S, 2.5 * S)  # count, (width, how far past COG_R)
 FONT, SIZE = "Consolas", 9.5 * S
+SEP = "   "  # between the numbers
 
 
 class StatusBar:
@@ -84,6 +85,11 @@ class StatusBar:
 
         self.doc = label(T.PART_TEXT)
         self.stats = label(T.HELP_TEXT, anchor_x="right")
+        self.fields: list[tuple[int, str]] = []  # (rank, text); see set_stats
+        self.char_w = (
+            pyglet.text.Label("M" * 10, font_name=FONT, font_size=SIZE).content_width
+            / 10
+        )  # the font is monospaced
         self._layout()
 
     # ---- layout --------------------------------------------------------------
@@ -106,11 +112,17 @@ class StatusBar:
         self.body.position = self.hole.position = (cx, cy)
         self.doc.position = (self.left + PAD, cy, 0)
         self.stats.position = (self.win_w - COG - PAD, cy, 0)
-        # the numbers give way to the name when there isn't room for both
-        self.stats.visible = (
-            self.stats.x - self.stats.content_width
-            > self.doc.x + self.doc.content_width + 2 * PAD
-        )
+        # the numbers give way to the name, least important first, when there isn't room
+        room = self.stats.x - (self.doc.x + self.doc.content_width + 2 * PAD)
+        fields = self.fields
+        while (
+            fields and len(text := SEP.join(t for _, t in fields)) * self.char_w > room
+        ):
+            worst = max(r for r, _ in fields)
+            fields = [f for f in fields if f[0] != worst]
+        text = SEP.join(t for _, t in fields)
+        if text != self.stats.text:
+            self.stats.text = text
 
     # ---- content ---------------------------------------------------------------
 
@@ -119,9 +131,11 @@ class StatusBar:
             self.doc.text = text
             self._layout()
 
-    def set_stats(self, text: str) -> None:
-        if text != self.stats.text:
-            self.stats.text = text
+    def set_stats(self, fields: list[tuple[int, str]]) -> None:
+        """The numbers, in display order, each with a rank: when they don't all fit,
+        the highest ranks are left out first."""
+        if fields != self.fields:
+            self.fields = fields
             self._layout()
 
     # ---- hit testing -------------------------------------------------------------
