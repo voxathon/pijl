@@ -60,8 +60,8 @@ Controls
                            (1, 2x1, 2x2, 4x2...). While it's still selected, Ctrl+scroll spaces
                            it out along the last doubling, Ctrl+Shift+scroll the other way.
                            See duplicate.py.
-  Ctrl+S                   save the board as a macro (the first save asks for a name)
-  Ctrl+Shift+S             save under another name
+  Ctrl+S                   save the board as a macro: asks for a name, prefilled with the
+                           current one (Enter keeps it; type another to save a copy)
   Ctrl+O                   open a macro: type to filter, arrows + Enter (or click); saved macros
                            are also in the picker's MACROS section: right-click -> Open
   Ctrl+N                   new, empty board
@@ -1195,10 +1195,7 @@ class Editor(pyglet.window.Window):
         elif symbol == key.A and modifiers & key.MOD_CTRL and self.mode is Mode.IDLE:
             self.selection.set(self.part_views.values(), self.wire_views.values())
         elif symbol == key.S and modifiers & key.MOD_CTRL and self.mode is Mode.IDLE:
-            if modifiers & key.MOD_SHIFT:
-                self._save_as()
-            else:
-                self._save()
+            self._save_as()  # prefilled with the current name: Enter just saves
         elif symbol == key.O and modifiers & key.MOD_CTRL and self.mode is Mode.IDLE:
             self._open_dialog()
         elif symbol == key.N and modifiers & key.MOD_CTRL and self.mode is Mode.IDLE:
