@@ -384,6 +384,19 @@ class PartPicker:
         self.refresh()
         self._place_all()
 
+    def set_library(self, library: Library) -> None:
+        """Show another library (another project's); no animation from the old one."""
+        for w in self.widgets.values():
+            w.delete()
+        self.widgets.clear()
+        self.lib, self.hovered = library, None
+        self.scroll = self.scroll_target = 0.0
+        self.refresh()
+        for w in self.widgets.values():
+            w.alpha, w.top = 1.0, w.target_top
+        self.divider_top = self.divider_target
+        self._place_all()
+
     def scroll_by(self, clicks: float) -> None:
         self.scroll_target = self._clamp_scroll(self.scroll_target - clicks * SCROLL_STEP)
 

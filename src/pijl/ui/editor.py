@@ -60,6 +60,8 @@ Controls
   Ctrl+N                   new, empty board
   Tab                      pin names on placed parts: hidden -> on hover -> always -> hidden
                            (opening, new and closing the window ask first if there are unsaved changes)
+  cogwheel (bottom right)  Controls (the short version of this list, see controls.py: keep them in
+                           step), Open macro..., Projects: switch to another project or make a new one
   Ctrl+Z / Ctrl+Y          undo / redo (also Ctrl+Shift+Z). During an action, Ctrl+Z cancels it.
                            Every finished edit is recorded automatically; see document.py.
   right-drag empty space   pan (middle-drag pans in any mode)
@@ -84,12 +86,13 @@ from pyglet.window import key, mouse
 
 from ..macros import Catalog
 from ..parts import load as load_parts
-from ..project import Project, write_atomic
+from ..project import Project, last_project, project_names, remember_project, write_atomic
 from ..storage import NAME_MAX, FormatError, MacroStore, check_name
 from ..sim import Part, Circuit, Pin, Wire
 from ..snapshot import MACRO  # library entries (and part kinds) of saved macros: "macro:<name>"
 from . import theme as T
 from .camera import MIN_LEVEL, STEPS_PER_OCTAVE, Camera
+from .controls import ControlsSheet
 from .document import EMPTY, History, Snapshot, capture, instantiate, internal_wires, restore
 from .duplicate import DOWN, RIGHT, Cell, Tiling
 from .grid import Grid
@@ -101,6 +104,7 @@ from .picker import PartPicker, Row
 from .prompt import Prompt
 from .sdf_text import SDFText
 from .selection import Selection
+from .status_bar import BAR_H, StatusBar
 from .views import (PartView, Layers, Point, Polyline, WireView, arc_length_at, points_before, project_onto,
                     theme_color)
 from .wire_edit import WireEditSession
@@ -114,6 +118,7 @@ SETTLE_TICKS = 64  # settling noise for new parts, see sim/circuit.py
 MACROS = "MACROS"  # the picker collection new macros land in
 NOTICE_SECONDS = 4.0
 DOUBLE_CLICK = 0.4  # s: a second click on the same picker row within this is treated as mouse bounce
+STATS_EVERY = 0.25  # s: how often the status bar's numbers are refreshed (averaged over that time)
 
 
 class Mode(Enum):
@@ -146,15 +151,16 @@ class Editor(pyglet.window.Window):
     def __init__(self) -> None:
         self.history: History | None = None  # set up by _start_document; checked by dispatch_event
         super().__init__(1280, 720, caption="pijl", resizable=True, vsync=True, config=_make_config())
-        self.project = Project.open()  # where saves go; created on first run (see project.py)
-        self.parts = load_parts(self.project.parts_dir)  # the project's part scripts (see pijl.parts)
-        self.store = MacroStore(self.project.macros_dir)
         # the open document: a macro, or an untitled board (set early: the picker asks about it)
         self.doc: str | None = None          # its name; None = untitled
         self.saved: Snapshot = EMPTY         # what's on disk (dirty = history.current differs)
-        # Part scripts plus macros. A macro's definition is read from its file when first needed.
-        self.catalog = Catalog(self.parts, lambda name: self.store.load(name, self.catalog).snapshot)
-        self.circuit = Circuit(self.catalog, settle_ticks=SETTLE_TICKS)
+        self.load_problems: list[str] = []
+        try:
+            project = Project.open(last_project())  # created on first run (see project.py)
+        except (OSError, ValueError) as e:
+            self.load_problems.append(f"can't open the last project ({e}); opened the default one")
+            project = Project.open()
+        self._bind_project(project)
         self.pin_label_mode = PIN_LABELS_HOVER  # Tab cycles it
         self.hover_view: PartView | None = None  # the part whose pin names hover shows
         self.camera = Camera()
@@ -166,23 +172,19 @@ class Editor(pyglet.window.Window):
         self.layers = Layers()
         self.text = SDFText(self.world, self.layers.text_order)
         self.hud = pyglet.graphics.Batch()
-        self.startup_problems: list[str] = [f"part script {msg}" for msg in self.parts.errors]
         self.library = self._load_library()
         self.picker = PartPicker(self.library, self.hud, self.height, self._pixel_ratio(),
                                  swatch=self._swatch, name_of=lambda entry: entry.removeprefix(MACRO),
                                  disabled=self._unplaceable)
         self.menu = ContextMenu(self.hud)
-        self.help = pyglet.text.Label(
-            "click pin: wire | click: select | drag empty: box select | Del: delete | Ctrl+C/X/V/D | "
-            "Ctrl+Z/Y | Ctrl+S/O/N: save/open/new | Tab: pin names | right-click: menu | middle-drag: pan | "
-            "scroll: zoom | hold Ctrl: snap",
-            font_name="Consolas", font_size=10, color=T.HELP_TEXT,
-            x=self.picker.width + 8, y=self.height - 8, anchor_y="top", batch=self.hud)
         # Problems (part scripts, files) in red; notices ("saved adder") in grey, for a few seconds
         self.status = pyglet.text.Label(
             "", font_name="Consolas", font_size=10, color=T.MENU_DANGER,
-            x=self.picker.width + 8, y=self.height - 24, anchor_y="top", batch=self.hud)
-        for msg in self.startup_problems:
+            x=self.picker.width + 8, y=self.height - 8, anchor_y="top", batch=self.hud)
+        self.bar = StatusBar(self.hud, self.width)
+        # runtime numbers for the bar, summed over STATS_EVERY seconds
+        self.stats = {"frames": 0, "time": 0.0, "sim": 0.0, "steps": 0, "draw": 0.0}
+        for msg in self.load_problems:
             self._report(msg)
 
         self.part_views: dict[Part, PartView] = {}
@@ -467,6 +469,10 @@ class Editor(pyglet.window.Window):
         if button == mouse.MIDDLE:
             self.panning = True
             return
+        if self.bar.contains(x, y):
+            if button == mouse.LEFT and self.bar.cog_hit(x, y) and self.mode is Mode.IDLE:
+                self._cog_menu()
+            return  # the bar isn't board: no placing, bends or selecting under it
 
         if self.mode is Mode.EDITING_WIRE and in_picker:
             self._finish_wire_edit(commit=True)  # like any click away from the wire
@@ -615,6 +621,7 @@ class Editor(pyglet.window.Window):
 
     def on_mouse_motion(self, x, y, dx, dy):
         self.mouse = (x, y)
+        self.bar.set_hover(self.mode is Mode.IDLE and self.bar.cog_hit(x, y))
         if self.mode is Mode.PROMPT:
             self.prompt.hover(x, y)
             return
@@ -1225,10 +1232,13 @@ class Editor(pyglet.window.Window):
         if self.prompt is not None:
             self.prompt.tick(dt)
         self._update_caption()
-        self.help.x = self.status.x = self.picker.width + 8  # follows the panel sliding in / out
+        self.status.x = self.picker.width + 8  # follows the panel sliding in / out
+        self.bar.place(self.picker.width, self.width)
+        t0 = time.perf_counter()
         self.circuit.frame()
         for _ in range(SIM_STEPS_PER_FRAME):
             self.circuit.step()
+        self._tally(dt, time.perf_counter() - t0)
         while self.circuit.errors:
             self._report(self.circuit.errors.pop(0))
         for view in self.part_views.values():
@@ -1238,13 +1248,14 @@ class Editor(pyglet.window.Window):
 
     def on_resize(self, width, height):
         super().on_resize(width, height)  # keeps the projection matrix in sync
-        self.help.y = height - 8
-        self.status.y = height - 24
+        self.status.y = height - 8
+        self.bar.place(self.picker.width, width)
         if self.prompt is not None:
             self.prompt.layout(width, height)
         self.picker.resize(height, self._pixel_ratio())
 
     def on_draw(self):
+        t0 = time.perf_counter()
         self.clear()
         self.grid.draw(self, self.camera, emphasized=self.snapping,  # also paints the background
                        divisions=self.grid_divisions)
@@ -1252,6 +1263,28 @@ class Editor(pyglet.window.Window):
         self.world.draw()
         self.view = Mat4()  # identity: HUD is in screen pixels
         self.hud.draw()
+        self.stats["draw"] += time.perf_counter() - t0  # CPU side: issuing the draws, not the GPU's work
+
+    def _tally(self, dt: float, sim: float) -> None:
+        """Add up one frame's numbers; every STATS_EVERY seconds, show their averages in the bar."""
+        st = self.stats
+        st["frames"] += 1
+        st["time"] += dt
+        st["sim"] += sim
+        if st["time"] < STATS_EVERY:
+            return
+        n, c = st["frames"], self.circuit
+        hidden = len(c.hidden_parts)
+        self.bar.set_stats("   ".join((
+            f"{n / st['time']:.0f} fps",
+            f"sim {1000 * st['sim'] / n:.2f} ms",
+            f"draw {1000 * st['draw'] / n:.1f} ms",
+            f"tick {c.tick}",
+            f"{len(c.parts)} parts" + (f" (+{hidden} in macros)" if hidden else ""),
+            f"{len(c.wires)} wires",
+            f"{len(c.net_value)} nets",
+            f"zoom {100 * self.camera.zoom:.0f}%")))
+        self.stats = dict.fromkeys(st, 0)
 
     def on_close(self):
         # Not calling super() (it closes right away): unsaved changes get asked about first.
@@ -1453,11 +1486,13 @@ class Editor(pyglet.window.Window):
         self.mode = Mode.IDLE
 
     def _update_caption(self) -> None:
-        state = (self.history.current, self.saved, self.doc)
-        if len(self._caption_for) == 3 and all(a is b for a, b in zip(state, self._caption_for)):
+        state = (self.history.current, self.saved, self.doc, self.project)
+        if len(self._caption_for) == len(state) and all(a is b for a, b in zip(state, self._caption_for)):
             return  # nothing changed since last frame (compared by identity: cheap)
         self._caption_for = state
-        self.set_caption(f"pijl - {self.doc or 'untitled'}{' *' if self.dirty else ''}")
+        name = f"{self.doc or 'untitled'}{' *' if self.dirty else ''}"
+        self.set_caption(f"pijl - {name}")
+        self.bar.set_doc(f"{self.project.name} / {name}")
 
     def _fit_camera(self) -> None:
         """Show everything on the board, centered in the space right of the picker.
@@ -1473,10 +1508,92 @@ class Editor(pyglet.window.Window):
         x1 = max(v.x + v.w for v in views) + margin
         y1 = max(v.y + v.h for v in views) + margin
         avail = max(1, self.width - self.picker.width)
-        fit = min(avail / (x1 - x0), self.height / (y1 - y0))
+        fit = min(avail / (x1 - x0), max(1, self.height - BAR_H) / (y1 - y0))
         self.camera.level = max(MIN_LEVEL, min(0, math.floor(STEPS_PER_OCTAVE * math.log2(fit))))
         self.camera.center_on((x0 + x1) / 2, (y0 + y1) / 2, self.width, self.height)
         self.camera.x -= self.picker.width / 2 / self.camera.zoom  # center in the free space, not the window
+        self.camera.y -= BAR_H / 2 / self.camera.zoom
+
+    # ---- projects and the cogwheel menu ---------------------------------------------
+
+    def _bind_project(self, project: Project) -> None:
+        """Point everything at `project`: its part scripts, its macros, a fresh circuit.
+        (Its picker library is loaded separately, see _load_library.)"""
+        self.project = project
+        try:
+            remember_project(project.name)
+        except OSError as e:
+            self.load_problems.append(f"couldn't save settings.json: {e}")
+        self.parts = load_parts(project.parts_dir)  # the project's part scripts (see pijl.parts)
+        self.load_problems += [f"part script {msg}" for msg in self.parts.errors]
+        self.store = MacroStore(project.macros_dir)
+        # Part scripts plus macros. A macro's definition is read from its file when first needed.
+        self.catalog = Catalog(self.parts, lambda name: self.store.load(name, self.catalog).snapshot)
+        self.circuit = Circuit(self.catalog, settle_ticks=SETTLE_TICKS)
+
+    def _cog_menu(self) -> None:
+        current = self.project.name
+        projects = [MenuItem(name, lambda n=name: self._request_project(n), checked=name == current)
+                    for name in project_names()]
+        projects.append(MenuItem("New project...", self._new_project_dialog))
+        self._open_menu(*self.bar.cog_anchor, [MenuItem("Controls", self._show_controls),
+                                               MenuItem("Open macro...", self._open_dialog),
+                                               MenuItem("Projects", submenu=projects)])
+
+    def _show_controls(self) -> None:
+        sheet = ControlsSheet(self.hud, self.width, self.height, self._pixel_ratio())
+
+        def page(symbol: int) -> None:
+            if symbol in (key.PAGEUP, key.PAGEDOWN):
+                sheet.move(-8 if symbol == key.PAGEUP else 8)
+
+        self._open_prompt(sheet, lambda _: self._close_prompt(), page)
+
+    def _new_project_dialog(self) -> None:
+        p = Prompt(self.hud, self.width, self.height, "New project", text="", max_len=NAME_MAX,
+                   hint="Enter: create it   Esc: cancel")
+
+        def enter(p: Prompt) -> None:
+            try:
+                name = check_name(p.text)
+            except ValueError as e:
+                p.set_hint(str(e), danger=True)
+                return
+            existing = next((n for n in project_names() if n.casefold() == name.casefold()), None)
+            if existing is not None:
+                p.set_hint(f"{existing} already exists", danger=True)
+                return
+            self._close_prompt()
+            self._request_project(name)
+
+        self._open_prompt(p, enter)
+
+    def _request_project(self, name: str) -> None:
+        if name == self.project.name:
+            self._notice(f"{name} is already open")
+            return
+        self._unsaved_then(lambda: self._switch_project(name))
+
+    def _switch_project(self, name: str) -> None:
+        """Close this project and open (or create) another, reopening what was open in it last."""
+        try:
+            project = Project.open(name)
+        except (OSError, ValueError) as e:
+            self._report(f"can't open project {name}: {e}")
+            return
+        self._save_library()
+        self._clear_board()
+        self.circuit.close_all()
+        # the clipboard's parts may not exist over there
+        self.clipboard, self.tiling, self._painted = None, None, None
+        self.load_problems = []
+        self._bind_project(project)
+        self.library = self._load_library()
+        self.picker.set_library(self.library)
+        self._clear_status()
+        for msg in self.load_problems:
+            self._report(msg)
+        self._start_document()
 
     # ---- the picker's library ----------------------------------------------------
 
@@ -1492,8 +1609,8 @@ class Editor(pyglet.window.Window):
         except FileNotFoundError:
             pass
         except (OSError, ValueError) as e:
-            # (too early to _report: the status line doesn't exist yet; __init__ shows it)
-            self.startup_problems.append(f"library.json unreadable ({e}); using the default layout")
+            # (too early to _report on start: the status line doesn't exist yet; the caller shows it)
+            self.load_problems.append(f"library.json unreadable ({e}); using the default layout")
         self._library_saved = lib.to_dict()
         return lib
 

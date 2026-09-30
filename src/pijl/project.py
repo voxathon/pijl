@@ -1,9 +1,11 @@
 """Where saved data lives. Pure filesystem logic, no pyglet.
 
 Everything the user makes is grouped into *projects*, each a folder under the
-data root. For now there's only ever one, "default", created on first run.
+data root. "default" is created on first run; more can be made from the status
+bar's cogwheel menu. The one open last is reopened on start (settings.json).
 
     <data root>/                  %APPDATA%\\pijl on Windows (PIJL_DATA overrides)
+      settings.json               app-wide: which project was open last
       projects/
         default/
           project.json            marks the folder as a project; format version
@@ -48,6 +50,43 @@ def data_root() -> Path:
 
 def projects_dir() -> Path:
     return data_root() / "projects"
+
+
+def project_names() -> list[str]:
+    """Every project on disk (a folder under projects/ with a project.json), by name."""
+    try:
+        found = [p.name for p in projects_dir().iterdir() if (p / "project.json").is_file()]
+    except OSError:
+        return []
+    return sorted(found, key=str.casefold)
+
+
+def _settings_file() -> Path:
+    return data_root() / "settings.json"
+
+
+def last_project() -> str:
+    """The project that was open last time (DEFAULT_PROJECT if none, or it's gone)."""
+    try:
+        name = json.loads(_settings_file().read_text(encoding="utf-8")).get("project")
+    except (OSError, ValueError, AttributeError):
+        return DEFAULT_PROJECT
+    if isinstance(name, str) and (projects_dir() / name / "project.json").is_file():
+        return name
+    return DEFAULT_PROJECT
+
+
+def remember_project(name: str) -> None:
+    try:
+        settings = json.loads(_settings_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        settings = {}
+    if not isinstance(settings, dict):
+        settings = {}
+    if settings.get("project") != name:
+        settings["project"] = name
+        _settings_file().parent.mkdir(parents=True, exist_ok=True)
+        write_atomic(_settings_file(), json.dumps(settings, indent=2) + "\n")
 
 
 @dataclass(frozen=True)

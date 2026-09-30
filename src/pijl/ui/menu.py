@@ -40,7 +40,7 @@ class MenuItem:
     danger: bool = False  # drawn in red (e.g. Delete)
     submenu: list[MenuItem] | None = None  # hovering opens it; the item has no action of its own
     swatch: tuple[int, int, int] | str | None = None  # a color square before the text (or RAINBOW)
-    checked: bool = False  # the current choice: a border around the swatch / a mark
+    checked: bool = False  # the current choice: a border around the swatch, or a dot if none
 
     def __post_init__(self) -> None:
         assert (self.action is None) != (self.submenu is None), "an item has an action or a submenu"
@@ -94,7 +94,7 @@ class ContextMenu:
         labels = [pyglet.text.Label(item.text, font_name="Consolas", font_size=11 * S,
                                     color=T.MENU_DANGER if item.danger else T.PART_TEXT, anchor_y="center",
                                     batch=self.batch, group=fg) for item in items]
-        text_x = 10 * S + (SWATCH + 8 * S if any(i.swatch for i in items) else 0)
+        text_x = 10 * S + (SWATCH + 8 * S if any(i.swatch or i.checked for i in items) else 0)
         arrow_w = 4 * ARROW if any(i.submenu for i in items) else 0
         item_w = max([ITEM_W, *(text_x + label.content_width + 10 * S + arrow_w for label in labels)])
         w = item_w + 2 * PAD
@@ -132,6 +132,9 @@ class ContextMenu:
                 else:
                     panel.shapes.append(shapes.Rectangle(sx0, cy - SWATCH / 2, SWATCH, SWATCH, color=item.swatch,
                                                          batch=self.batch, group=fg))
+            elif item.checked:  # no swatch: a dot marks the current choice
+                panel.shapes.append(shapes.Circle(left + PAD + 10 * S + SWATCH / 2, cy, SWATCH / 4,
+                                                  color=T.PART_TEXT[:3], batch=self.batch, group=fg))
             if item.submenu:
                 ax = left + PAD + item_w - 10 * S
                 panel.shapes.append(shapes.Triangle(ax - 1.5 * ARROW, cy - ARROW, ax - 1.5 * ARROW, cy + ARROW,
