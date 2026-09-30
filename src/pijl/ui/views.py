@@ -15,6 +15,7 @@ from pyglet import shapes
 
 from ..sim import Part, Pin, Wire
 from . import theme as T
+from .paint import Pair, Rgb, mix, sample, with_hue
 from .sdf_text import SDFText
 
 Point = tuple[float, float]
@@ -34,39 +35,114 @@ class Layers:
         self.overlay = pyglet.graphics.Group(order=6)
 
 
+class _GradientLine(shapes.Line):
+    """A Line whose two ends can have different colors (the GPU blends between them)."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        self._rgba2: tuple[int, int, int] | None = None  # end color; None: same as the start
+        super().__init__(*args, **kwargs)
+
+    def set_colors(self, start: tuple, end: tuple) -> None:
+        """Both ends at once; 3-component colors keep the current opacity."""
+        self._rgba = (*start[:3], start[3] if len(start) > 3 else self._rgba[3])
+        self._rgba2 = None if end[:3] == start[:3] else tuple(end[:3])
+        self._update_color()
+
+    def _create_vertex_list(self) -> None:
+        super()._create_vertex_list()
+        self._update_color()
+
+    def _update_color(self) -> None:
+        if self._rgba2 is None:
+            super()._update_color()
+            return
+        a, b = self._rgba, (*self._rgba2, self._rgba[3])
+        self._vertex_list.colors[:] = a + b + b + a + b + a  # vertex order of shapes.Line: start, end, end, ...
+
+
+GRADIENT_STEPS = 8  # pieces per stretch between two gradient stops (OKLab isn't linear in RGB)
+
+
 class Polyline:
-    """Thick line through several points, with round joints so corners have no gaps."""
+    """Thick line through several points, with round joints so corners have no gaps.
+    One color, or a gradient along its length (set_gradient)."""
 
     def __init__(self, points: list[Point], color, batch: pyglet.graphics.Batch,
                  group: pyglet.graphics.Group, thickness: float = T.WIRE_THICKNESS) -> None:
         self.batch, self.group, self.thickness = batch, group, thickness
         self._color = color
+        self._stops: list[tuple[float, tuple]] | None = None  # gradient: (fraction of the length, rgb)
         self._opacity: int | None = None  # None: whatever alpha the color carries
-        self.segments: list[shapes.Line] = []
+        self.segments: list[_GradientLine] = []
         self.joints: list[shapes.Circle] = []
         self.points: list[Point] = []
         self.set_points(points)
 
     def set_points(self, points: list[Point]) -> None:
-        n_seg = max(len(points) - 1, 0)
-        n_joint = max(len(points) - 2, 0)
+        self.points = list(points)
+        self._build()
+
+    def set_gradient(self, stops: list[tuple[float, tuple]]) -> None:
+        """Colors at fractions of the length, ascending; the line blends between them."""
+        if all(c[:3] == stops[0][1][:3] for _, c in stops):
+            self.color = stops[0][1]  # one color after all: plain line
+            return
+        if stops != self._stops:
+            self._stops = list(stops)
+            self._build()
+
+    def _build(self) -> None:
+        """Lay segments along the points. A gradient splits them further: at every stop,
+        and in GRADIENT_STEPS pieces between stops, so each piece blends only a little."""
+        pts = self.points
+        cum = [0.0]
+        for a, b in zip(pts, pts[1:]):
+            cum.append(cum[-1] + math.dist(a, b))
+        total = cum[-1]
+        if self._stops is None or total == 0:
+            verts, corner_idx = pts, list(range(1, len(pts) - 1))
+            colors = [self._color] * len(pts)
+        else:
+            fracs = [c / total for c in cum]
+            cuts = set()
+            for (f0, c0), (f1, c1) in zip(self._stops, self._stops[1:]):
+                cuts.add(f0)
+                if c0 != c1:
+                    cuts.update(f0 + (f1 - f0) * i / GRADIENT_STEPS for i in range(1, GRADIENT_STEPS))
+            cuts = sorted(f for f in cuts if 0 < f < 1 and all(abs(f - g) > 1e-9 for g in fracs))
+            verts, vfracs, k, corner_idx = [pts[0]], [0.0], 0, []
+            for i, (a, b) in enumerate(zip(pts, pts[1:])):
+                while k < len(cuts) and cuts[k] < fracs[i + 1]:
+                    t = (cuts[k] - fracs[i]) / (fracs[i + 1] - fracs[i])
+                    verts.append((a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])))
+                    vfracs.append(cuts[k])
+                    k += 1
+                if i + 1 < len(pts) - 1:
+                    corner_idx.append(len(verts))
+                verts.append(b)
+                vfracs.append(fracs[i + 1])
+            colors = [_sample_rgb(self._stops, f) for f in vfracs]
+        n_seg = max(len(verts) - 1, 0)
         while len(self.segments) < n_seg:
-            self.segments.append(self._styled(shapes.Line(0, 0, 0, 0, thickness=self.thickness, color=self._color,
-                                                          batch=self.batch, group=self.group)))
+            self.segments.append(self._styled(_GradientLine(0, 0, 0, 0, thickness=self.thickness, color=self._color,
+                                                            batch=self.batch, group=self.group)))
         while len(self.segments) > n_seg:
             self.segments.pop().delete()
+        for seg, (a, b), c0, c1 in zip(self.segments, zip(verts, verts[1:]), colors, colors[1:]):
+            seg.x, seg.y = a
+            seg.x2, seg.y2 = b
+            seg.set_colors(c0, c1)
+        # round joints only at the real corners (pieces of one straight segment need none)
+        corners = [(verts[i], colors[i]) for i in corner_idx]
+        n_joint = len(corners)
         while len(self.joints) < n_joint:
             self.joints.append(self._styled(shapes.Circle(0, 0, self.thickness / 2, segments=T.JOINT_SEGMENTS,
                                                           color=self._color, batch=self.batch, group=self.group)))
         while len(self.joints) > n_joint:
             self.joints.pop().delete()
-
-        for seg, (a, b) in zip(self.segments, zip(points, points[1:])):
-            seg.x, seg.y = a
-            seg.x2, seg.y2 = b
-        for joint, p in zip(self.joints, points[1:-1]):
+        for joint, (p, c) in zip(self.joints, corners):
             joint.position = p
-        self.points = list(points)
+            joint.color = c
 
     @property
     def color(self):
@@ -74,9 +150,14 @@ class Polyline:
 
     @color.setter
     def color(self, value) -> None:
+        """One color for the whole line (drops any gradient)."""
         self._color = value
+        if self._stops is not None:
+            self._stops = None
+            self._build()
+            return
         for s in self.segments:
-            s.color = value
+            s.set_colors(value, value)
         for j in self.joints:
             j.color = value
 
@@ -106,6 +187,15 @@ class Polyline:
             j.delete()
         self.segments.clear()
         self.joints.clear()
+
+
+def _sample_rgb(stops: list[tuple[float, tuple]], f: float) -> tuple:
+    if f <= stops[0][0]:
+        return stops[0][1]
+    for (f0, c0), (f1, c1) in zip(stops, stops[1:]):
+        if f <= f1:
+            return mix(c0, c1, 0.0 if f1 == f0 else (f - f0) / (f1 - f0))
+    return stops[-1][1]
 
 
 def _segment_distance(px: float, py: float, a: Point, b: Point) -> float:
@@ -225,6 +315,8 @@ class PartView:
                                   color=T.SELECT, batch=batch, group=layers.selection)
         self.outline.visible = False
         self._last_state: tuple[bool, ...] | None = None
+        self.pin_tints: list[Rgb | None] = [None] * len(self.pin_dots)  # hue for each lit pin (paint.py)
+        self.body_tint: Rgb | None = None  # hue for a lit body (switches, LEDs)
         self.set_pin_labels(pin_labels)
         self.move_to(x, y)
         self.sync()
@@ -338,10 +430,18 @@ class PartView:
             return
         self._last_state = state
         # 3-component colors keep the current opacity (matters for ghosts)
-        for dot, on in zip(self.pin_dots, state):
-            dot.color = T.PIN_ON if on else T.PIN_OFF
+        for dot, on, tint in zip(self.pin_dots, state, self.pin_tints):
+            dot.color = with_hue(T.PIN_ON, tint) if on else T.PIN_OFF
         if self.look.lit and state:  # body color follows the first pin (switches, LEDs)
-            self._set_body(theme_color(self.look.lit[1] if state[0] else self.look.lit[0]))
+            fill, border = theme_color(self.look.lit[1] if state[0] else self.look.lit[0])
+            self._set_body((with_hue(fill, self.body_tint), with_hue(border, self.body_tint)))
+
+    def set_tints(self, pins: list[Rgb | None], body: Rgb | None) -> None:
+        if pins == self.pin_tints and body == self.body_tint:
+            return
+        self.pin_tints, self.body_tint = pins, body
+        self._last_state = None
+        self.sync()
 
     def _set_body(self, colors: tuple[tuple[int, int, int], tuple[int, int, int]]) -> None:
         self.body.color, self.body.border_color = colors
@@ -361,7 +461,9 @@ class PartView:
 class WireView:
     """A wire drawn from its src pin, through user-placed bend points, to its dst pin.
 
-    Bend points are layout data, so they live here and not in the sim.
+    Bend points are layout data, so they live here and not in the sim. So is color:
+    `color` is what the user picked (None: Default), `stops` the gradient that
+    paint.py worked out from it and from what the wire connects to.
     """
 
     def __init__(self, wire: Wire, src: Point, bends: list[Point], dst: Point,
@@ -369,7 +471,8 @@ class WireView:
         self.wire = wire
         self.src, self.dst = src, dst
         self.bends = list(bends)
-        self.color = color  # a T.WIRE_COLORS name; None = the default look
+        self.color = color  # a T.WIRE_COLORS name; None = Default (inherit from the ends)
+        self.stops: list[tuple[float, Pair]] = []  # empty: neutral, the classic grey / red
         self.batch, self.layers = batch, layers
         self.line = Polyline(self.points, T.WIRE_OFF, batch, layers.wires)
         self.highlight: Polyline | None = None  # selection glow, only while selected
@@ -430,16 +533,30 @@ class WireView:
             return
         self._last_state = state
         on, conflict = state
-        off_color, on_color = T.WIRE_COLORS.get(self.color, T.WIRE_COLORS[None])  # unknown name: default
-        color = T.WIRE_CONFLICT if conflict else on_color if on else off_color
-        self.line.color = color
-        for dot in self.dots.values():
-            dot.color = color
+        if conflict or not self.stops:
+            color = T.WIRE_CONFLICT if conflict else T.WIRE_ON if on else T.WIRE_OFF
+            self.line.color = color
+            for dot in self.dots.values():
+                dot.color = color
+            return
+        self.line.set_gradient([(f, c[on]) for f, c in self.stops])
+        for end, dot in self.dots.items():
+            dot.color = sample(self.stops, 0.0 if end == "src" else 1.0)[on]
 
-    def set_color(self, color: str | None) -> None:
-        self.color = color
+    def set_stops(self, stops: list[tuple[float, Pair]]) -> None:
+        if stops == self.stops:
+            return
+        self.stops = stops
         state, self._last_state = self._last_state, None
         self.sync(state or (False, False))
+
+    def color_at(self, p: Point) -> Pair | None:
+        """The gradient at the spot nearest to `p` (where a branch attaches); None if neutral."""
+        if not self.stops:
+            return None
+        pts = self.points
+        total = sum(math.dist(a, b) for a, b in zip(pts, pts[1:]))
+        return sample(self.stops, arc_length_at(pts, p) / total if total else 0.0)
 
     def distance_to(self, wx: float, wy: float) -> float:
         return self.line.distance_to(wx, wy)

@@ -39,7 +39,8 @@ Controls
     Delete (wires)         cuts the wire like Digital Logic Sim: from the nearest junction
                            before the spot you clicked, onward. See cut_wire.
     Label...               type in place; Enter commits, Esc reverts, clicking elsewhere commits
-    Recolor (wires)        a submenu of 8 colors; new branches take their wire's color
+    Recolor                wires and IN/OUT parts: 8 colors, or Default (inherit). Colors blend
+                           along wires, see paint.py. New branches take their wire's color
     Edit (wires)           hold+drag square handles to move bends, "+" handles or the wire
                            itself to add one; right-click a square to remove it. Round handles
                            are junctions (its own ends and branches off it): drag to slide
@@ -89,7 +90,8 @@ from .document import EMPTY, History, Snapshot, capture, instantiate, internal_w
 from .grid import Grid
 from .library import Library
 from .line_edit import LineEdit
-from .menu import ContextMenu, MenuItem
+from .menu import RAINBOW, ContextMenu, MenuItem
+from .paint import paint, part_color
 from .picker import PartPicker, Row
 from .prompt import Prompt
 from .sdf_text import SDFText
@@ -202,6 +204,7 @@ class Editor(pyglet.window.Window):
         self.edit: LineEdit | None = None
         self.caret: shapes.Rectangle | None = None
         self.wire_edit: WireEditSession | None = None
+        self._painted: Snapshot | None = None  # the board as paint() last saw it
         # placing (new part or paste): ghosts that follow the cursor until a click
         self.placing_views: list[PartView] = []
         self.placing_wires: list[WireView] = []
@@ -556,14 +559,19 @@ class Editor(pyglet.window.Window):
             # highlight shows exactly what the menu will act on.
             if view := self.part_at(wx, wy):
                 self.selection.set(parts=[view])
-                self._open_menu(x, y, [MenuItem("Label...", lambda: self._start_edit(view)),
-                                       MenuItem("Delete", lambda: self.remove_part(view), danger=True)])
+                items = [MenuItem("Label...", lambda: self._start_edit(view))]
+                if view.look.lit:  # switches and LEDs are color sources (paint.py)
+                    items.append(MenuItem("Recolor", submenu=self._recolor_items(
+                        part_color(view.part), lambda c: self._set_part_color(view, c))))
+                items.append(MenuItem("Delete", lambda: self.remove_part(view), danger=True))
+                self._open_menu(x, y, items)
             elif wire := self.wire_at(wx, wy):
                 self.selection.set(wires=[wire])
                 at = project_onto(wire.points, (wx, wy))
                 self._open_menu(x, y, [MenuItem("Edit", lambda: self._start_wire_edit(wire)),
                                        MenuItem("Branch", lambda: self._start_wiring(wire.wire, at)),
-                                       MenuItem("Recolor", submenu=self._recolor_items(wire)),
+                                       MenuItem("Recolor", submenu=self._recolor_items(
+                                           wire.color, lambda c: setattr(wire, "color", c))),
                                        MenuItem("Delete", lambda: self.cut_wire(wire, at), danger=True)])
             else:
                 self.panning = True
@@ -771,10 +779,19 @@ class Editor(pyglet.window.Window):
         self.menu.hover(x, y)
         self.mode = Mode.MENU
 
-    def _recolor_items(self, view: WireView) -> list[MenuItem]:
-        return [MenuItem((name or "default").capitalize(), lambda c=name: view.set_color(c),
-                         swatch=on, checked=view.color == name)
-                for name, (_, on) in T.WIRE_COLORS.items()]
+    @staticmethod
+    def _recolor_items(current: str | None, set_color) -> list[MenuItem]:
+        """The palette, then Default (inherit a color: paint.py), for a wire or an IN/OUT part."""
+        return [*(MenuItem(name.capitalize(), lambda c=name: set_color(c), swatch=on, checked=current == name)
+                  for name, (_, on) in T.WIRE_COLORS.items()),
+                MenuItem("Default", lambda: set_color(None), swatch=RAINBOW, checked=current is None)]
+
+    @staticmethod
+    def _set_part_color(view: PartView, color: str | None) -> None:
+        if color is None:
+            view.part.props.pop("color", None)
+        else:
+            view.part.props["color"] = color
 
     def _close_menu(self) -> None:
         self.menu.close()
@@ -934,6 +951,7 @@ class Editor(pyglet.window.Window):
 
     def _start_paste(self) -> None:
         views, wires = instantiate(self, self.clipboard, live=False)
+        paint(self)  # the ghosts show their colors too
         self._carry(views, wires, again=self._start_paste)
         self.placing_kind = None
 
@@ -1137,7 +1155,9 @@ class Editor(pyglet.window.Window):
         empty space, a switch toggle) don't clutter the history."""
         result = super().dispatch_event(event_type, *args)
         if event_type in self._EDIT_EVENTS and self.history is not None and self.mode is Mode.IDLE:
-            self.history.commit(capture(self))
+            snap = capture(self)
+            self.history.commit(snap)
+            self._repaint(snap)
         if event_type in self._EDIT_EVENTS and self.history is not None:
             self._save_library()  # picker rearrangements are saved as they happen (no-op if unchanged)
         return result
@@ -1230,9 +1250,16 @@ class Editor(pyglet.window.Window):
         self._reset_history(None)
         self.camera.center_on(*HOME, self.width, self.height)
 
+    def _repaint(self, snap: Snapshot) -> None:
+        """Rework wire gradients and part tints (paint.py) if the board changed since last time."""
+        if snap != self._painted:
+            paint(self)
+            self._painted = snap
+
     def _reset_history(self, doc: str | None) -> None:
         """A fresh undo timeline for what's on the board now, which counts as saved."""
         self.history = History(capture(self))
+        self._repaint(self.history.current)
         self.saved = self.history.current
         self.doc = doc
         self.picker.refresh()  # what's greyed out depends on what's open

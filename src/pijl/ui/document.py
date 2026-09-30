@@ -102,8 +102,7 @@ def restore(editor: Editor, target: Snapshot) -> None:
             wire_by_uid[uid] = wire
             continue
         view = editor.wire_views[wire]
-        if view.color != target.wire_colors.get(uid):
-            view.set_color(target.wire_colors.get(uid))
+        view.color = target.wire_colors.get(uid)  # paint() redoes the gradients
         if tuple(view.bends) != bends or (src_pt and view.src != src_pt) or (dst_pt and view.dst != dst_pt):
             view.src, view.dst = src_pt or view.src, dst_pt or view.dst
             view.set_bends(list(bends))

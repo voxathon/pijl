@@ -1,6 +1,3 @@
-# nuitka-project: --standalone
-# nuitka-project: --onefile
-
 from pijl.ui import run
 
 

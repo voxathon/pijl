@@ -16,17 +16,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable
 
+import colorsys
+
 import pyglet
 from pyglet import shapes
 
 from . import theme as T
-from .views import Box
+from .views import Box, _GradientLine
 
 S = T.UI_SCALE
 ITEM_W, ITEM_H, PAD = 140 * S, 26 * S, 3 * S
 SWATCH = 12 * S   # color square before an item's text
 ARROW = 5 * S     # half-height of the submenu arrow
 OVERLAP = 2 * S   # a submenu slightly overlaps its parent, so there's no gap to cross
+RAINBOW = "rainbow"  # a swatch that runs through every hue (Default: "any color")
+RAINBOW_PIECES = 6  # blended hue to hue, so it reads as one smooth sweep
 
 
 @dataclass
@@ -35,7 +39,7 @@ class MenuItem:
     action: Callable[[], None] | None = None
     danger: bool = False  # drawn in red (e.g. Delete)
     submenu: list[MenuItem] | None = None  # hovering opens it; the item has no action of its own
-    swatch: tuple[int, int, int] | None = None  # a color square before the text
+    swatch: tuple[int, int, int] | str | None = None  # a color square before the text (or RAINBOW)
     checked: bool = False  # the current choice: a border around the swatch / a mark
 
     def __post_init__(self) -> None:
@@ -116,8 +120,18 @@ class ContextMenu:
                     panel.shapes.append(shapes.Rectangle(sx0 - b, cy - SWATCH / 2 - b, SWATCH + 2 * b,
                                                          SWATCH + 2 * b, color=T.PART_TEXT[:3],
                                                          batch=self.batch, group=fg))
-                panel.shapes.append(shapes.Rectangle(sx0, cy - SWATCH / 2, SWATCH, SWATCH, color=item.swatch,
-                                                     batch=self.batch, group=fg))
+                if item.swatch == RAINBOW:
+                    piece = SWATCH / RAINBOW_PIECES
+                    hue = [tuple(round(c * 255) for c in colorsys.hsv_to_rgb(k / RAINBOW_PIECES, 0.75, 0.95))
+                           for k in range(RAINBOW_PIECES + 1)]
+                    for k in range(RAINBOW_PIECES):
+                        line = _GradientLine(sx0 + k * piece, cy, sx0 + (k + 1) * piece, cy, thickness=SWATCH,
+                                             batch=self.batch, group=fg)
+                        line.set_colors(hue[k], hue[k + 1])
+                        panel.shapes.append(line)
+                else:
+                    panel.shapes.append(shapes.Rectangle(sx0, cy - SWATCH / 2, SWATCH, SWATCH, color=item.swatch,
+                                                         batch=self.batch, group=fg))
             if item.submenu:
                 ax = left + PAD + item_w - 10 * S
                 panel.shapes.append(shapes.Triangle(ax - 1.5 * ARROW, cy - ARROW, ax - 1.5 * ARROW, cy + ARROW,

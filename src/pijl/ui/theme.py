@@ -32,11 +32,12 @@ def _dim(on: tuple[int, int, int]) -> tuple[int, int, int]:
     return tuple(round(0.65 * g + 0.35 * c) for g, c in zip(WIRE_OFF, on))
 
 
-# Wire colors (Recolor menu): name -> (off, on). Names are what save files store; None
-# (no color set) is the default look. A conflict still shows WIRE_CONFLICT whatever the color.
-WIRE_COLORS: dict[str | None, tuple[tuple[int, int, int], tuple[int, int, int]]] = {
-    None: (WIRE_OFF, WIRE_ON),
-    **{name: (_dim(on), on) for name, on in (
+# Colors for wires and IN/OUT parts (Recolor menu, in this order): name -> (off, on).
+# Names are what save files store. No color set ("Default") inherits one: see paint.py.
+# A conflict still shows WIRE_CONFLICT whatever the color.
+WIRE_COLORS: dict[str, tuple[tuple[int, int, int], tuple[int, int, int]]] = {
+    name: (_dim(on), on) for name, on in (
+        ("red", WIRE_ON),
         ("orange", (245, 130, 40)),
         ("yellow", (235, 225, 70)),
         ("green", (80, 210, 100)),
@@ -44,7 +45,7 @@ WIRE_COLORS: dict[str | None, tuple[tuple[int, int, int], tuple[int, int, int]]]
         ("blue", (70, 130, 245)),
         ("purple", (170, 100, 240)),
         ("pink", (240, 110, 190)),
-    )},
+    )
 }
 
 PICKER_BG = (34, 34, 41)
