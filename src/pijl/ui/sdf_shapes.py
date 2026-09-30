@@ -53,6 +53,7 @@ in vec4 rect;     // x, y, width, height
 in float border;  // inside the rectangle
 in vec4 fill; in vec4 fill_on; in vec4 edge; in vec4 edge_on;
 in vec4 flags;
+in float lift;
 out vec2 local;
 flat out vec2 size;
 flat out float bw;
@@ -69,7 +70,7 @@ void main() {{
     ce = on ? edge_on : edge;
     cf.a *= flags.y;
     ce.a *= flags.y;
-    gl_Position = window.projection * window.view * vec4(rect.xy + local, 0.0, 1.0);
+    gl_Position = window.projection * window.view * vec4(rect.xy + lift * lift_offset + local, 0.0, 1.0);
 }}
 """, """#version 150 core
 in vec2 local;
@@ -87,7 +88,7 @@ void main() {
     final_color = c;
 }
 """, np.dtype([("rect", "f4", 4), ("border", "f4"), ("fill", "u1", 4), ("fill_on", "u1", 4),
-               ("edge", "u1", 4), ("edge_on", "u1", 4), ("flags", "u1", 4)]))
+               ("edge", "u1", 4), ("edge_on", "u1", 4), ("flags", "u1", 4), ("lift", "f4")]))
 
 # ---- Dot ----------------------------------------------------------------------------
 
@@ -96,6 +97,7 @@ in vec2 center;
 in float radius;
 in vec4 color; in vec4 color_on;
 in vec4 flags;
+in float lift;
 out vec2 local;   // the rim is at length 1
 flat out vec4 c;
 {UNIFORMS}
@@ -104,7 +106,7 @@ void main() {{
     local = (corner * 2.0 - 1.0) * {PAD};
     c = flags.x > 0.5 ? color_on : color;
     c.a *= flags.y;
-    gl_Position = window.projection * window.view * vec4(center + local * radius, 0.0, 1.0);
+    gl_Position = window.projection * window.view * vec4(center + lift * lift_offset + local * radius, 0.0, 1.0);
 }}
 """, f"""#version 150 core
 in vec2 local;
@@ -117,7 +119,7 @@ void main() {{
     final_color = vec4(c.rgb, c.a * a);
 }}
 """, np.dtype([("center", "f4", 2), ("radius", "f4"), ("color", "u1", 4), ("color_on", "u1", 4),
-               ("flags", "u1", 4)]))
+               ("flags", "u1", 4), ("lift", "f4")]))
 
 # ---- Segment ------------------------------------------------------------------------
 
@@ -128,6 +130,7 @@ in float radius;
 in vec4 ca; in vec4 ca_on;  // color at a (off / on) ...
 in vec4 cb; in vec4 cb_on;  // ... and at b; blended along the length
 in vec4 flags;              // z / w: round cap at a / b
+in float lift;
 out vec2 uv;                // world units: along the segment from a, and across it
 flat out vec2 ext;          // (length, radius)
 flat out vec4 c0;
@@ -150,7 +153,7 @@ void main() {{
     c1 = on ? cb_on : cb;
     c0.a *= flags.y;
     c1.a *= flags.y;
-    gl_Position = window.projection * window.view * vec4(a + dir * u + n * v, 0.0, 1.0);
+    gl_Position = window.projection * window.view * vec4(a + lift * lift_offset + dir * u + n * v, 0.0, 1.0);
 }}
 """, f"""#version 150 core
 in vec2 uv;
@@ -168,7 +171,7 @@ void main() {{
     final_color = vec4(c.rgb, c.a * a);
 }}
 """, np.dtype([("a", "f4", 2), ("b", "f4", 2), ("radius", "f4"), ("ca", "u1", 4), ("ca_on", "u1", 4),
-               ("cb", "u1", 4), ("cb_on", "u1", 4), ("flags", "u1", 4)]))
+               ("cb", "u1", 4), ("cb_on", "u1", 4), ("flags", "u1", 4), ("lift", "f4")]))
 
 
 class _Shape:
@@ -199,6 +202,15 @@ class _Shape:
         if flags[self.slot, 0] != v:
             flags[self.slot, 0] = v
             self.buf.mark(self.slot)
+
+    @property
+    def lifted(self) -> bool:
+        return bool(self._get("lift"))
+
+    @lifted.setter
+    def lifted(self, on: bool) -> None:
+        """Drawn shifted by the canvas's offset (see canvas.py)."""
+        self._set("lift", 1.0 if on else 0.0)
 
     @property
     def opacity(self) -> int:

@@ -43,6 +43,7 @@ _VERTEX = f"""#version 150 core
 in vec4 rect;   // x, y, width, height of the glyph's quad
 in vec4 uv;     // u0, v0, u1, v1 in the atlas
 in vec4 color;
+in float lift;
 out vec2 tex;
 flat out vec4 c;
 {UNIFORMS}
@@ -50,7 +51,7 @@ void main() {{
     vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));
     tex = mix(uv.xy, uv.zw, corner);
     c = color;
-    gl_Position = window.projection * window.view * vec4(rect.xy + corner * rect.zw, 0.0, 1.0);
+    gl_Position = window.projection * window.view * vec4(rect.xy + lift * lift_offset + corner * rect.zw, 0.0, 1.0);
 }}
 """
 
@@ -76,7 +77,7 @@ void main() {
 """ % {"spread": float(SPREAD)}
 
 GLYPH = Kind("glyph", 0, _VERTEX, _FRAGMENT,
-             np.dtype([("rect", "f4", 4), ("uv", "f4", 4), ("color", "u1", 4)]),
+             np.dtype([("rect", "f4", 4), ("uv", "f4", 4), ("color", "u1", 4), ("lift", "f4")]),
              texture=lambda: _get_atlas().texture)
 
 
@@ -223,6 +224,7 @@ class SDFLabel:
         self.anchor_x = anchor_x
         self.x, self.y = x, y
         self._color = tuple(color)
+        self._lift = 0.0
         self.slots = np.empty(0, np.intp)
         # per glyph: its quad relative to (left edge, capitals' center), world units; moving is one add
         self._rel = np.empty((0, 4), np.float32)
@@ -242,6 +244,7 @@ class SDFLabel:
                                          boxes[:, 2], boxes[:, 3])) * s
             buf.f["uv"][self.slots] = [a.glyphs[c].uv for _, c in visible]
             buf.f["color"][self.slots] = self._color
+            buf.f["lift"][self.slots] = self._lift
             buf.mark_many(self.slots)
         self.move_to(self.x, self.y)
 
@@ -266,6 +269,18 @@ class SDFLabel:
             return
         self.buf.f["rect"][self.slots] = self._rel + (self._left(), y, 0.0, 0.0)
         self.buf.mark_many(self.slots)
+
+    @property
+    def lifted(self) -> bool:
+        return bool(self._lift)
+
+    @lifted.setter
+    def lifted(self, on: bool) -> None:
+        """Drawn shifted by the canvas's offset (see canvas.py)."""
+        self._lift = 1.0 if on else 0.0
+        if self.slots.size:
+            self.buf.f["lift"][self.slots] = self._lift
+            self.buf.mark_many(self.slots)
 
     @property
     def opacity(self) -> int:

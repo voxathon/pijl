@@ -208,3 +208,11 @@ def test_revision_counts_edits_not_clicks():
     assert c.revision == r  # using the circuit isn't editing it
     c.remove_wire(w)
     assert c.revision > r
+
+
+def test_rebuilding_wiring_skips_the_drawing_rules():
+    c = Circuit()
+    g = c.add_part("NAND")
+    assert c.connect(g.outputs[0], g.inputs[0]) == (None, [])  # can't be drawn by hand ...
+    w, _ = c.connect(g.outputs[0], g.inputs[0], check=False)   # ... but undo must bring it back
+    assert w is not None and c.wires_at(g.inputs[0]) == [w]

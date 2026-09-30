@@ -13,6 +13,10 @@ a numpy element write plus a dirty mark; dirty slots are uploaded once per frame
 Shapes carry both of their colors (off and on) plus a state flag, so a pin or wire
 switching on/off is a one-byte write and the shader picks the color.
 
+Every kind also has a `lift` field: lifted instances are drawn shifted by the canvas's
+`offset` (a uniform). Dragging a selection lifts it once and then only changes the
+offset per mouse move, instead of rewriting every shape (see Editor._begin_move).
+
 Draw order: layers by their order; inside a layer, by slot. Freed slots are reused
 lowest first (like pyglet's allocator), so "newer on top" is only roughly true.
 """
@@ -30,7 +34,8 @@ from pyglet.graphics.shader import Shader, ShaderProgram
 GAP = 64       # dirty slots at most this far apart are uploaded as one run
 MAX_RUNS = 32  # more runs than this: upload one range from the first dirty slot to the last
 
-UNIFORMS = "uniform WindowBlock { mat4 projection; mat4 view; } window;"
+UNIFORMS = """uniform WindowBlock { mat4 projection; mat4 view; } window;
+uniform vec2 lift_offset;  // added to the position of lifted instances (Canvas.offset)"""
 
 
 class Kind:
@@ -159,11 +164,12 @@ class InstanceBuffer:
         self.dirty[:] = False
         self.realloc = self.any_dirty = False
 
-    def draw(self) -> None:
+    def draw(self, offset: tuple[float, float] = (0.0, 0.0)) -> None:
         if not self.top:
             return
         self._upload()
         self.program.use()
+        self.program["lift_offset"] = offset
         if self.kind.texture is not None:
             tex = self.kind.texture()
             gl.glActiveTexture(gl.GL_TEXTURE0)
@@ -181,6 +187,7 @@ class Canvas:
     def __init__(self, batch: pyglet.graphics.Batch) -> None:
         self.batch = batch
         self._buffers: dict[tuple[int, int, str], InstanceBuffer] = {}
+        self.offset = (0.0, 0.0)  # where lifted instances are drawn, relative to their data
 
     def buffer(self, kind: Kind, layer) -> InstanceBuffer:
         """`layer`: a pyglet Group (its order counts) or an order number."""
@@ -194,7 +201,7 @@ class Canvas:
         gl.glEnable(gl.GL_BLEND)
         gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
         for key in sorted(self._buffers):
-            self._buffers[key].draw()
+            self._buffers[key].draw(self.offset)
         gl.glDisable(gl.GL_BLEND)
         self.batch.draw()
 

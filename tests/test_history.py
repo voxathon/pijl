@@ -28,9 +28,11 @@ def test_undo_redo_roundtrip():
     h = History(snap(0))
     for n in (1, 2, 3):
         h.commit(snap(n))
-    assert h.undo() == snap(2)
-    assert h.undo() == snap(1)
-    assert h.redo() == snap(2)
+    assert h.undo() == ({2: (None, ("NOT", "", 2.0, 0.0, {}))}, {}, {})  # the step: uid -> (before, after)
+    assert h.current == snap(2)
+    h.undo()
+    assert h.current == snap(1)
+    h.redo()
     assert h.current == snap(2)
 
 
@@ -40,7 +42,8 @@ def test_new_commit_clears_redo():
     h.undo()
     h.commit(snap(5))
     assert h.redo() is None
-    assert h.undo() == snap(0)
+    h.undo()
+    assert h.current == snap(0)
 
 
 def test_undo_past_start_and_redo_past_end_are_no_ops():
@@ -54,4 +57,41 @@ def test_limit_drops_oldest():
     for n in range(1, 10):
         h.commit(snap(n))
     assert len(h.undo_stack) == 3
-    assert h.undo_stack[0] == snap(6)
+    for _ in range(3):
+        h.undo()
+    assert h.current == snap(6) and h.undo() is None
+
+
+def test_record_takes_only_what_changed():
+    h = History(snap(3))
+    moved = ("NOT", "", 9.0, 9.0, {})
+    assert h.record({1: moved, 7: None}, {}, {})  # 7 was never there: not a change
+    assert h.undo_stack[0][0] == ({1: (("NOT", "", 1.0, 0.0, {}), moved)}, {}, {})
+    assert h.current.parts[1] == moved
+    assert not h.record({1: moved}, {}, {})
+
+
+def test_states_name_points_in_the_timeline():
+    h = History(snap(0))
+    saved = h.state
+    h.commit(snap(1))
+    assert h.state != saved
+    h.undo()
+    assert h.state == saved  # back where it was saved: nothing unsaved
+    h.redo()
+    h.commit(snap(2))
+    assert len({saved, h.state}) == 2
+
+
+def test_amend_folds_into_the_last_step():
+    h = History(snap(1))
+    a = ("NOT", "", 5.0, 0.0, {})
+    b = ("NOT", "", 6.0, 0.0, {})
+    h.record({0: a}, {}, {})
+    first = h.state
+    h.amend({0: b}, {}, {})
+    assert len(h.undo_stack) == 1 and h.state != first
+    h.undo()
+    assert h.current == snap(1)  # both tweaks undone at once
+    h.redo()
+    assert h.current.parts[0] == b

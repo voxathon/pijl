@@ -21,12 +21,19 @@ tints reproduce the classic theme exactly).
 
 Gradients blend in OKLCH: around the hue wheel (the short way), with even
 lightness, so blue -> yellow runs through teal and green instead of grey.
+
+After an edit only the region it can reach is repainted: the changed wires, the
+wires on changed parts' pins, everything hanging off those (colors flow down
+branches), and the parts at their ends. The color math is cached: a board only
+ever uses a handful of palette colors.
 """
 
 from __future__ import annotations
 
 import colorsys
 import math
+from collections.abc import Iterable
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 from ..sim import Pin
@@ -49,10 +56,19 @@ def part_color(part) -> str | None:
     return part.props.get("color") if part.type.look.lit else None
 
 
-def paint(editor: Editor) -> None:
-    """Recompute every wire's gradient and every part's tints."""
-    pin_tint: dict[Pin, Rgb] = {}  # the first wire end color seen on each pin
-    for wire in editor.circuit.wires:  # creation order: parents first
+def paint(editor: Editor, parts: Iterable[int] | None = None, wires: Iterable[int] | None = None) -> None:
+    """Recompute wire gradients and part tints: everywhere, or around the parts and wires
+    (uids) that changed -- gone ones included, their uids are just skipped."""
+    c = editor.circuit
+    if parts is None and wires is None:
+        todo, affected = c.wires, list(editor.part_views)
+    else:
+        seed_parts = {c.part_by_uid[uid] for uid in parts or () if uid in c.part_by_uid}
+        seeds = {c.wire_by_uid[uid] for uid in wires or () if uid in c.wire_by_uid}
+        seeds.update(w for part in seed_parts for pin in part.pins for w in c.ends_on(pin))
+        todo = sorted(seeds.union(c.descendants(*seeds)), key=lambda w: w.uid)  # parents first
+        affected = seed_parts | {e.part for w in todo for e in w.ends if isinstance(e, Pin)}
+    for wire in todo:
         view = editor.wire_views.get(wire)
         if view is None:
             continue
@@ -66,13 +82,22 @@ def paint(editor: Editor) -> None:
         colors = [c for c in (ends[0], color_pair(view.color), ends[1]) if c is not None]
         n = len(colors)
         view.set_stops([(i / (n - 1) if n > 1 else 0.0, c) for i, c in enumerate(colors)])
-        for end, f in ((wire.src, 0.0), (wire.dst, 1.0)):
-            if isinstance(end, Pin) and view.stops:
-                pin_tint.setdefault(end, sample(view.stops, f)[1])
-    for view in editor.part_views.values():
-        own = color_pair(part_color(view.part))
-        pins = [own[1] if own else pin_tint.get(p) for p in view.part.pins]
+    for part in affected:
+        view = editor.part_views.get(part)
+        if view is None:
+            continue
+        own = color_pair(part_color(part))
+        pins = [own[1] if own else _pin_tint(editor, pin) for pin in part.pins]
         view.set_tints(pins, own[1] if own else next((t for t in pins if t), None))
+
+
+def _pin_tint(editor: Editor, pin: Pin) -> Rgb | None:
+    """The color at the end of the oldest wire on `pin` that has one."""
+    for wire in editor.circuit.wires_at(pin):  # creation order
+        view = editor.wire_views.get(wire)
+        if view is not None and view.stops:
+            return sample(view.stops, 0.0 if wire.src is pin else 1.0)[1]
+    return None
 
 
 # ---- color math -----------------------------------------------------------------
@@ -89,6 +114,7 @@ def sample(stops: Stops, f: float) -> Pair:
     return stops[-1][1]
 
 
+@lru_cache(maxsize=1 << 16)
 def mix(a: Rgb, b: Rgb, t: float) -> Rgb:
     """Blend two colors in OKLCH (see the module docstring)."""
     if a == b or t <= 0:
@@ -107,6 +133,7 @@ def mix(a: Rgb, b: Rgb, t: float) -> Rgb:
     return _from_oklab((L, C * math.cos(h), C * math.sin(h)))
 
 
+@lru_cache(maxsize=1 << 12)
 def with_hue(color: tuple, tint: Rgb | None) -> tuple:
     """`color` with `tint`'s hue (alpha, if any, kept)."""
     if tint is None:

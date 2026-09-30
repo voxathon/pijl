@@ -28,16 +28,19 @@ Point = tuple[float, float]
 _seq = itertools.count()  # creation order of views: newer ones are drawn (and hit) on top
 
 
-class Revision:
-    """Bumped whenever board data held by views changes: part positions and labels, wire
-    bends, ends and colors. With Circuit.revision (parts and wiring) it tells the editor
-    whether an event may have edited the board at all (see Editor.dispatch_event).
-    Code that changes part props directly bumps it itself."""
-    value = 0
+class Touched:
+    """The parts and wires (by uid) whose board data changed since the editor last took
+    them: created, deleted, moved, relabeled, re-bent, re-ended, recolored. Only those get
+    written into the undo history and repainted (see Editor._record). Views report their
+    own changes; code that changes part props directly reports it itself."""
+    parts: set[int] = set()
+    wires: set[int] = set()
 
     @classmethod
-    def bump(cls) -> None:
-        cls.value += 1
+    def take(cls) -> tuple[set[int], set[int]]:
+        parts, wires = cls.parts, cls.wires
+        cls.parts, cls.wires = set(), set()
+        return parts, wires
 
 
 class Layers:
@@ -98,6 +101,7 @@ class Polyline:
         self._stops: list[tuple[float, Pair]] | None = None  # gradient: (fraction of the length, pair)
         self._on = False
         self._opacity = 255
+        self._lift = 0.0
         self.segments: list[Segment] = []
         self._slots = np.empty(0, np.intp)  # the segments' slots in `buf`, for state / opacity at once
         self.points: list[Point] = []
@@ -182,7 +186,7 @@ class Polyline:
         if len(self.segments) != n_seg:
             while len(self.segments) < n_seg:
                 seg = Segment(self.thickness, self._pair[0], self.canvas, self.group)
-                seg.state, seg.opacity = self._on, self._opacity  # match the others (e.g. ghosts)
+                seg.state, seg.opacity, seg.lifted = self._on, self._opacity, self._lift  # match the others
                 self.segments.append(seg)
             while len(self.segments) > n_seg:
                 self.segments.pop().delete()
@@ -232,10 +236,25 @@ class Polyline:
         self._opacity = value
         self._write_flag(1, value)
 
+    @property
+    def lifted(self) -> bool:
+        return bool(self._lift)
+
+    @lifted.setter
+    def lifted(self, on: bool) -> None:
+        """Drawn shifted by the canvas's offset (see canvas.py)."""
+        self._lift = 1.0 if on else 0.0
+        if self._slots.size:
+            self.buf.f["lift"][self._slots] = self._lift
+            self.buf.mark_many(self._slots)
+
     def _write_flag(self, i: int, value: int) -> None:
         if self._slots.size:
             self.buf.f["flags"][self._slots, i] = value
             self.buf.mark_many(self._slots)
+
+    def translate(self, dx: float, dy: float) -> None:
+        translate_lines([self], dx, dy)
 
     def distance_to(self, wx: float, wy: float) -> float:
         return min((_segment_distance(wx, wy, a, b) for a, b in zip(self.points, self.points[1:])),
@@ -357,6 +376,7 @@ class PartView:
         self.canvas, self.layers = canvas, layers
         self.pin_tags: list = []  # (background, SDF label) per pin, while shown (see set_pin_labels)
         self.opacity = 255
+        self.lifted = False  # being dragged: drawn at the canvas's offset (see set_lifted)
         # The user's label sits outside the body: left of IN switches, right of
         # OUT LEDs (so it reads like a pin name at the board edge), below gates.
         anchor = {"left": "right", "right": "left"}.get(look.label, "center")
@@ -395,6 +415,7 @@ class PartView:
                 label.opacity = self.opacity
                 bg = Rect(0, 0, 1, 1, 0, T.PIN_TAG_BG, T.PIN_TAG_BG, self.canvas, self.layers.tags)
                 bg.opacity = self.opacity
+                bg.lifted = label.lifted = self.lifted
                 self.pin_tags.append((bg, label))
             self._place_pin_tags()
 
@@ -418,6 +439,7 @@ class PartView:
             o = T.SELECT_OUTSET
             self.outline = Rect(self.x - o, self.y - o, self.w + 2 * o, self.h + 2 * o, T.SELECT_THICKNESS,
                                 (*T.SELECT, 0), T.SELECT, self.canvas, self.layers.selection)
+            self.outline.lifted = self.lifted
         elif not on and self.outline is not None:
             self.outline.delete()
             self.outline = None
@@ -438,7 +460,7 @@ class PartView:
 
     def move_to(self, x: float, y: float) -> None:
         self.x, self.y = x, y
-        Revision.bump()
+        Touched.parts.add(self.part.uid)
         self.body.position = (x, y)
         if self.outline is not None:
             self.outline.position = (x - T.SELECT_OUTSET, y - T.SELECT_OUTSET)
@@ -460,7 +482,7 @@ class PartView:
 
     def refresh_name(self) -> None:
         """Show part.label (after it was edited)."""
-        Revision.bump()
+        Touched.parts.add(self.part.uid)
         self.name.set_text(self.part.label)
 
     def contains(self, wx: float, wy: float) -> bool:
@@ -473,6 +495,18 @@ class PartView:
             if (px - wx) ** 2 + (py - wy) ** 2 <= r * r:
                 return pin
         return None
+
+    def set_lifted(self, on: bool) -> None:
+        """While lifted, the part is drawn shifted by the canvas's offset and its x / y
+        are where it was lifted from: dragging moves the offset, not the shapes. Put it
+        down with move_to (after set_lifted(False))."""
+        if on == self.lifted:
+            return
+        self.lifted = on
+        for shape in (self.body, self.outline, self.kind_text, self.name, *self.pin_dots,
+                      *(s for tag in self.pin_tags for s in tag)):
+            if shape is not None:
+                shape.lifted = on
 
     def set_ghost(self, ghost: bool) -> None:
         """Semi-transparent while being carried around before placement."""
@@ -513,6 +547,7 @@ class PartView:
             self.body.set_colors(off[0], off[1], on[0], on[1])
 
     def delete(self) -> None:
+        Touched.parts.add(self.part.uid)
         if self.index is not None:
             self.index.remove(self)
         self.body.delete()
@@ -553,6 +588,7 @@ class WireView:
                      for end in ("src", "dst") if not isinstance(getattr(wire, end), Pin)}
         self._last_state: tuple[bool, bool] | None = None
         self._conflict = False
+        self.lifted = False  # see set_lifted
         self._redraw()
         self._recolor()
         self.sync((False, False))
@@ -569,12 +605,17 @@ class WireView:
     @color.setter
     def color(self, value: str | None) -> None:
         if value != getattr(self, "_color", object()):
-            Revision.bump()
+            Touched.wires.add(self.wire.uid)
         self._color = value
 
     def set_ends(self, src: Point, dst: Point) -> None:
+        if (src, dst) == (self.src, self.dst):
+            return  # (re-attaching after a move often lands exactly where it was)
         self.src, self.dst = src, dst
         self._redraw()
+
+    def translate(self, dx: float, dy: float) -> None:
+        translate_wires([self], dx, dy)
 
     def set_bends(self, bends: list[Point]) -> None:
         self.bends = list(bends)
@@ -588,7 +629,17 @@ class WireView:
             dot.position = getattr(self, end)
         if self.index is not None:
             self.index.put_polyline(self, self.points)
-        Revision.bump()
+        Touched.wires.add(self.wire.uid)
+
+    def set_lifted(self, on: bool) -> None:
+        """Drawn shifted by the canvas's offset, like PartView.set_lifted: for wires that
+        move rigidly with a dragged selection. Put it down with set_ends / set_bends."""
+        if on == self.lifted:
+            return
+        self.lifted = on
+        for shape in (self.line, self.highlight, *self.dots.values()):
+            if shape is not None:
+                shape.lifted = on
 
     def set_ghost(self, ghost: bool) -> None:
         """Semi-transparent while being carried around before placement (paste)."""
@@ -605,6 +656,7 @@ class WireView:
         if on and self.highlight is None:
             self.highlight = Polyline(self.points, T.SELECT_WIRE, self.canvas, self.layers.wire_halo,
                                       thickness=T.WIRE_THICKNESS + 6)
+            self.highlight.lifted = self.lifted
         elif not on and self.highlight is not None:
             self.highlight.delete()
             self.highlight = None
@@ -657,12 +709,41 @@ class WireView:
         return self.line.distance_to(wx, wy)
 
     def delete(self) -> None:
+        Touched.wires.add(self.wire.uid)
         if self.index is not None:
             self.index.remove(self)
         self.set_selected(False)
         self.line.delete()
         for dot in self.dots.values():
             dot.delete()
+
+
+def translate_lines(lines: list[Polyline], dx: float, dy: float) -> None:
+    """Shift whole lines. Same shape, so same layout and colors: only their segments'
+    end points move -- in one numpy operation per buffer, however many lines."""
+    by_buf: dict[int, tuple] = {}
+    for line in lines:
+        line.points = [(x + dx, y + dy) for x, y in line.points]
+        if line._slots.size:
+            by_buf.setdefault(id(line.buf), (line.buf, []))[1].append(line._slots)
+    for buf, slots in by_buf.values():
+        slots = np.concatenate(slots)
+        buf.f["a"][slots] += (dx, dy)
+        buf.f["b"][slots] += (dx, dy)
+        buf.mark_many(slots)
+
+
+def translate_wires(views: list[WireView], dx: float, dy: float) -> None:
+    """Move whole wires, bends and ends, without laying them out again."""
+    translate_lines([line for v in views for line in (v.line, v.highlight) if line is not None], dx, dy)
+    for v in views:
+        v.src, v.dst = (v.src[0] + dx, v.src[1] + dy), (v.dst[0] + dx, v.dst[1] + dy)
+        v.bends = [(x + dx, y + dy) for x, y in v.bends]
+        for end, dot in v.dots.items():
+            dot.position = getattr(v, end)
+        if v.index is not None:
+            v.index.put_polyline(v, v.points)
+        Touched.wires.add(v.wire.uid)
 
 
 def arc_length_at(points: list[Point], p: Point) -> float:
