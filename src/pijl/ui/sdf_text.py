@@ -78,7 +78,7 @@ void main() {
 
 GLYPH = Kind("glyph", 0, _VERTEX, _FRAGMENT,
              np.dtype([("rect", "f4", 4), ("uv", "f4", 4), ("color", "u1", 4), ("lift", "f4")]),
-             texture=lambda: _get_atlas().texture)
+             texture=lambda: _get_atlas().texture, positions=("rect",))
 
 
 @dataclass

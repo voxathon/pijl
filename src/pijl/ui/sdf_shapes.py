@@ -88,7 +88,8 @@ void main() {
     final_color = c;
 }
 """, np.dtype([("rect", "f4", 4), ("border", "f4"), ("fill", "u1", 4), ("fill_on", "u1", 4),
-               ("edge", "u1", 4), ("edge_on", "u1", 4), ("flags", "u1", 4), ("lift", "f4")]))
+               ("edge", "u1", 4), ("edge_on", "u1", 4), ("flags", "u1", 4), ("lift", "f4")]),
+            positions=("rect",))
 
 # ---- Dot ----------------------------------------------------------------------------
 
@@ -119,7 +120,7 @@ void main() {{
     final_color = vec4(c.rgb, c.a * a);
 }}
 """, np.dtype([("center", "f4", 2), ("radius", "f4"), ("color", "u1", 4), ("color_on", "u1", 4),
-               ("flags", "u1", 4), ("lift", "f4")]))
+               ("flags", "u1", 4), ("lift", "f4")]), positions=("center",))
 
 # ---- Segment ------------------------------------------------------------------------
 
@@ -171,7 +172,8 @@ void main() {{
     final_color = vec4(c.rgb, c.a * a);
 }}
 """, np.dtype([("a", "f4", 2), ("b", "f4", 2), ("radius", "f4"), ("ca", "u1", 4), ("ca_on", "u1", 4),
-               ("cb", "u1", 4), ("cb_on", "u1", 4), ("flags", "u1", 4), ("lift", "f4")]))
+               ("cb", "u1", 4), ("cb_on", "u1", 4), ("flags", "u1", 4), ("lift", "f4")]),
+               positions=("a", "b"))
 
 
 class _Shape:

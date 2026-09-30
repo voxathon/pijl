@@ -41,13 +41,16 @@ uniform vec2 lift_offset;  // added to the position of lifted instances (Canvas.
 class Kind:
     """A shape kind: its shaders and the layout of one instance. Programs are compiled
     on first use (that needs a GL context). `texture`: a function returning a texture
-    to bind while drawing, if the kind needs one."""
+    to bind while drawing, if the kind needs one. `positions`: the fields whose first
+    two numbers are a world position (what InstanceBuffer.shift moves)."""
 
-    def __init__(self, name: str, rank: int, vertex: str, fragment: str, dtype: np.dtype, texture=None) -> None:
+    def __init__(self, name: str, rank: int, vertex: str, fragment: str, dtype: np.dtype, texture=None,
+                 positions: tuple[str, ...] = ()) -> None:
         self.name, self.rank = name, rank
         self.vertex, self.fragment = vertex, fragment
         self.dtype = dtype
         self.texture = texture
+        self.positions = positions
         self._program: ShaderProgram | None = None
 
     @property
@@ -141,6 +144,16 @@ class InstanceBuffer:
     def mark_many(self, slots) -> None:
         self.dirty[slots] = True
         self.any_dirty = True
+
+    def shift(self, slots: np.ndarray, dx: float, dy: float) -> None:
+        """Move these instances by (dx, dy), all at once."""
+        for name in self.kind.positions:
+            self.f[name][slots, :2] += (dx, dy)
+        self.mark_many(slots)
+
+    def set_lift(self, slots: np.ndarray, on: bool) -> None:
+        self.f["lift"][slots] = 1.0 if on else 0.0
+        self.mark_many(slots)
 
     # ---- GPU -----------------------------------------------------------------
 

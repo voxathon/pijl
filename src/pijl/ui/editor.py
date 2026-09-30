@@ -106,10 +106,10 @@ from .picker import PartPicker, Row
 from .prompt import Prompt
 from .sdf_text import SDFText
 from .selection import Selection
-from .spatial import SpatialHash, ordered
+from .spatial import SpatialIndex, ordered
 from .status_bar import BAR_H, StatusBar
 from .views import (PartView, Layers, Point, Polyline, Touched, WireView, arc_length_at, points_before,
-                    project_onto, theme_color, translate_wires)
+                    lift, project_onto, put_down, theme_color)
 from .wire_edit import WireEditSession
 
 SIM_STEPS_PER_FRAME = 1
@@ -193,8 +193,8 @@ class Editor(pyglet.window.Window):
         self.part_views: dict[Part, PartView] = {}
         self.wire_views: dict[Wire, WireView] = {}
         # Where every view is, for hit testing without looking at all of them (views keep it current)
-        self.part_index = SpatialHash()
-        self.wire_index = SpatialHash()
+        self.part_index = SpatialIndex()
+        self.wire_index = SpatialIndex()
 
         # interaction state
         self.mode = Mode.IDLE
@@ -341,7 +341,8 @@ class Editor(pyglet.window.Window):
         src_pos, color = view.src, view.color
 
         self.circuit.merge(w, splice)  # w keeps its identity (uid); splice's branches move to w
-        Touched.wires.update(x.uid for x in self.circuit.attachments(w))  # their ends now name w
+        for x in self.circuit.attachments(w):  # their ends now name w
+            Touched.wire(x.uid)
         for gone in (w, splice):
             self._drop_wire_view(gone)
         self.wire_views[w] = WireView(w, src_pos, bends, self.end_pos(w.dst, far_pos), self.world, self.layers,
@@ -830,7 +831,7 @@ class Editor(pyglet.window.Window):
             view.part.props.pop("color", None)
         else:
             view.part.props["color"] = color
-        Touched.parts.add(view.part.uid)
+        Touched.part(view.part.uid)
 
     def _close_menu(self) -> None:
         self.menu.close()
@@ -1079,7 +1080,8 @@ class Editor(pyglet.window.Window):
         self.selection.clear()
         restore(self, self.history.current, change_uids(change))
         # parts at the ends of wires that came or went: their pins' colors may change
-        Touched.parts.update(_pin_part_uids(pair for pair in change[1].values()))
+        for uid in _pin_part_uids(pair for pair in change[1].values()):
+            Touched.part(uid)
 
     def _begin_group_drag(self, grabbed: PartView) -> None:
         """Start moving the selection, or just `grabbed` if it isn't part of it."""
@@ -1100,10 +1102,7 @@ class Editor(pyglet.window.Window):
         self.drag_group = [(v, v.x, v.y) for v in views]
         self.drag_wires = [(w, list(w.bends), w.src, w.dst) for w in wires]
         self.drag_delta = (0.0, 0.0)
-        for v in views:
-            v.set_lifted(True)
-        for w in wires:
-            w.set_lifted(True)
+        lift(views, wires, True)
         c, parts, inside = self.circuit, {v.part for v in views}, {w.wire for w in wires}
         # Stretched: an end on the group's pins or on one of its wires, the other end outside.
         # The ends on the group move along with it (junction ends too: their wire moves rigidly).
@@ -1137,13 +1136,8 @@ class Editor(pyglet.window.Window):
         """Put the lifted group down where it was dragged to, for real."""
         dx, dy = self.drag_delta
         self.world.offset = (0.0, 0.0)
-        for view, sx, sy in self.drag_group:
-            view.set_lifted(False)
-            view.move_to(sx + dx, sy + dy)
-        for view, *_ in self.drag_wires:
-            view.set_lifted(False)
-        if dx or dy:
-            translate_wires([v for v, *_ in self.drag_wires], dx, dy)  # rigidly, junction ends included
+        parts, wires = [v for v, *_ in self.drag_group], [v for v, *_ in self.drag_wires]
+        put_down(parts, wires, dx, dy)  # (lifted, they kept their coordinates: from where they were picked up)
         # exact final attachment, as if it had been moved step by step
         live = [v for v, *_ in self.stretched if v.wire in self.wire_views]
         self.refresh_wires([*live, *(v for v, *_ in self.drag_wires)])
@@ -1417,14 +1411,15 @@ class Editor(pyglet.window.Window):
         """Write what views reported changed (views.Touched) into the undo history, as a
         new step (or folded into the last one), and rework the colors around it (paint.py).
         Returns whether there was a change to record."""
-        parts, wires = Touched.take()
+        parts, wires, paint_parts, paint_wires = Touched.take()
         now = changes(self, parts, wires)
         # parts at the ends of a changed wire, before and after: their pins' colors may change
         # (before: from the history, so ask before recording updates it)
         before = self.history.current.wires
-        ends = _pin_part_uids((before.get(uid), now[1][uid]) for uid in wires)
+        ends = _pin_part_uids((before.get(uid), now[1][uid]) for uid in paint_wires)
         recorded = (self.history.amend if amend else self.history.record)(*now)
-        paint(self, parts | ends, wires)
+        if paint_parts or paint_wires:
+            paint(self, paint_parts | ends, paint_wires)
         return recorded
 
     def _reset_history(self, doc: str | None) -> None:

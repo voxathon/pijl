@@ -71,7 +71,7 @@ def changes(editor: Editor, parts: Iterable[int], wires: Iterable[int]) -> tuple
 
 def part_data(view: PartView) -> PartData:
     p = view.part
-    return p.kind, p.label, view.x, view.y, copy.deepcopy(p.props)
+    return p.kind, p.label, view.x, view.y, copy.deepcopy(p.props) if p.props else {}
 
 
 def wire_data(view: WireView) -> WireData:
@@ -144,7 +144,7 @@ def restore(editor: Editor, target: Snapshot, only: tuple[Iterable[int], Iterabl
             view.name.move_to(*view.name_pos())
         if view.part.props != props:
             view.part.props = copy.deepcopy(props)
-            Touched.parts.add(uid)
+            Touched.part(uid)
     # 4. wires, parents first: add missing, update bends / junction points
     changed: list[WireView] = []
     for uid in sorted(wire_uids & target.wires.keys()):

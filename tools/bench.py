@@ -74,6 +74,8 @@ def main() -> None:
         "hover": ("mouse move over a part", lambda: ev("on_mouse_motion", tx, ty, 0, 0), 50),
         "click": ("click a switch", lambda: (ev("on_mouse_press", sx, sy, mouse.LEFT, 0),
                                              ev("on_mouse_release", sx, sy, mouse.LEFT, 0)), 20),
+        "box": ("box-select query (1000 x 600 world units)",
+                lambda: (ed.part_index.query(0, 0, 1000, 600), ed.wire_index.query(0, 0, 1000, 600)), 20),
         "edit": ("drag one part (an edit)", drag_one, 1),
         "undo": ("undo it", undo, 1),
     }
@@ -84,8 +86,8 @@ def main() -> None:
     if only is None or "drag" in only:
         # everything selected, dragged around: the per-mouse-move cost
         ev("on_key_press", key.A, key.MOD_CTRL)
-        ev("on_mouse_press", tx, ty, mouse.LEFT, 0)
-        ev("on_mouse_drag", tx + 10, ty, 10, 0, mouse.LEFT, 0)
+        report(f"pick up all {n} parts", timed(lambda: (ev("on_mouse_press", tx, ty, mouse.LEFT, 0),
+                                                        ev("on_mouse_drag", tx + 10, ty, 10, 0, mouse.LEFT, 0))))
         moves = iter(range(1, 1000))
         report(f"drag all {n} parts: one mouse move",
                timed(lambda: ev("on_mouse_drag", tx + 10 + next(moves), ty, 1, 0, mouse.LEFT, 0), 10), 10)

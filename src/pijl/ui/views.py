@@ -20,8 +20,8 @@ from . import theme as T
 from .canvas import Canvas
 from .paint import Pair, Rgb, sample, with_hue
 from .sdf_shapes import SEGMENT, Dot, Rect, Segment, WireDot
-from .sdf_text import SDFText
-from .spatial import SpatialHash
+from .sdf_text import SDFLabel, SDFText
+from .spatial import SpatialIndex
 
 Point = tuple[float, float]
 
@@ -31,16 +31,34 @@ _seq = itertools.count()  # creation order of views: newer ones are drawn (and h
 class Touched:
     """The parts and wires (by uid) whose board data changed since the editor last took
     them: created, deleted, moved, relabeled, re-bent, re-ended, recolored. Only those get
-    written into the undo history and repainted (see Editor._record). Views report their
-    own changes; code that changes part props directly reports it itself."""
+    written into the undo history (see Editor._record). Views report their own changes;
+    code that changes part props directly reports it itself.
+
+    `paint_parts` / `paint_wires`: the ones among them whose change can change colors
+    (paint.py), i.e. everything but moving a part and shifting a wire whole. Colors
+    follow the wiring and wire shapes, and a rigid move changes neither."""
     parts: set[int] = set()
     wires: set[int] = set()
+    paint_parts: set[int] = set()
+    paint_wires: set[int] = set()
 
     @classmethod
-    def take(cls) -> tuple[set[int], set[int]]:
-        parts, wires = cls.parts, cls.wires
-        cls.parts, cls.wires = set(), set()
-        return parts, wires
+    def part(cls, uid: int) -> None:
+        """A change to a part that can change colors."""
+        cls.parts.add(uid)
+        cls.paint_parts.add(uid)
+
+    @classmethod
+    def wire(cls, uid: int) -> None:
+        cls.wires.add(uid)
+        cls.paint_wires.add(uid)
+
+    @classmethod
+    def take(cls) -> tuple[set[int], set[int], set[int], set[int]]:
+        """(parts, wires, paint_parts, paint_wires), and start over."""
+        out = cls.parts, cls.wires, cls.paint_parts, cls.paint_wires
+        cls.parts, cls.wires, cls.paint_parts, cls.paint_wires = set(), set(), set(), set()
+        return out
 
 
 class Layers:
@@ -253,9 +271,6 @@ class Polyline:
             self.buf.f["flags"][self._slots, i] = value
             self.buf.mark_many(self._slots)
 
-    def translate(self, dx: float, dy: float) -> None:
-        translate_lines([self], dx, dy)
-
     def distance_to(self, wx: float, wy: float) -> float:
         return min((_segment_distance(wx, wy, a, b) for a, b in zip(self.points, self.points[1:])),
                    default=math.inf)
@@ -354,7 +369,7 @@ class Box:
 class PartView:
     def __init__(self, part: Part, x: float, y: float, canvas: Canvas,
                  layers: Layers, text: SDFText, pin_labels: bool = True,
-                 index: SpatialHash | None = None) -> None:
+                 index: SpatialIndex | None = None) -> None:
         """`index`: where to register for hit testing; kept up to date as it moves."""
         self.part = part
         self.seq = next(_seq)
@@ -390,6 +405,7 @@ class PartView:
         self._recolor()
         self.set_pin_labels(pin_labels)
         self.move_to(x, y)
+        Touched.part(part.uid)  # new: its own color (props) needs painting
         self.sync()
 
     @property
@@ -469,9 +485,7 @@ class PartView:
         for dot, pin in zip(self.pin_dots, self.part.pins):
             dot.position = self.pin_pos(pin)
         self._place_pin_tags()
-        if self.index is not None:  # the body, and the pins sticking out of its sides
-            r = T.PIN_RADIUS
-            self.index.put_rect(self, x - r, y, x + self.w + r, y + self.h)
+        self._register()
 
     def name_pos(self) -> Point:
         if self.look.label == "left":
@@ -482,7 +496,7 @@ class PartView:
 
     def refresh_name(self) -> None:
         """Show part.label (after it was edited)."""
-        Touched.parts.add(self.part.uid)
+        Touched.parts.add(self.part.uid)  # (labels don't change colors)
         self.name.set_text(self.part.label)
 
     def contains(self, wx: float, wy: float) -> bool:
@@ -499,14 +513,13 @@ class PartView:
     def set_lifted(self, on: bool) -> None:
         """While lifted, the part is drawn shifted by the canvas's offset and its x / y
         are where it was lifted from: dragging moves the offset, not the shapes. Put it
-        down with move_to (after set_lifted(False))."""
-        if on == self.lifted:
-            return
-        self.lifted = on
-        for shape in (self.body, self.outline, self.kind_text, self.name, *self.pin_dots,
-                      *(s for tag in self.pin_tags for s in tag)):
-            if shape is not None:
-                shape.lifted = on
+        down with move_to (after set_lifted(False)), or many at once with put_down."""
+        lift([self], [], on)
+
+    def _register(self) -> None:
+        if self.index is not None:  # the body, and the pins sticking out of its sides
+            r = T.PIN_RADIUS
+            self.index.put_rect(self, self.x - r, self.y, self.x + self.w + r, self.y + self.h)
 
     def set_ghost(self, ghost: bool) -> None:
         """Semi-transparent while being carried around before placement."""
@@ -547,7 +560,7 @@ class PartView:
             self.body.set_colors(off[0], off[1], on[0], on[1])
 
     def delete(self) -> None:
-        Touched.parts.add(self.part.uid)
+        Touched.part(self.part.uid)
         if self.index is not None:
             self.index.remove(self)
         self.body.delete()
@@ -571,7 +584,7 @@ class WireView:
 
     def __init__(self, wire: Wire, src: Point, bends: list[Point], dst: Point,
                  canvas: Canvas, layers: Layers, color: str | None = None,
-                 index: SpatialHash | None = None) -> None:
+                 index: SpatialIndex | None = None) -> None:
         self.wire = wire
         self.seq = next(_seq)
         self.index = index
@@ -605,7 +618,7 @@ class WireView:
     @color.setter
     def color(self, value: str | None) -> None:
         if value != getattr(self, "_color", object()):
-            Touched.wires.add(self.wire.uid)
+            Touched.wire(self.wire.uid)
         self._color = value
 
     def set_ends(self, src: Point, dst: Point) -> None:
@@ -613,9 +626,6 @@ class WireView:
             return  # (re-attaching after a move often lands exactly where it was)
         self.src, self.dst = src, dst
         self._redraw()
-
-    def translate(self, dx: float, dy: float) -> None:
-        translate_wires([self], dx, dy)
 
     def set_bends(self, bends: list[Point]) -> None:
         self.bends = list(bends)
@@ -629,17 +639,14 @@ class WireView:
             dot.position = getattr(self, end)
         if self.index is not None:
             self.index.put_polyline(self, self.points)
-        Touched.wires.add(self.wire.uid)
+        Touched.wire(self.wire.uid)  # (its shape: colors of branches depend on where they attach)
 
     def set_lifted(self, on: bool) -> None:
         """Drawn shifted by the canvas's offset, like PartView.set_lifted: for wires that
-        move rigidly with a dragged selection. Put it down with set_ends / set_bends."""
-        if on == self.lifted:
-            return
-        self.lifted = on
-        for shape in (self.line, self.highlight, *self.dots.values()):
-            if shape is not None:
-                shape.lifted = on
+        move rigidly with a dragged selection. Put it down with set_ends / set_bends,
+        or put_down."""
+        lift([], [self], on)
+
 
     def set_ghost(self, ghost: bool) -> None:
         """Semi-transparent while being carried around before placement (paste)."""
@@ -709,7 +716,7 @@ class WireView:
         return self.line.distance_to(wx, wy)
 
     def delete(self) -> None:
-        Touched.wires.add(self.wire.uid)
+        Touched.wire(self.wire.uid)
         if self.index is not None:
             self.index.remove(self)
         self.set_selected(False)
@@ -718,32 +725,133 @@ class WireView:
             dot.delete()
 
 
-def translate_lines(lines: list[Polyline], dx: float, dy: float) -> None:
-    """Shift whole lines. Same shape, so same layout and colors: only their segments'
-    end points move -- in one numpy operation per buffer, however many lines."""
-    by_buf: dict[int, tuple] = {}
-    for line in lines:
-        line.points = [(x + dx, y + dy) for x, y in line.points]
-        if line._slots.size:
-            by_buf.setdefault(id(line.buf), (line.buf, []))[1].append(line._slots)
-    for buf, slots in by_buf.values():
-        slots = np.concatenate(slots)
-        buf.f["a"][slots] += (dx, dy)
-        buf.f["b"][slots] += (dx, dy)
-        buf.mark_many(slots)
+# ---- many at once ---------------------------------------------------------------
+# Dropping a big selection moves every shape of every part and wire in it. One at a
+# time that was over a second for 20k parts; these gather the shapes' slots per
+# instance buffer and write each buffer once.
 
 
-def translate_wires(views: list[WireView], dx: float, dy: float) -> None:
-    """Move whole wires, bends and ends, without laying them out again."""
-    translate_lines([line for v in views for line in (v.line, v.highlight) if line is not None], dx, dy)
+class _Slots:
+    """Slots gathered per instance buffer. Shapes come in by role (every part's body,
+    every pin dot, every label...): all shapes of one role share a buffer -- same
+    canvas, same layer -- so it's looked up once per role, not per shape."""
+
+    def __init__(self) -> None:
+        self.by: dict[int, tuple] = {}
+
+    def _add(self, buf, slots: np.ndarray) -> None:
+        if slots.size:
+            self.by.setdefault(id(buf), (buf, []))[1].append(slots)
+
+    def shapes(self, shapes: list) -> None:
+        """sdf_shapes instances: one slot each."""
+        if shapes:
+            self._add(shapes[0].buf, np.fromiter((s.slot for s in shapes), np.intp, len(shapes)))
+
+    def labels(self, labels: list[SDFLabel]) -> None:
+        if labels:
+            self._add(labels[0].buf, np.concatenate([label.slots for label in labels]))
+
+    def lines(self, lines: list[Polyline]) -> None:
+        if lines:
+            self._add(lines[0].buf, np.concatenate([line._slots for line in lines]))
+
+    def parts(self, views: list[PartView]) -> _Slots:
+        self.shapes([v.body for v in views])
+        self.shapes([d for v in views for d in v.pin_dots])
+        self.shapes([v.outline for v in views if v.outline is not None])
+        self.shapes([bg for v in views for bg, _ in v.pin_tags])
+        self.labels([v.kind_text for v in views if v.kind_text.slots.size])
+        self.labels([v.name for v in views if v.name.slots.size])
+        self.labels([label for v in views for _, label in v.pin_tags])
+        return self
+
+    def wires(self, views: list[WireView]) -> _Slots:
+        self.lines([v.line for v in views])
+        self.lines([v.highlight for v in views if v.highlight is not None])
+        self.shapes([d for v in views for d in v.dots.values()])
+        return self
+
+    def __iter__(self):
+        for buf, arrays in self.by.values():
+            yield buf, (np.concatenate(arrays) if len(arrays) > 1 else arrays[0])
+
+
+def lift(parts: list[PartView], wires: list[WireView], on: bool) -> None:
+    """set_lifted for many parts and wires at once."""
+    parts, wires = _lift_mirrors(parts, wires, on)
+    for buf, slots in _Slots().parts(parts).wires(wires):
+        buf.set_lift(slots, on)
+
+
+def put_down(parts: list[PartView], wires: list[WireView], dx: float, dy: float) -> None:
+    """Un-lift these and move them by (dx, dy): the parts as if by move_to, the wires
+    whole (bends and junction ends too, no new layout). Dropping a dragged selection;
+    every shape is written once. (A rigid move changes no colors: not reported to
+    paint.py. The caller re-attaches wires stretched between these and the rest.)"""
+    _lift_mirrors(parts, wires, False)
+    if dx or dy:
+        _move_part_mirrors(parts, dx, dy)
+        _move_wire_mirrors(wires, dx, dy)
+    for buf, slots in _Slots().parts(parts).wires(wires):
+        buf.set_lift(slots, False)
+        if dx or dy:
+            buf.shift(slots, dx, dy)
+
+
+# What the views remember of their shapes (coordinates, lift), and the spatial index:
+# the rest of the bulk operations, next to the one write per buffer.
+
+def _lift_mirrors(parts: list[PartView], wires: list[WireView], on: bool) -> tuple[list, list]:
+    """Mark them (un)lifted; returns the ones that weren't already."""
+    parts = [v for v in parts if v.lifted != on]
+    wires = [v for v in wires if v.lifted != on]
+    value = 1.0 if on else 0.0
+    for v in parts:
+        v.lifted = on
+        v.kind_text._lift = v.name._lift = value  # (what glyphs they get later start with)
+        for _, label in v.pin_tags:
+            label._lift = value
+    for v in wires:
+        v.lifted = on
+        v.line._lift = value
+        if v.highlight is not None:
+            v.highlight._lift = value
+    return parts, wires
+
+
+def _move_part_mirrors(views: list[PartView], dx: float, dy: float) -> None:
+    for v in views:
+        v.x += dx
+        v.y += dy
+        for label in (v.kind_text, v.name):
+            label.x += dx
+            label.y += dy
+        for _, label in v.pin_tags:
+            label.x += dx
+            label.y += dy
+    _shift_indexed(views, dx, dy)
+    Touched.parts.update(v.part.uid for v in views)
+
+
+def _move_wire_mirrors(views: list[WireView], dx: float, dy: float) -> None:
     for v in views:
         v.src, v.dst = (v.src[0] + dx, v.src[1] + dy), (v.dst[0] + dx, v.dst[1] + dy)
         v.bends = [(x + dx, y + dy) for x, y in v.bends]
-        for end, dot in v.dots.items():
-            dot.position = getattr(v, end)
+        for line in (v.line, v.highlight):
+            if line is not None:
+                line.points = [(x + dx, y + dy) for x, y in line.points]
+    _shift_indexed(views, dx, dy)
+    Touched.wires.update(v.wire.uid for v in views)
+
+
+def _shift_indexed(views: list, dx: float, dy: float) -> None:
+    by_index: dict[int, tuple] = {}
+    for v in views:
         if v.index is not None:
-            v.index.put_polyline(v, v.points)
-        Touched.wires.add(v.wire.uid)
+            by_index.setdefault(id(v.index), (v.index, []))[1].append(v)
+    for index, members in by_index.values():
+        index.shift(members, dx, dy)
 
 
 def arc_length_at(points: list[Point], p: Point) -> float:
