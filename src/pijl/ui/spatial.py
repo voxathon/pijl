@@ -142,6 +142,13 @@ class SpatialIndex:
         owner = self._owner
         return {owner[i] for i in hit.tolist()}
 
+    def bounds(self) -> tuple[float, float, float, float] | None:
+        """The box around everything (x0, y0, x1, y1), or None if empty."""
+        c = self._cols[:, :self._end]
+        if not len(self.where):
+            return None
+        return float(c[0].min()), float(c[1].min()), float(c[2].max()), float(c[3].max())
+
     def near(self, x: float, y: float, r: float) -> set:
         return self.query(x - r, y - r, x + r, y + r)
 

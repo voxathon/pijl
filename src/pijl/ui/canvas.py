@@ -242,13 +242,17 @@ class Canvas:
         return buf
 
     def draw(self) -> None:
+        self.draw_instances()
+        self.batch.draw()
+
+    def draw_instances(self) -> None:
+        """Just the instance buffers (what the minimap draws again, smaller)."""
         gl.glEnable(gl.GL_BLEND)
         gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
         now = time.monotonic() % 3600.0  # (kept small: it's a float32 in the shaders)
         for key in sorted(self._buffers):
             self._buffers[key].draw(self.offset, now)
         gl.glDisable(gl.GL_BLEND)
-        self.batch.draw()
 
     def counts(self) -> dict[str, int]:
         """Instances in use per kind (for the curious / tests)."""

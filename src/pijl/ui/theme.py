@@ -9,7 +9,7 @@ UI_SCALE = 1.2
 # dark fills a lighter one, so every block reads against the background.
 PART_BODY = ((62, 84, 150), (34, 47, 92))
 MACRO_SWATCH = ((128, 84, 160), (74, 46, 98))  # saved macros in the part picker
-MACRO_BODY = ((92, 66, 138), (52, 36, 82))      # placed macros
+MACRO_BODY = ((92, 66, 138), (52, 36, 82))  # placed macros
 SWITCH_OFF = ((70, 40, 40), (112, 62, 62))
 SWITCH_ON = ((220, 60, 60), (140, 30, 30))
 LED_OFF = ((45, 45, 52), (86, 86, 98))
@@ -28,13 +28,15 @@ WIRE_PREVIEW_SNAP = (120, 220, 140, 220)
 # X (unknown) and Z (floating) are patterns, not colors, on wires, pins and lit bodies
 # (sdf_shapes.pattern). They run diagonally in world space, so they line up across
 # segments and parts; their period doubles as you zoom out, so they never turn to mush.
-LOGIC_X = ((255, 0, 255), (0, 0, 0))   # magenta / black bands: the missing texture look
+LOGIC_X = ((255, 0, 255), (0, 0, 0))  # magenta / black bands: the missing texture look
 LOGIC_Z = ((12, 12, 15), (60, 60, 74))  # near black, with short dashes: nothing here
-LOGIC_PERIOD = 16      # world units between bands, zoomed in
-LOGIC_PERIOD_PX = 14   # ... but never fewer screen px than this
-LOGIC_DASH = 0.35      # Z: how much of each period is dash
+LOGIC_PERIOD = 16  # world units between bands, zoomed in
+LOGIC_PERIOD_PX = 14  # ... but never fewer screen px than this
+LOGIC_DASH = 0.35  # Z: how much of each period is dash
 LOGIC_SCROLL_HZ = 0.75  # X's bands scroll: periods per second
-LOGIC_FIGHT_HZ = 2.5    # a conflict (drivers fighting) shows X's bands too, scrolling faster
+LOGIC_FIGHT_HZ = (
+    2.5  # a conflict (drivers fighting) shows X's bands too, scrolling faster
+)
 
 
 def _dim(on: tuple[int, int, int]) -> tuple[int, int, int]:
@@ -46,7 +48,8 @@ def _dim(on: tuple[int, int, int]) -> tuple[int, int, int]:
 # Names are what save files store. No color set ("Default") inherits one: see paint.py.
 # X, Z and conflicts show their patterns whatever the color.
 WIRE_COLORS: dict[str, tuple[tuple[int, int, int], tuple[int, int, int]]] = {
-    name: (_dim(on), on) for name, on in (
+    name: (_dim(on), on)
+    for name, on in (
         ("red", WIRE_ON),
         ("orange", (245, 130, 40)),
         ("yellow", (235, 225, 70)),
@@ -89,6 +92,18 @@ ADD_HANDLE_BORDER = (200, 200, 215)
 JUNCTION_HANDLE_FILL = (120, 170, 255)  # junctions: slide along the wire they sit on
 GHOST_OPACITY = 150
 
+# The top-right panels (minimap.py): M toggles the minimap, G the lens under it.
+LENS_STEPS = 16  # the lens starts this many zoom levels closer than the camera (8 per doubling: x4)
+LENS_STEPS_RANGE = (1, 40)  # G+scroll moves it within this
+LENS_FRAME = (235, 200, 90, 210)  # the frame on the board around what the lens shows
+LENS_CROSS = (235, 200, 90, 110)  # crosshair through the middle of the lens
+MINIMAP_CROSS = (235, 235, 245, 90)  # crosshair on the minimap: where the cursor is
+MINIMAP_SIZE = (200, 140)  # before UI_SCALE
+MINIMAP_MARGIN = 10
+MINIMAP_BG = (22, 22, 27)
+MINIMAP_VIEW = (*SELECT, 220)  # outline of what's on screen
+MINIMAP_VIEW_FILL = (*SELECT, 28)
+
 # Grid: (minor line, major line) colors. Brighter while Ctrl-snapping.
 GRID_COLORS = ((34, 34, 42), (44, 44, 54))
 GRID_SNAPPING = ((42, 42, 52), (62, 62, 78))
@@ -110,11 +125,11 @@ JUNCTION_RADIUS = 4.5  # dot where a wire attaches to another wire
 PART_BORDER = 2
 LABEL_SIZE = 10  # pt at zoom 1
 LABEL_GAP = 6  # between a part and its label
-PIN_LABEL_SIZE = 9     # pt at zoom 1: pin name tags next to macro pins
+PIN_LABEL_SIZE = 9  # pt at zoom 1: pin name tags next to macro pins
 PIN_TAG_BG = (0, 0, 0, 170)  # the tag behind each name
-PIN_TAG_PAD = (4, 3)   # tag padding around the text (x, y), world units
-PIN_TAG_GAP = 4        # between the pin dot's edge and its tag
-TITLE_PAD = 12         # a part's title keeps this much room on each side
+PIN_TAG_PAD = (4, 3)  # tag padding around the text (x, y), world units
+PIN_TAG_GAP = 4  # between the pin dot's edge and its tag
+TITLE_PAD = 12  # a part's title keeps this much room on each side
 TITLE_SIZE, IO_TITLE_SIZE = 12, 10
 
 # Screen-space sizes

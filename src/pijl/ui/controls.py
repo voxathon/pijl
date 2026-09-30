@@ -69,6 +69,8 @@ CONTROLS: list[tuple[str, list[tuple[str, str]]]] = [
         ("scroll", "zoom"),
         ("right-drag / middle-drag", "pan"),
         ("Home", "reset the camera"),
+        ("M", "minimap: click or drag in it to go there"),
+        ("G", "lens: magnify around the cursor (hold G + scroll: how much)"),
         ("hold Ctrl", "snap to the grid (Ctrl+Shift: the finer subgrid)"),
         ("Tab", "pin names on parts: hidden -> on hover -> always"),
         ("«  (picker header)", "tuck the part picker away"),

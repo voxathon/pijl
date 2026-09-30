@@ -11,12 +11,17 @@ nothing per object.
 
 Zoom moves in discrete steps (2^(1/8) per scroll notch), so zoom levels are
 reproducible and a trackpad's tiny fractional scrolls add up to whole notches.
+
+How far out you can zoom depends on the board: `min_level` is kept (by the editor)
+at whatever fits all of it, but never closer than MIN_LEVEL.
 """
+
+import math
 
 from pyglet.math import Mat4
 
 STEPS_PER_OCTAVE = 8           # scroll notches to double the zoom
-MIN_LEVEL, MAX_LEVEL = -26, 24  # ~0.1x .. 8x
+MIN_LEVEL, MAX_LEVEL = -26, 24  # ~0.1x .. 8x; a big board lowers the minimum (min_level)
 
 
 class Camera:
@@ -24,6 +29,7 @@ class Camera:
         self.x = 0.0  # world coordinate shown at the bottom-left of the window
         self.y = 0.0
         self.level = 0
+        self.min_level = MIN_LEVEL  # how far out zooming may go (see fit_level)
         self._scroll_accum = 0.0  # trackpads send fractional scroll amounts
 
     @property
@@ -52,7 +58,8 @@ class Camera:
 
     def set_level(self, level: int, sx: float, sy: float) -> bool:
         """Change zoom while keeping the world point under (sx, sy) fixed."""
-        level = min(MAX_LEVEL, max(MIN_LEVEL, level))
+        # (never pushed in: if the board shrank below where you are, you just can't go further out)
+        level = min(MAX_LEVEL, max(min(self.min_level, self.level), level))
         if level == self.level:
             return False
         wx, wy = self.screen_to_world(sx, sy)
@@ -60,6 +67,12 @@ class Camera:
         self.x = wx - sx / self.zoom
         self.y = wy - sy / self.zoom
         return True
+
+    @staticmethod
+    def fit_level(w: float, h: float, avail_w: float, avail_h: float) -> int:
+        """The closest level at which a w x h world rect fits in avail_w x avail_h px."""
+        fit = min(max(1.0, avail_w) / max(w, 1e-9), max(1.0, avail_h) / max(h, 1e-9))
+        return math.floor(STEPS_PER_OCTAVE * math.log2(fit))
 
     def center_on(self, wx: float, wy: float, width: int, height: int) -> None:
         self.x = wx - width / 2 / self.zoom

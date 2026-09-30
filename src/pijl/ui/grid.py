@@ -68,16 +68,22 @@ class Grid:
     def draw(self, window: pyglet.window.Window, camera: Camera, emphasized: bool,
              divisions: int = 1) -> None:
         """`divisions` > 1 shows the finer subgrid (Ctrl+Shift); major lines stay put."""
+        self.draw_at(window, camera.translation(), camera.zoom, T.BACKGROUND,
+                     T.GRID_SNAPPING if emphasized else T.GRID_COLORS, divisions)
+
+    def draw_at(self, window: pyglet.window.Window, translate: tuple[float, float], zoom: float,
+                background, colors, divisions: int = 1) -> None:
+        """The grid for any view: `translate` is where the world's origin is on screen (px).
+        Fills the whole window; clip it with glScissor (the minimap panels do)."""
         p = self.program
         p.use()
-        tx, ty = camera.translation()
-        p["translate"] = (tx, ty)
-        p["zoom"] = camera.zoom
+        p["translate"] = translate
+        p["zoom"] = zoom
         p["px_ratio"] = window.get_framebuffer_size()[0] / window.width
         p["spacing"] = T.GRID / divisions
         p["major_every"] = float(T.GRID_MAJOR_EVERY * divisions)
-        p["background"] = _rgb(T.BACKGROUND)
-        minor, major = T.GRID_SNAPPING if emphasized else T.GRID_COLORS
+        p["background"] = _rgb(background)
+        minor, major = colors
         p["minor_color"] = _rgb(minor)
         p["major_color"] = _rgb(major)
         self.quad.draw(gl.GL_TRIANGLES)

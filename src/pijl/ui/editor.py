@@ -76,6 +76,9 @@ Controls
   hold Ctrl+Shift          snap to the finer subgrid instead
   scroll                   zoom
   Home                     reset the camera
+  M                        minimap (top right): click or drag in it to go there
+  G                        lens: magnifies the board around the cursor; hold G + scroll to change
+                           how much (see minimap.py)
 """
 
 from __future__ import annotations
@@ -102,7 +105,7 @@ from ..storage import NAME_MAX, FormatError, MacroStore, check_name
 from ..sim import Part, Circuit, Pin, Wire
 from ..snapshot import MACRO  # library entries (and part kinds) of saved macros: "macro:<name>"
 from . import theme as T
-from .camera import MIN_LEVEL, STEPS_PER_OCTAVE, Camera
+from .camera import MIN_LEVEL, Camera
 from .canvas import Canvas
 from .controls import ControlsSheet
 from .document import (EMPTY, Change, History, Snapshot, capture, change_uids, changes, instantiate,
@@ -112,6 +115,7 @@ from .grid import Grid
 from .library import Library
 from .line_edit import LineEdit
 from .menu import RAINBOW, ContextMenu, MenuItem
+from .minimap import Panels
 from .paint import paint, part_color
 from .picker import PartPicker, Row
 from .popover import NumberPopover
@@ -133,6 +137,7 @@ SETTLE_TICKS = 64  # settling noise for new parts, see sim/circuit.py
 MACROS = "MACROS"  # the picker collection new macros land in
 NOTICE_SECONDS = 4.0
 DOUBLE_CLICK = 0.4  # s: a second click on the same picker row within this is treated as mouse bounce
+FIT_MARGIN, FIT_MARGIN_SHARE = 60, 0.05  # room around the board when fitting it: world units, or of its size
 STATS_EVERY = 0.25  # s: how often the status bar's numbers are refreshed (averaged over that time)
 
 
@@ -152,6 +157,7 @@ class Mode(Enum):
     RENAMING = auto()       # typing a collection's name in the picker
     PROMPT = auto()         # a Prompt box is up (save as / open / unsaved changes); see _open_prompt
     POPOVER = auto()        # editing a Number setting in its popover; see _open_popover
+    MINIMAP = auto()        # mouse down in the minimap: the camera follows it
 
 
 def _make_config() -> pyglet.gl.Config | None:
@@ -199,6 +205,8 @@ class Editor(pyglet.window.Window):
             "", font_name="Consolas", font_size=10, color=T.MENU_DANGER,
             x=self.picker.width + 8, y=self.height - 8, anchor_y="top", batch=self.hud)
         self.bar = StatusBar(self.hud, self.width)
+        self.panels = Panels()  # minimap (M) and lens (G), top right
+        self.lens_key: list | None = None  # while G is down: [lens was open before, scrolled since]
         # runtime numbers for the bar, summed over STATS_EVERY seconds
         self.stats = {"frames": 0, "time": 0.0, "sim": 0.0, "steps": 0, "draw": 0.0}
         for msg in self.load_problems:
@@ -214,6 +222,7 @@ class Editor(pyglet.window.Window):
         self.mode = Mode.IDLE
         self.panning = False                 # orthogonal to mode: you can pan while carrying things
         self.mouse = (0, 0)                  # last known cursor position, screen space
+        self.mouse_in = False                # is it over the window at all?
         self.active: PartView | None = None  # part being pressed / dragged
         self.grab = (0.0, 0.0)               # part origin minus cursor, world units
         self.press_at = (0, 0)               # screen pos of the press on a part / wire / picker row
@@ -562,6 +571,12 @@ class Editor(pyglet.window.Window):
             if button == mouse.LEFT and self.bar.cog_hit(x, y) and self.mode is Mode.IDLE:
                 self._cog_menu()
             return  # the bar isn't board: no placing, bends or selecting under it
+        if self.panels.contains(x, y):
+            if button == mouse.LEFT and self.mode is Mode.IDLE and self.panels.minimap.contains(x, y):
+                self.mode = Mode.MINIMAP
+                self.panels.minimap.held = True
+                self._look_at(*self.panels.minimap.to_world(x, y))
+            return  # nor are the panels
 
         if self.mode is Mode.EDITING_WIRE and in_picker:
             self._finish_wire_edit(commit=True)  # like any click away from the wire
@@ -617,7 +632,7 @@ class Editor(pyglet.window.Window):
             return
 
         if self.mode in (Mode.PRESSING_PART, Mode.DRAGGING_PART, Mode.BOX_SELECTING, Mode.PRESSING_WIRE,
-                         Mode.PICKER_PRESS, Mode.PICKER_DRAG):
+                         Mode.PICKER_PRESS, Mode.PICKER_DRAG, Mode.MINIMAP):
             return  # another button while the left one is held down: ignore (middle already panned)
 
         # IDLE
@@ -691,6 +706,8 @@ class Editor(pyglet.window.Window):
             return
         if self.panning:
             self.camera.pan(dx, dy)
+        elif self.mode is Mode.MINIMAP:
+            self._look_at(*self.panels.minimap.to_world(x, y))
         elif self.mode is Mode.PRESSING_PART:
             px, py = self.press_at
             if abs(x - px) + abs(y - py) >= T.DRAG_THRESHOLD_PX:
@@ -719,7 +736,7 @@ class Editor(pyglet.window.Window):
         self._follow_cursor()
 
     def on_mouse_motion(self, x, y, dx, dy):
-        self.mouse = (x, y)
+        self.mouse, self.mouse_in = (x, y), True
         self.bar.set_hover(self.mode is Mode.IDLE and self.bar.cog_hit(x, y))
         if self.mode is Mode.PROMPT:
             self.prompt.hover(x, y)
@@ -734,6 +751,12 @@ class Editor(pyglet.window.Window):
         self._follow_cursor()
         self._update_pin_labels()
 
+    def on_mouse_enter(self, x, y):
+        self.mouse, self.mouse_in = (x, y), True
+
+    def on_mouse_leave(self, x, y):
+        self.mouse_in = False
+
     def on_mouse_release(self, x, y, button, modifiers):
         if self.mode is Mode.POPOVER:
             if button == mouse.LEFT:
@@ -743,6 +766,8 @@ class Editor(pyglet.window.Window):
         # That is what makes press-and-hold on a picker part or pin harmless.
         if button in (mouse.MIDDLE, mouse.RIGHT) and self.panning:
             self.panning = False
+        elif button == mouse.LEFT and self.mode is Mode.MINIMAP:
+            self.mode, self.panels.minimap.held = Mode.IDLE, False
         elif button == mouse.LEFT and self.mode is Mode.PRESSING_PART:
             # A click without movement: clickable parts (switches) get the click,
             # everything else gets selected.
@@ -783,6 +808,10 @@ class Editor(pyglet.window.Window):
             return
         if self.mode is Mode.MENU:
             self._close_menu()  # the menu belongs to what's under it; don't let the world slide away
+        if self.lens_key is not None and self.keys[key.G] and self.panels.lens.open:
+            self.panels.lens.adjust(scroll_y)  # G+scroll: the lens's magnification, not the board's
+            self.lens_key[1] = True
+            return
         if self.picker.contains(x, y):
             self.picker.scroll_by(scroll_y)  # eases there; a drag follows along (see PartPicker.update)
             if self.mode is not Mode.PICKER_DRAG:
@@ -791,6 +820,8 @@ class Editor(pyglet.window.Window):
         if scroll_y and self.snapping and self.mode is Mode.IDLE and self._tiling_active():
             self._space_tiling(scroll_y)
             return
+        if self.panels.contains(x, y):
+            x, y = self._board_center()  # zoom what you're looking at, not what's under the panel
         self.camera.scroll(x, y, scroll_y)
         self._follow_cursor()
 
@@ -877,12 +908,24 @@ class Editor(pyglet.window.Window):
             self.pin_label_mode = (self.pin_label_mode + 1) % len(PIN_LABEL_MODES)
             self._update_pin_labels()
             self._notice(f"pin names: {PIN_LABEL_MODES[self.pin_label_mode]}")
+        elif symbol == key.M and not modifiers & (key.MOD_CTRL | key.MOD_ALT):
+            self.panels.minimap.open = not self.panels.minimap.open
+        elif symbol == key.G and not modifiers & (key.MOD_CTRL | key.MOD_ALT):
+            # Opens right away (so G+scroll has something to adjust); closes on release,
+            # unless it was just opened or you scrolled while holding G.
+            self.lens_key = [self.panels.lens.open, False]
+            self.panels.lens.open = True
         elif symbol == key.HOME:
             self.camera.set_level(0, 0, 0)
             self.camera.center_on(*HOME, self.width, self.height)
             self._follow_cursor()
 
     def on_key_release(self, symbol, modifiers):
+        if symbol == key.G and self.lens_key is not None:
+            was_open, scrolled = self.lens_key
+            self.lens_key = None
+            if was_open and not scrolled:
+                self.panels.lens.open = False
         if symbol in (key.LCTRL, key.RCTRL, key.LSHIFT, key.RSHIFT):
             self._follow_cursor()  # un-snap / back to the normal grid
 
@@ -1476,6 +1519,7 @@ class Editor(pyglet.window.Window):
             self._close_prompt()
         elif self.mode is Mode.POPOVER:
             self._close_popover()
+        self.panels.minimap.held = False
         self.pressed_wire = None
         self.picker_row = None
         if self.mode in (Mode.DRAGGING_PART, Mode.PLACING_PART):
@@ -1528,6 +1572,7 @@ class Editor(pyglet.window.Window):
         self._update_caption()
         self.status.x = self.picker.width + 8  # follows the panel sliding in / out
         self.bar.place(self.picker.width, self.width)
+        self._update_panels(dt)
         t0 = time.perf_counter()
         self.circuit.frame()
         for _ in range(SIM_STEPS_PER_FRAME):
@@ -1568,8 +1613,54 @@ class Editor(pyglet.window.Window):
         self.view = self.camera.matrix()
         self.world.draw()
         self.view = Mat4()  # identity: HUD is in screen pixels
+        self.panels.draw(self, self.world, self.grid)
         self.hud.draw()
         self.stats["draw"] += time.perf_counter() - t0  # CPU side: issuing the draws, not the GPU's work
+
+    def _board_center(self) -> tuple[float, float]:
+        """The middle of the visible board (right of the picker, above the bar), screen px."""
+        return (self.picker.width + self.width) / 2, (BAR_H + self.height) / 2
+
+    def _visible_world(self) -> tuple[float, float, float, float]:
+        """The world rect you can see: right of the picker, above the bar."""
+        (x0, y0), (x1, y1) = (self.camera.screen_to_world(self.picker.width, BAR_H),
+                              self.camera.screen_to_world(self.width, self.height))
+        return x0, y0, x1, y1
+
+    def _look_at(self, wx: float, wy: float) -> None:
+        """Move the camera so (wx, wy) is in the middle of the visible board."""
+        sx, sy = self._board_center()
+        z = self.camera.zoom
+        self.camera.x, self.camera.y = wx - sx / z, wy - sy / z
+        self._follow_cursor()
+
+    def _board_bounds(self) -> tuple[float, float, float, float] | None:
+        """The box around every part and wire, or None for an empty board."""
+        boxes = [b for b in (self.part_index.bounds(), self.wire_index.bounds()) if b]
+        if not boxes:
+            return None
+        return (min(b[0] for b in boxes), min(b[1] for b in boxes),
+                max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+    def _fit(self, board) -> tuple[tuple[float, float, float, float], int]:
+        """`board` with a margin around it, and the level at which that fits the visible board."""
+        x0, y0, x1, y1 = board
+        m = max(FIT_MARGIN, FIT_MARGIN_SHARE * max(x1 - x0, y1 - y0))
+        x0, y0, x1, y1 = x0 - m, y0 - m, x1 + m, y1 + m
+        level = Camera.fit_level(x1 - x0, y1 - y0, self.width - self.picker.width, self.height - BAR_H)
+        return (x0, y0, x1, y1), level
+
+    def _update_zoom_floor(self, board) -> None:
+        """Zooming out goes as far as it takes to see the whole board (at least to MIN_LEVEL)."""
+        self.camera.min_level = MIN_LEVEL if board is None else min(MIN_LEVEL, self._fit(board)[1])
+
+    def _update_panels(self, dt: float) -> None:
+        board = self._board_bounds()
+        self._update_zoom_floor(board)
+        on_board = (self.mouse_in and not self.picker.contains(*self.mouse)
+                    and not self.bar.contains(*self.mouse))
+        self.panels.update(dt, self.camera, board, self._visible_world(), self.mouse if on_board else None,
+                           self.width, self.height)
 
     def _tally(self, dt: float, sim: float) -> None:
         """Add up one frame's numbers; every STATS_EVERY seconds, show their averages in the bar."""
@@ -1817,22 +1908,17 @@ class Editor(pyglet.window.Window):
     def _fit_camera(self) -> None:
         """Show everything on the board, centered in the space right of the picker.
         Zooms out if it doesn't fit, never in past 1:1."""
-        views = list(self.part_views.values())
-        if not views:
+        board = self._board_bounds()
+        self._update_zoom_floor(board)
+        if board is None:
             self.camera.set_level(0, 0, 0)
             self.camera.center_on(*HOME, self.width, self.height)
             return
-        margin = 60
-        x0 = min(v.x for v in views) - margin
-        y0 = min(v.y for v in views) - margin
-        x1 = max(v.x + v.w for v in views) + margin
-        y1 = max(v.y + v.h for v in views) + margin
-        avail = max(1, self.width - self.picker.width)
-        fit = min(avail / (x1 - x0), max(1, self.height - BAR_H) / (y1 - y0))
-        self.camera.level = max(MIN_LEVEL, min(0, math.floor(STEPS_PER_OCTAVE * math.log2(fit))))
-        self.camera.center_on((x0 + x1) / 2, (y0 + y1) / 2, self.width, self.height)
-        self.camera.x -= self.picker.width / 2 / self.camera.zoom  # center in the free space, not the window
-        self.camera.y -= BAR_H / 2 / self.camera.zoom
+        (x0, y0, x1, y1), level = self._fit(board)
+        self.camera.level = max(self.camera.min_level, min(0, level))
+        sx, sy = self._board_center()
+        self.camera.x = (x0 + x1) / 2 - sx / self.camera.zoom
+        self.camera.y = (y0 + y1) / 2 - sy / self.camera.zoom
 
     # ---- projects and the cogwheel menu ---------------------------------------------
 
