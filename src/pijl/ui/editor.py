@@ -76,9 +76,10 @@ Controls
   hold Ctrl+Shift          snap to the finer subgrid instead
   scroll                   zoom
   Home                     reset the camera
-  M                        minimap (top right): click or drag in it to go there
-  G                        lens: magnifies the board around the cursor; hold G + scroll to change
-                           how much (see minimap.py)
+  M                        minimap (top right): press (any button) or drag in it to go there;
+                           works mid-action too, like panning
+  G                        lens: magnifies the board around the cursor. Hold G + scroll, or
+                           scroll on the lens or the minimap, to change how much (see minimap.py)
 """
 
 from __future__ import annotations
@@ -157,7 +158,10 @@ class Mode(Enum):
     RENAMING = auto()       # typing a collection's name in the picker
     PROMPT = auto()         # a Prompt box is up (save as / open / unsaved changes); see _open_prompt
     POPOVER = auto()        # editing a Number setting in its popover; see _open_popover
-    MINIMAP = auto()        # mouse down in the minimap: the camera follows it
+
+
+# Modes you can steer with the minimap in (the rest hold a button down, or have the keyboard)
+STEERABLE = frozenset({Mode.IDLE, Mode.PLACING_PART, Mode.WIRING, Mode.EDITING_WIRE})
 
 
 def _make_config() -> pyglet.gl.Config | None:
@@ -199,13 +203,16 @@ class Editor(pyglet.window.Window):
         self.picker = PartPicker(self.library, self.hud, self.height, self._pixel_ratio(),
                                  swatch=self._swatch, name_of=lambda entry: entry.removeprefix(MACRO),
                                  disabled=self._unplaceable)
-        self.menu = ContextMenu(self.hud)
+        # Screen-space things that belong to the board (the lens magnifies them with it):
+        # the context menu and the selection box. Drawn over the HUD.
+        self.overlay = pyglet.graphics.Batch()
+        self.menu = ContextMenu(self.overlay)
         # Problems (part scripts, files) in red; notices ("saved adder") in grey, for a few seconds
         self.status = pyglet.text.Label(
             "", font_name="Consolas", font_size=10, color=T.MENU_DANGER,
             x=self.picker.width + 8, y=self.height - 8, anchor_y="top", batch=self.hud)
         self.bar = StatusBar(self.hud, self.width)
-        self.panels = Panels()  # minimap (M) and lens (G), top right
+        self.panels = Panels(self.overlay)  # minimap (M) and lens (G), top right
         self.lens_key: list | None = None  # while G is down: [lens was open before, scrolled since]
         # runtime numbers for the bar, summed over STATS_EVERY seconds
         self.stats = {"frames": 0, "time": 0.0, "sim": 0.0, "steps": 0, "draw": 0.0}
@@ -221,6 +228,7 @@ class Editor(pyglet.window.Window):
         # interaction state
         self.mode = Mode.IDLE
         self.panning = False                 # orthogonal to mode: you can pan while carrying things
+        self.map_button: int | None = None   # same for steering with the minimap: the button held in it
         self.mouse = (0, 0)                  # last known cursor position, screen space
         self.mouse_in = False                # is it over the window at all?
         self.active: PartView | None = None  # part being pressed / dragged
@@ -259,7 +267,7 @@ class Editor(pyglet.window.Window):
         self.box_start: Point = (0.0, 0.0)     # world point where the box drag began
         self.box_base: tuple[set, set] = (set(), set())  # selection to add to (shift) or empty
         self.box_shapes: tuple[shapes.Rectangle, shapes.Box] | None = None
-        self.hud_box_group = pyglet.graphics.Group(order=8)  # above the picker, below menus
+        self.hud_box_group = pyglet.graphics.Group(order=8)  # below menus
         # prompt box (Mode.PROMPT)
         self.prompt: Prompt | None = None
         self.prompt_enter = None  # what Enter (or clicking a list item) does: fn(prompt)
@@ -579,6 +587,13 @@ class Editor(pyglet.window.Window):
             self._finish_rename(commit=True)  # same for collection names
             return
 
+        if self.panels.minimap.contains(x, y):
+            # Steer from the map (with any button, in any mode that isn't holding a button already).
+            if self.map_button is None and not self.panning and self.mode in STEERABLE:
+                self.map_button = button
+                self.panels.minimap.held = True
+                self._look_at(*self.panels.minimap.to_world(x, y))
+            return
         if button == mouse.MIDDLE:
             self.panning = True
             return
@@ -587,11 +602,7 @@ class Editor(pyglet.window.Window):
                 self._cog_menu()
             return  # the bar isn't board: no placing, bends or selecting under it
         if self.panels.contains(x, y):
-            if button == mouse.LEFT and self.mode is Mode.IDLE and self.panels.minimap.contains(x, y):
-                self.mode = Mode.MINIMAP
-                self.panels.minimap.held = True
-                self._look_at(*self.panels.minimap.to_world(x, y))
-            return  # nor are the panels
+            return  # nor is the lens
 
         if self.mode is Mode.EDITING_WIRE and in_picker:
             self._finish_wire_edit(commit=True)  # like any click away from the wire
@@ -647,7 +658,7 @@ class Editor(pyglet.window.Window):
             return
 
         if self.mode in (Mode.PRESSING_PART, Mode.DRAGGING_PART, Mode.BOX_SELECTING, Mode.PRESSING_WIRE,
-                         Mode.PICKER_PRESS, Mode.PICKER_DRAG, Mode.MINIMAP):
+                         Mode.PICKER_PRESS, Mode.PICKER_DRAG):
             return  # another button while the left one is held down: ignore (middle already panned)
 
         # IDLE
@@ -719,10 +730,11 @@ class Editor(pyglet.window.Window):
         if self.mode is Mode.POPOVER:
             self._popover_drag(x)
             return
+        if self.map_button is not None:
+            self._look_at(*self.panels.minimap.to_world(x, y))
+            return
         if self.panning:
             self.camera.pan(dx, dy)
-        elif self.mode is Mode.MINIMAP:
-            self._look_at(*self.panels.minimap.to_world(x, y))
         elif self.mode is Mode.PRESSING_PART:
             px, py = self.press_at
             if abs(x - px) + abs(y - py) >= T.DRAG_THRESHOLD_PX:
@@ -773,6 +785,9 @@ class Editor(pyglet.window.Window):
         self.mouse_in = False
 
     def on_mouse_release(self, x, y, button, modifiers):
+        if button == self.map_button:
+            self.map_button, self.panels.minimap.held = None, False
+            return
         if self.mode is Mode.POPOVER:
             if button == mouse.LEFT:
                 self._popover_release()
@@ -781,8 +796,6 @@ class Editor(pyglet.window.Window):
         # That is what makes press-and-hold on a picker part or pin harmless.
         if button in (mouse.MIDDLE, mouse.RIGHT) and self.panning:
             self.panning = False
-        elif button == mouse.LEFT and self.mode is Mode.MINIMAP:
-            self.mode, self.panels.minimap.held = Mode.IDLE, False
         elif button == mouse.LEFT and self.mode is Mode.PRESSING_PART:
             # A click without movement: clickable parts (switches) get the click,
             # everything else gets selected.
@@ -823,10 +836,6 @@ class Editor(pyglet.window.Window):
             return
         if self.mode is Mode.MENU:
             self._close_menu()  # the menu belongs to what's under it; don't let the world slide away
-        if self.lens_key is not None and self.keys[key.G] and self.panels.lens.open:
-            self.panels.lens.adjust(scroll_y)  # G+scroll: the lens's magnification, not the board's
-            self.lens_key[1] = True
-            return
         if self.picker.contains(x, y):
             self.picker.scroll_by(scroll_y)  # eases there; a drag follows along (see PartPicker.update)
             if self.mode is not Mode.PICKER_DRAG:
@@ -835,8 +844,21 @@ class Editor(pyglet.window.Window):
         if scroll_y and self.snapping and self.mode is Mode.IDLE and self._tiling_active():
             self._space_tiling(scroll_y)
             return
-        if self.panels.contains(x, y):
-            x, y = self._board_center()  # zoom what you're looking at, not what's under the panel
+        if self.panels.scrolls_lens(x, y) or (self.lens_key is not None and self.keys[key.G]
+                                               and self.panels.lens.open):
+            self.panels.lens.adjust(scroll_y)  # the lens's magnification; the view stays put
+            if self.lens_key is not None:
+                self.lens_key[1] = True
+            return
+        if (at := self.panels.anchor(x, y, self._visible_world())) is not None:
+            # On the map: zoom around the spot pointed at -- after jumping there if it's
+            # outside the view (zooming around a point off screen would slide the view away).
+            p, jump = at
+            if jump:
+                self._look_at(*p)
+            x, y = self.camera.world_to_screen(*p)
+        elif self.panels.contains(x, y):
+            x, y = self._board_center()
         self.camera.scroll(x, y, scroll_y)
         self._follow_cursor()
 
@@ -1442,9 +1464,9 @@ class Editor(pyglet.window.Window):
         y0, y1 = sorted((ay, sy))
         if self.box_shapes is None:
             self.box_shapes = (shapes.Rectangle(0, 0, 1, 1, color=T.SELECT_BOX_FILL,
-                                                batch=self.hud, group=self.hud_box_group),
+                                                batch=self.overlay, group=self.hud_box_group),
                                shapes.Box(0, 0, 1, 1, thickness=1, color=T.SELECT,
-                                          batch=self.hud, group=self.hud_box_group))
+                                          batch=self.overlay, group=self.hud_box_group))
         for shape in self.box_shapes:
             shape.position = (x0, y0)
             shape.width, shape.height = max(x1 - x0, 1), max(y1 - y0, 1)
@@ -1534,7 +1556,6 @@ class Editor(pyglet.window.Window):
             self._close_prompt()
         elif self.mode is Mode.POPOVER:
             self._close_popover()
-        self.panels.minimap.held = False
         self.pressed_wire = None
         self.picker_row = None
         if self.mode in (Mode.DRAGGING_PART, Mode.PLACING_PART):
@@ -1630,6 +1651,7 @@ class Editor(pyglet.window.Window):
         self.view = Mat4()  # identity: HUD is in screen pixels
         self.panels.draw(self, self.world, self.grid)
         self.hud.draw()
+        self.overlay.draw()
         self.stats["draw"] += time.perf_counter() - t0  # CPU side: issuing the draws, not the GPU's work
 
     def _board_center(self) -> tuple[float, float]:
@@ -1672,10 +1694,10 @@ class Editor(pyglet.window.Window):
     def _update_panels(self, dt: float) -> None:
         board = self._board_bounds()
         self._update_zoom_floor(board)
-        on_board = (self.mouse_in and not self.picker.contains(*self.mouse)
-                    and not self.bar.contains(*self.mouse))
-        self.panels.update(dt, self.camera, board, self._visible_world(), self.mouse if on_board else None,
-                           self.width, self.height)
+        on_board = not self.picker.contains(*self.mouse) and not self.bar.contains(*self.mouse)
+        menu = self.menu.rect_at(*self.mouse) if self.mode is Mode.MENU else None
+        self.panels.update(dt, self.camera, board, self._visible_world(), self.mouse if self.mouse_in else None,
+                           on_board, menu, self.width, self.height)
 
     def _tally(self, dt: float, sim: float) -> None:
         """Add up one frame's numbers; every STATS_EVERY seconds, show their averages in the bar."""

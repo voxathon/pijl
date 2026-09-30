@@ -94,7 +94,7 @@ GHOST_OPACITY = 150
 
 # The top-right panels (minimap.py): M toggles the minimap, G the lens under it.
 LENS_STEPS = 16  # the lens starts this many zoom levels closer than the camera (8 per doubling: x4)
-LENS_STEPS_RANGE = (1, 40)  # G+scroll moves it within this
+LENS_STEPS_RANGE = (1, 40)  # G+scroll (or scrolling on the panels) moves it within this
 LENS_FRAME = (235, 200, 90, 210)  # the frame on the board around what the lens shows
 LENS_CROSS = (235, 200, 90, 110)  # crosshair through the middle of the lens
 MINIMAP_CROSS = (235, 235, 245, 90)  # crosshair on the minimap: where the cursor is

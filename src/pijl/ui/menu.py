@@ -158,6 +158,14 @@ class ContextMenu:
     def contains(self, sx: float, sy: float) -> bool:
         return self._panel_at(sx, sy) is not None
 
+    def rect_at(self, sx: float, sy: float) -> tuple[float, float, float, float] | None:
+        """(x, y, w, h) of the topmost panel under the point, if any."""
+        d = self._panel_at(sx, sy)
+        if d is None:
+            return None
+        box = self.panels[d].box
+        return box.x, box.y, box.w, box.h
+
     def item_at(self, sx: float, sy: float) -> MenuItem | None:
         d = self._panel_at(sx, sy)
         if d is None:
