@@ -39,7 +39,7 @@ SUPERSAMPLE = (
 # without it the SDF encodes the bitmap's pixel stairs and edges look jagged
 CHARS = "".join(chr(c) for c in range(33, 127))  # printable ASCII except space
 ATLAS_W = 1024
-_FORMAT_VERSION = 1  # bump when the cache layout or SDF math changes
+_FORMAT_VERSION = 2  # bump when the cache layout or SDF math changes
 
 _VERTEX = f"""#version 150 core
 in vec4 rect;   // x, y, width, height of the glyph's quad
@@ -158,7 +158,12 @@ def _build() -> tuple[np.ndarray, np.ndarray, float, float]:
         advance = g.advance / SUPERSAMPLE  # monospace: identical for all
         img = g.get_image_data()
         alpha = np.frombuffer(img.get_data("RGBA", img.width * 4), np.uint8)
-        alpha = alpha.reshape(img.height, img.width, 4)[:, :, 3]  # rows bottom-up
+        alpha = alpha.reshape(img.height, img.width, 4)[:, :, 3]
+        # Rows come as stored in the texture: bottom-up, except where the font renderer
+        # stored them top-down and flipped the glyph's tex_coords instead (FreeType, so
+        # Linux). Bottom-left vertex's v above the top-left's: flipped.
+        if g.tex_coords[1] > g.tex_coords[10]:
+            alpha = alpha[::-1]  # now bottom-up
         sdf = _to_sdf(alpha)
         left, bottom = (
             g.vertices[0] / SUPERSAMPLE - SPREAD,
