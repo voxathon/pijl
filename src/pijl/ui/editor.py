@@ -83,7 +83,9 @@ Controls
   Ctrl+Home                fit the camera to the parts (with a margin)
   G                        miniview (top right): the board around the cursor again, at its
                            own zoom (see miniview.py). Press (any button) or drag in it to
-                           move its crosshair; the view stays put.
+                           move its crosshair; the view stays put. Left-click in it
+                           selects, like on the board (Shift toggles); right-click opens
+                           the same menus (Label..., Edit and Branch take the view there).
     scroll on it, G+scroll its zoom (closer than the view, or further out: a map)
     arrow keys             move it instead: it parks there (stops following the cursor)
     hold G + move mouse    same, finer: the cursor stays put (theme: MINI_MOUSE_SENSITIVITY)
@@ -339,6 +341,7 @@ class Editor(pyglet.window.Window):
             None  # same for pointing in the miniview: the button held in it
         )
         self.mouse = (0, 0)  # last known cursor position, screen space
+        self.hit_scale: float | None = None  # see hit_zoom
         self.mouse_in = False  # is it over the window at all?
         self.active: PartView | None = None  # part being pressed / dragged
         self.grab = (0.0, 0.0)  # part origin minus cursor, world units
@@ -681,15 +684,21 @@ class Editor(pyglet.window.Window):
     # ======================================================================
 
     @property
+    def hit_zoom(self) -> float:
+        """Screen px per world unit where the click is: the view's, or the miniview's
+        while a click in it is being hit-tested."""
+        return self.hit_scale or self.camera.zoom
+
+    @property
     def slop(self) -> float:
         """HIT_SLOP_PX converted to world units, so clicking feels the same at any zoom."""
-        return T.HIT_SLOP_PX / self.camera.zoom
+        return T.HIT_SLOP_PX / self.hit_zoom
 
     @property
     def pins_clickable(self) -> bool:
         """Zoomed far out, pins are specks and their (screen-sized) reach would cover
         the whole part: clicks go to parts instead, and wires can't be started or ended."""
-        return T.PIN_RADIUS * self.camera.zoom >= T.PIN_HIT_MIN_PX
+        return T.PIN_RADIUS * self.hit_zoom >= T.PIN_HIT_MIN_PX
 
     def pin_at(self, wx: float, wy: float) -> Pin | None:
         if not self.pins_clickable:
@@ -813,6 +822,10 @@ class Editor(pyglet.window.Window):
                 self.map_button = button
                 self.mini.grabbed = True
                 self.mini.point(x, y)
+                if button == mouse.LEFT and self.mode is Mode.IDLE:
+                    self._mini_select(*self.mini.to_world(x, y), modifiers)
+                elif button == mouse.RIGHT and self.mode is Mode.IDLE:
+                    self._mini_menu(x, y, modifiers)
             return
         if button == mouse.MIDDLE:
             self.panning = True
@@ -953,62 +966,122 @@ class Editor(pyglet.window.Window):
                 self.press_at = (x, y)
                 self.mode = Mode.BOX_SELECTING
 
-        elif button == mouse.RIGHT:
-            # Right-clicking narrows the selection to what the menu will act on, so the
-            # highlight shows exactly that: the clicked item -- or, on a part inside a
-            # selection of parts all of one kind, those parts (Ctrl: just the clicked one).
-            if view := self.part_at(wx, wy):
-                sel = self.selection.parts
-                group = (
-                    sorted(sel, key=lambda v: v.part.uid)
-                    if view in sel
-                    and not modifiers & key.MOD_CTRL
-                    and len({v.part.type for v in sel}) == 1
-                    else [view]
-                )
-                self.selection.set(parts=group)
-                items = (
-                    [MenuItem("Label...", lambda: self._start_edit(view))]
-                    if len(group) == 1
-                    else []
-                )
-                if view.look.lit:  # switches and LEDs are color sources (paint.py)
-                    items.append(
-                        MenuItem(
-                            "Recolor",
-                            submenu=self._recolor_items(
-                                _common(part_color(v.part) for v in group),
-                                lambda c: [self._set_part_color(v, c) for v in group],
-                            ),
-                        )
-                    )
-                items += self._settings_items(group)
+        elif button == mouse.RIGHT and not self._item_menu(x, y, wx, wy, modifiers):
+            self.panning = True
+
+    def _item_menu(
+        self, x: float, y: float, wx: float, wy: float, modifiers: int, board=None
+    ) -> bool:
+        """The context menu for what's at world point (wx, wy), opened at screen point
+        (x, y); False if there's nothing there. `board(action)`: wraps the items that go
+        on to work on the board (label editing, wire editing, branching) -- the
+        miniview's menu brings the view there first."""
+        board = board or (lambda action: action)
+        # Right-clicking narrows the selection to what the menu will act on, so the
+        # highlight shows exactly that: the clicked item -- or, on a part inside a
+        # selection of parts all of one kind, those parts (Ctrl: just the clicked one).
+        if view := self.part_at(wx, wy):
+            sel = self.selection.parts
+            group = (
+                sorted(sel, key=lambda v: v.part.uid)
+                if view in sel
+                and not modifiers & key.MOD_CTRL
+                and len({v.part.type for v in sel}) == 1
+                else [view]
+            )
+            self.selection.set(parts=group)
+            items = (
+                [MenuItem("Label...", board(lambda: self._start_edit(view)))]
+                if len(group) == 1
+                else []
+            )
+            if view.look.lit:  # switches and LEDs are color sources (paint.py)
                 items.append(
-                    MenuItem("Delete", lambda: self.remove_parts(group), danger=True)
-                )
-                self._open_menu(x, y, items)
-            elif wire := self.wire_at(wx, wy):
-                self.selection.set(wires=[wire])
-                at = project_onto(wire.points, (wx, wy))
-                self._open_menu(
-                    x,
-                    y,
-                    [
-                        MenuItem("Edit", lambda: self._start_wire_edit(wire)),
-                        MenuItem("Branch", lambda: self._start_wiring(wire.wire, at)),
-                        MenuItem(
-                            "Recolor",
-                            submenu=self._recolor_items(
-                                wire.color, lambda c: setattr(wire, "color", c)
-                            ),
+                    MenuItem(
+                        "Recolor",
+                        submenu=self._recolor_items(
+                            _common(part_color(v.part) for v in group),
+                            lambda c: [self._set_part_color(v, c) for v in group],
                         ),
-                        MenuItem(
-                            "Delete", lambda: self.cut_wire(wire, at), danger=True
-                        ),
-                    ],
+                    )
                 )
-            else:
-                self.panning = True
+            items += self._settings_items(group)
+            items.append(
+                MenuItem("Delete", lambda: self.remove_parts(group), danger=True)
+            )
+            self._open_menu(x, y, items)
+        elif wire := self.wire_at(wx, wy):
+            self.selection.set(wires=[wire])
+            at = project_onto(wire.points, (wx, wy))
+            self._open_menu(
+                x,
+                y,
+                [
+                    MenuItem("Edit", board(lambda: self._start_wire_edit(wire))),
+                    MenuItem(
+                        "Branch", board(lambda: self._start_wiring(wire.wire, at))
+                    ),
+                    MenuItem(
+                        "Recolor",
+                        submenu=self._recolor_items(
+                            wire.color, lambda c: setattr(wire, "color", c)
+                        ),
+                    ),
+                    MenuItem(
+                        "Delete", lambda: self.cut_wire(wire, at), danger=True
+                    ),
+                ],
+            )
+        else:
+            return False
+        return True
+
+    @contextmanager
+    def _hit_in_mini(self):
+        """Hit-test at the miniview's zoom (so clicking in it feels the same as on the board)."""
+        self.hit_scale = self.mini.scale
+        try:
+            yield
+        finally:
+            self.hit_scale = None
+
+    def _mini_select(self, wx: float, wy: float, modifiers: int) -> None:
+        """A left click in the miniview: selects what's there, like a click on the board
+        (Shift toggles it; on nothing, a plain click clears)."""
+        with self._hit_in_mini():
+            hit = self.part_at(wx, wy) or self.wire_at(wx, wy)
+        if modifiers & key.MOD_SHIFT and not modifiers & key.MOD_CTRL:
+            if hit is not None:
+                self.selection.toggle(hit)
+        elif isinstance(hit, PartView):
+            self.selection.set(parts=[hit])
+        elif hit is not None:
+            self.selection.set(wires=[hit])
+        else:
+            self.selection.clear()
+
+    def _mini_menu(self, x: float, y: float, modifiers: int) -> None:
+        """A right click in the miniview: the same menu as on the board, opened where you
+        clicked (over the miniview, which holds still for it). Items that go on to work on
+        the board (Label..., Edit, Branch) first bring the view to the spot and the cursor
+        onto it there."""
+        wx, wy = self.mini.to_world(x, y)
+
+        def board(action):
+            def run():
+                self._center_on(wx, wy)
+                self._warp(*self.camera.world_to_screen(wx, wy))
+                self._follow_cursor()
+                action()
+
+            return run
+
+        with self._hit_in_mini():
+            opened = self._item_menu(x, y, wx, wy, modifiers, board)
+        if opened:
+            self.map_button = None  # the menu has the mouse now
+            self.mini.grabbed = False
+            self.mini.own_menu = True
 
     def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers):
         if self.mini_steer is not None:
@@ -2496,6 +2569,12 @@ class Editor(pyglet.window.Window):
             self.camera.screen_to_world(self.width, self.height),
         )
         return x0, y0, x1, y1
+
+    def _center_on(self, wx: float, wy: float) -> None:
+        """Move the camera so (wx, wy) is in the middle of the visible board."""
+        sx, sy = self._board_center()
+        z = self.camera.zoom
+        self.camera.x, self.camera.y = wx - sx / z, wy - sy / z
 
     def _board_bounds(self) -> tuple[float, float, float, float] | None:
         """The box around every part and wire, or None for an empty board."""

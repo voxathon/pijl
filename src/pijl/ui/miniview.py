@@ -9,7 +9,9 @@ It looks at the *pointer*: the world point under the cursor on the board, with t
 crosshair through it. On the board, a yellow frame shows what it covers; in it, a blue
 outline shows what the view does. Over the miniview itself, it holds still (so you can
 point at things in it); pressing or dragging in it (any button) moves its crosshair
-there (kept on the panel's edge if you drag off it) -- the view doesn't move.
+there (kept on the panel's edge if you drag off it) -- the view doesn't move -- and
+a left click selects what's there, a right click opens its context menu (the editor
+does those). That menu is drawn over it as usual, not again inside it.
 
 Parked (the editor drives this; see its docstring for the keys): it stops following
 the pointer and stays on its own world point, moved only by nudge() (arrows, G+mouse)
@@ -132,6 +134,9 @@ class Miniview:
         )  # where that is in it (fractions of its size; menus move it)
         self.hovered = False  # the cursor is on it: it holds still
         self.grabbed = False  # a button pressed in it is held: it holds still too
+        # The context menu was opened in it (the editor sets this): it holds still, and
+        # doesn't show that menu a second time (it's drawn over it already)
+        self.own_menu = False
         self.parked = (
             False  # on its own spot, not following the pointer (see the docstring)
         )
@@ -319,7 +324,11 @@ class Miniview:
         self.menu = None
         self.hovered = self.grabbed or cursor is not None and self.contains(*cursor)
         context = self.context
-        if context is not None and context.visible:  # it holds still (see _push)
+        if context is None or not context.visible:
+            self.own_menu = False
+        if self.own_menu:
+            pass  # stays
+        elif context is not None and context.visible:  # it holds still (see _push)
             if cursor is not None and (
                 context.contains(*cursor) or on_board and not self.hovered
             ):
@@ -449,7 +458,7 @@ class Miniview:
                 k, 0, 0, 0, 0, k, 0, 0, 0, 0, 1, 0, tx - mx * k, ty - my * k, 0, 1
             )
             self.overlay.draw()
-        if self.context is not None and self.context.visible:
+        if self.context is not None and self.context.visible and not self.own_menu:
             ax, ay = self.context.anchor
             window.view = Mat4(
                 1,
