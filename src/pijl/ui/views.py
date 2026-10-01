@@ -1741,6 +1741,10 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
             at = (starts[idx][:, None] + np.arange(n_in + n_out)).ravel()
             is_out[at] = np.tile(out, len(idx))
             pin_dy[at] = np.tile(dy, len(idx))
+    # (before anything asks pin_pos: the pin name tags below do)
+    t.pin_row[pin_slots] = np.repeat(rows, counts)
+    t.pin_out[pin_slots] = is_out
+    t.pin_dy[pin_slots] = pin_dy
     # titles and user labels (a view's title, then its label: the one-at-a-time order),
     # and pin name tags if shown
     mid_x, mid_y = xs + ws / 2, ys + hs / 2
@@ -1823,9 +1827,6 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
         buf.mark_many(slots)
         buf.show_pins(slots, pin_slots)
     t.pin_dot[pin_slots] = slots
-    t.pin_row[pin_slots] = np.repeat(rows, counts)
-    t.pin_out[pin_slots] = is_out
-    t.pin_dy[pin_slots] = pin_dy
     # the spatial index: the body, and the pins sticking out of its sides (_index_box)
     if t.index is not None:
         r = T.PIN_RADIUS

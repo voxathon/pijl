@@ -91,6 +91,10 @@ def test_pin_tags_follow_tab_hover_and_drags(ed):
             ed.dispatch_event("on_key_press", key.TAB, 0)
 
     tab_to(2)  # always
+    # (made while tags are shown: they're placed as the part's are made)
+    views.append(ed.add_part("OR", 200.0, 300.0))
+    ed._record()
+    base += len("OR")  # (its title)
     assert all(v.pin_labels_shown for v in views)
     with_tags = int(glyphs.used.sum())
     assert with_tags > base
@@ -110,5 +114,5 @@ def test_pin_tags_follow_tab_hover_and_drags(ed):
     v = views[2]
     sx, sy = ed.camera.world_to_screen(v.x + v.w / 2, v.y + v.h / 2)
     ed.dispatch_event("on_mouse_motion", sx, sy, 0, 0)
-    assert [w.pin_labels_shown for w in views] == [False, False, True, False]
+    assert [w.pin_labels_shown for w in views] == [False, False, True, False, False]
     assert capture(ed).parts  # (still a sound board)
