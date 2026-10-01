@@ -68,7 +68,14 @@ Controls
                            (or Rename..., which changes only its title: boards using it
                            keep working)
   Ctrl+N                   new, empty board
-  Tab                      pin names on placed parts: hidden -> on hover -> always -> hidden
+  Tab                      pin names on placed parts: hidden -> on hover -> always -> hidden.
+                           Unless hidden, the part under the cursor also shows its pins' levels
+                           (0 / 1 / X / Z) inside its body (inside.PinProbe)
+  right-click a macro      View: look inside this instance, live and read-only (the board
+                           behind it keeps running; a grey-blue board, a breadcrumb in the bar).
+                           Inside, right-click a macro to go deeper; Esc / Backspace backs out
+                           one level. The picker, Ctrl+S / O / N back out first; edits do
+                           nothing. Open definition opens the macro itself. See inside.py.
                            (opening, new and closing the window ask first if there are unsaved changes)
   cogwheel (bottom right)  Controls (the short version of this list, see controls.py: keep them in
                            step), Open macro..., Projects: switch to another project or make a new one
@@ -137,6 +144,7 @@ from .document import (
 )
 from .duplicate import DOWN, RIGHT, Cell, Tiling, tiled
 from .grid import Grid
+from .inside import Level, PinProbe, build_scene, free_scene, put_scene, take_scene
 from .library import Library, LibraryHistory, Step
 from .line_edit import LineEdit
 from .menu import RAINBOW, ContextMenu, MenuItem
@@ -268,6 +276,9 @@ class Editor(pyglet.window.Window):
         self._bind_project(project)
         self.pin_label_mode = PIN_LABELS_HOVER  # Tab cycles it
         self.hover_view: PartView | None = None  # the part whose pin names hover shows
+        self.probe = PinProbe()  # ... and its pin levels (see inside.py)
+        # Looking inside placed macros (right-click -> View), outermost first: see inside.py
+        self.inside: list[Level] = []
         self._pin_label_mode_shown: int | None = None  # what the tags were last set for
         self._wire_batch: dict | None = (
             None  # wires waiting for their views (see wire_batch)
@@ -794,6 +805,9 @@ class Editor(pyglet.window.Window):
         if button == mouse.MIDDLE:
             self.panning = True
             return
+        if self.inside:
+            self._inside_press(x, y, wx, wy, button, modifiers, in_picker)
+            return
         if self.bar.contains(x, y):
             if (
                 button == mouse.LEFT
@@ -941,6 +955,13 @@ class Editor(pyglet.window.Window):
         # Right-clicking narrows the selection to what the menu will act on, so the
         # highlight shows exactly that: the clicked item -- or, on a part inside a
         # selection of parts all of one kind, those parts (Ctrl: just the clicked one).
+        if self.inside:  # read-only: only looking further in
+            view = self.part_at(wx, wy)
+            if view is None or not view.part.inner:
+                return False
+            self.selection.set(parts=[view])
+            self._open_menu(x, y, self._macro_items(view))
+            return True
         if view := self.part_at(wx, wy):
             sel = self.selection.parts
             group = (
@@ -956,6 +977,8 @@ class Editor(pyglet.window.Window):
                 if len(group) == 1
                 else []
             )
+            if len(group) == 1 and view.part.inner:
+                items[:0] = self._macro_items(view)
             if view.look.lit:  # switches and LEDs are color sources (paint.py)
                 items.append(
                     MenuItem(
@@ -992,6 +1015,110 @@ class Editor(pyglet.window.Window):
         else:
             return False
         return True
+
+    # ---- looking inside macros (see inside.py) ----------------------------------------
+
+    def _macro_items(self, view: PartView) -> list[MenuItem]:
+        """Menu rows for a placed macro: look inside this one, or open its definition."""
+        return [
+            MenuItem("View", lambda: self._view_inside(view)),
+            MenuItem(
+                "Open definition", lambda: self._request_open(view.part.type.name)
+            ),
+        ]
+
+    def _view_inside(self, view: PartView) -> None:
+        """Show a placed macro's insides, live and read-only, in place of what's on
+        screen (Esc / Backspace comes back out)."""
+        self._cancel()
+        self._forget_hover()
+        cam = self.camera
+        level = Level(
+            view.part,
+            take_scene(self),
+            {"x": cam.x, "y": cam.y, "level": cam.level},
+        )
+        with paused_gc():
+            scene = build_scene(
+                view.part, pin_labels=self.pin_label_mode == PIN_LABELS_ALWAYS
+            )
+        self.inside.append(level)
+        put_scene(self, scene)
+        self._fit_camera()
+        self._update_pin_labels()
+        self._notice(f"inside {_crumb(view.part)}: read-only   Esc: back out")
+
+    def _leave_inside(self, everything: bool = False) -> None:
+        """One level back out (`everything`: all the way to the board)."""
+        if not self.inside:
+            return
+        self._cancel()
+        self._forget_hover()
+        while self.inside:
+            level = self.inside.pop()
+            free_scene(take_scene(self))
+            put_scene(self, level.outer)
+            if not everything:
+                break
+        cam = self.camera
+        cam.x, cam.y, cam.level = level.camera["x"], level.camera["y"], level.camera["level"]
+        self._update_zoom_floor(self._board_bounds())
+        self._update_pin_labels()
+        if not self.inside:
+            self._clear_status()
+
+    def _forget_hover(self) -> None:
+        """Before the scene changes: the hovered part's tags and levels go, and pin
+        tags get worked out again for the next scene (_update_pin_labels)."""
+        self.probe.clear()
+        if self.hover_view is not None and self.pin_label_mode == PIN_LABELS_HOVER:
+            set_pin_labels([self.hover_view], False)
+        self.hover_view = self._pin_label_mode_shown = None
+
+    def _inside_press(self, x, y, wx, wy, button, modifiers, in_picker) -> None:
+        """A press while inside a macro (IDLE): panning, the View menu, nothing else.
+        Anything meant for the board (the picker, the cogwheel) leaves first."""
+        if self.bar.contains(x, y):
+            if button == mouse.LEFT and self.bar.cog_hit(x, y):
+                self._cog_menu()
+            return
+        if in_picker:
+            self._leave_inside(everything=True)
+            self.on_mouse_press(x, y, button, modifiers)
+            return
+        if button == mouse.RIGHT and not self._item_menu(x, y, wx, wy, modifiers):
+            self.panning = True
+        elif button == mouse.LEFT:
+            self.selection.clear()
+
+    def _inside_key(self, symbol, modifiers) -> None:
+        """A key while inside a macro (IDLE or a menu): back out, look around, save,
+        open or start over (those leave first, see _clear_board); edits do nothing."""
+        ctrl = modifiers & key.MOD_CTRL
+        if symbol in (key.LCTRL, key.RCTRL, key.LSHIFT, key.RSHIFT):
+            return
+        if self.mode is not Mode.IDLE:
+            if symbol == key.ESCAPE:
+                self._cancel()
+            return
+        if symbol in (key.ESCAPE, key.BACKSPACE):
+            self._leave_inside()
+        elif symbol == key.TAB:
+            self.pin_label_mode = (self.pin_label_mode + 1) % len(PIN_LABEL_MODES)
+            self._update_pin_labels()
+            self._notice(f"pin names: {PIN_LABEL_MODES[self.pin_label_mode]}")
+        elif symbol == key.HOME:
+            self._home(fit=bool(ctrl))
+        elif ctrl and symbol == key.S:
+            self._save_as()
+        elif ctrl and symbol == key.O:
+            self._open_dialog()
+        elif ctrl and symbol == key.N:
+            self._unsaved_then(self._new)
+        elif symbol not in _LOOKING:
+            self._notice(
+                f"inside {_crumb(self.inside[-1].inst)}: read-only   Esc: back out"
+            )
 
     def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers):
         self.mouse = (x, y)
@@ -1162,6 +1289,9 @@ class Editor(pyglet.window.Window):
                 self._finish_rename(commit=True)
             elif symbol == key.ESCAPE:
                 self._finish_rename(commit=False)
+            return
+        if self.inside:
+            self._inside_key(symbol, modifiers)
             return
         if symbol in (key.LCTRL, key.RCTRL, key.LSHIFT, key.RSHIFT):
             self._follow_cursor()  # (sub)snap whatever is on the cursor right away
@@ -2384,6 +2514,7 @@ class Editor(pyglet.window.Window):
             event_type in self._EDIT_EVENTS
             and self.history is not None
             and self.mode is Mode.IDLE
+            and not self.inside  # (nothing there is the board's)
             and (Touched.parts or Touched.wires or Touched.moved)
         ):
             self._record()
@@ -2419,7 +2550,12 @@ class Editor(pyglet.window.Window):
             self._report(self.circuit.errors.pop(0))
         # Every pin, lit body and wire at once (see sync.py): view by view was ~80 ms a
         # frame on a board of oscillators, where nearly everything changes every tick.
+        if self.inside and not self.inside[0].inst.live:
+            self._leave_inside(everything=True)  # (its instance is gone)
         self.view_sync(self.circuit, self.world)
+        self.probe.update(
+            self.hover_view if self.pin_label_mode != PIN_LABELS_HIDDEN else None
+        )
         self._tally(dt, sim, time.perf_counter() - t_start - sim)
 
     def on_resize(self, width, height):
@@ -2440,6 +2576,7 @@ class Editor(pyglet.window.Window):
             self.camera,
             emphasized=self.snapping,  # also paints the background
             divisions=self.grid_divisions,
+            inside=bool(self.inside),
         )
         self.view = self.camera.matrix()
         self.world.draw()
@@ -2648,6 +2785,7 @@ class Editor(pyglet.window.Window):
 
     def _clear_board(self) -> None:
         self._cancel()
+        self._leave_inside(everything=True)
         self.selection.clear()
         self.tiling = None
         restore(self, EMPTY)  # removes (and closes) everything
@@ -2856,13 +2994,14 @@ class Editor(pyglet.window.Window):
 
     def _update_caption(self) -> None:
         title = self.doc_title
-        state = (self.history.state, self.saved_state, title, self.project)
+        crumbs = "".join(f" > {_crumb(level.inst)}" for level in self.inside)
+        state = (self.history.state, self.saved_state, title, self.project, crumbs)
         if state == self._caption_for:
             return  # nothing changed since last frame
         self._caption_for = state
         name = f"{title or 'untitled'}{' *' if self.dirty else ''}"
         self.set_caption(f"pijl - {name}")
-        self.bar.set_doc(f"{self.project.name} / {name}")
+        self.bar.set_doc(f"{self.project.name} / {name}{crumbs}")
 
     def _home(self, fit: bool) -> None:
         """Home: the camera back to the Home spot at 1:1, or (Ctrl) fitted to the parts."""
@@ -3063,7 +3202,7 @@ class Editor(pyglet.window.Window):
         mode = self.pin_label_mode
         hovered = None
         if (
-            mode == PIN_LABELS_HOVER
+            mode != PIN_LABELS_HIDDEN
             and self.mode is not Mode.PROMPT
             and not self.picker.contains(*self.mouse)
         ):
@@ -3076,9 +3215,14 @@ class Editor(pyglet.window.Window):
                 hovered = None
         if mode == self._pin_label_mode_shown and hovered is self.hover_view:
             return  # nothing changed (the common case: called on every mouse move)
-        self._pin_label_mode_shown, self.hover_view = mode, hovered
+        was, self._pin_label_mode_shown, self.hover_view = (
+            self._pin_label_mode_shown,
+            mode,
+            hovered,
+        )
         if mode == PIN_LABELS_ALWAYS:
-            set_pin_labels(list(self.part_views.values()), True)
+            if was != mode:  # (only the hovered part changed: its levels, see PinProbe)
+                set_pin_labels(list(self.part_views.values()), True)
             return
         # Only the views showing tags now, and the hovered one, can change. Oldest
         # first, as a pass over every view would go (what's freed before a new tag
@@ -3107,6 +3251,15 @@ class Editor(pyglet.window.Window):
 
 
 MIXED = "mixed"  # what a menu row shows when the edited parts' values differ
+
+# Keys that only look around (WASD: see _move_keys): no read-only notice inside a macro
+_LOOKING = frozenset({key.W, key.A, key.S, key.D, key.LALT, key.RALT})
+
+
+def _crumb(part: Part) -> str:
+    """An instance in the breadcrumb: its title, and its label if it has one."""
+    name = part.type.title
+    return f"{name} ({part.label})" if part.label else name
 
 
 @dataclass

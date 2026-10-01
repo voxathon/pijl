@@ -19,6 +19,14 @@ LABEL_TEXT = (200, 200, 215, 255)  # user labels next to parts
 
 PIN_OFF = (18, 18, 22)
 PIN_ON = (240, 70, 70)
+# Pin levels on the hovered part (0 / 1 / X / Z, by logic code: see inside.PinProbe)
+LEVEL_TEXT = {
+    0: (120, 140, 185, 255),  # Z
+    1: (170, 170, 185, 255),  # 0
+    2: (255, 125, 115, 255),  # 1
+    3: (235, 100, 235, 255),  # X (magenta, like its bands)
+}
+LEVEL_SIZE = 8  # pt at zoom 1
 
 WIRE_OFF = (85, 85, 98)
 WIRE_ON = (235, 60, 60)
@@ -97,6 +105,9 @@ VIEW_KEY_SPEED = 420  # WASD move the view this many screen px per second
 # Grid: (minor line, major line) colors. Brighter while Ctrl-snapping.
 GRID_COLORS = ((34, 34, 42), (44, 44, 54))
 GRID_SNAPPING = ((42, 42, 52), (62, 62, 78))
+# Inside a macro (View: read-only, see inside.py): a cooler, darker board
+INSIDE_BACKGROUND = (20, 26, 34, 255)
+GRID_INSIDE = ((26, 34, 44), (36, 46, 60))
 
 # World-space sizes
 PIN_RADIUS = 6

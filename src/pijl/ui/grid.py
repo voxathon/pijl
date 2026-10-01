@@ -75,8 +75,10 @@ class Grid:
         camera: Camera,
         emphasized: bool,
         divisions: int = 1,
+        inside: bool = False,
     ) -> None:
-        """`divisions` > 1 shows the finer subgrid (Ctrl+Shift); major lines stay put."""
+        """`divisions` > 1 shows the finer subgrid (Ctrl+Shift); major lines stay put.
+        `inside`: viewing a macro's insides (see inside.py), in their own colors."""
         p = self.program
         p.use()
         p["translate"] = camera.translation()
@@ -84,8 +86,10 @@ class Grid:
         p["px_ratio"] = window.get_framebuffer_size()[0] / window.width
         p["spacing"] = T.GRID / divisions
         p["major_every"] = float(T.GRID_MAJOR_EVERY * divisions)
-        p["background"] = _rgb(T.BACKGROUND)
-        minor, major = T.GRID_SNAPPING if emphasized else T.GRID_COLORS
+        p["background"] = _rgb(T.INSIDE_BACKGROUND if inside else T.BACKGROUND)
+        minor, major = (
+            T.GRID_SNAPPING if emphasized else T.GRID_INSIDE if inside else T.GRID_COLORS
+        )
         p["minor_color"] = _rgb(minor)
         p["major_color"] = _rgb(major)
         self.quad.draw(gl.GL_TRIANGLES)

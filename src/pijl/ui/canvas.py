@@ -401,6 +401,16 @@ class Canvas:
         gl.glDisable(gl.GL_BLEND)
         self.batch.draw()
 
+    def delete(self) -> None:
+        """Free the GL buffers (a canvas that's going away: see inside.py)."""
+        for buf in self._buffers.values():
+            gl.glDeleteBuffers(2, (gl.GLuint * 2)(buf.vbo, buf.svbo))
+            gl.glDeleteVertexArrays(1, ctypes.byref(buf.vao))
+        for echo in self._echoes.values():
+            gl.glDeleteVertexArrays(1, ctypes.byref(echo.vao))
+        self._buffers.clear()
+        self._echoes.clear()
+
     def counts(self) -> dict[str, int]:
         """Instances in use per kind (for the curious / tests)."""
         out: dict[str, int] = {}
