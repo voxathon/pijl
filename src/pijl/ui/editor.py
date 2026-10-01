@@ -129,10 +129,11 @@ from .document import (
     change_uids,
     changes,
     instantiate,
+    instantiate_keyed,
     internal_wires,
     restore,
 )
-from .duplicate import DOWN, RIGHT, Cell, Tiling
+from .duplicate import DOWN, RIGHT, Cell, Tiling, tiled
 from .grid import Grid
 from .library import Library, LibraryHistory, Step
 from .line_edit import LineEdit
@@ -145,6 +146,7 @@ from .sdf_text import SDFText
 from .selection import Selection
 from .spatial import SpatialIndex, ordered
 from .status_bar import BAR_H, StatusBar
+from .sync import ViewSync
 from .views import (
     PartView,
     Layers,
@@ -300,7 +302,15 @@ class Editor(pyglet.window.Window):
         )
         self.bar = StatusBar(self.hud, self.width)
         # runtime numbers for the bar, summed over STATS_EVERY seconds
-        self.stats = {"frames": 0, "time": 0.0, "sim": 0.0, "steps": 0, "draw": 0.0}
+        self.stats = {
+            "frames": 0,
+            "time": 0.0,
+            "sim": 0.0,
+            "ui": 0.0,
+            "steps": 0,
+            "draw": 0.0,
+        }
+        self.view_sync = ViewSync()
         for msg in self.load_problems:
             self._report(msg)
 
@@ -2008,11 +2018,27 @@ class Editor(pyglet.window.Window):
             wires = internal_wires(self, unit)
             self.tiling = Tiling(capture(self, unit), unit, wires)
         t = self.tiling
-        t.grow(t.next_axis(), lambda: Cell.of(*instantiate(self, t.unit)))
+        t.grow(t.next_axis(), self._tile_cells)
         t.adjusting = (
             False  # this press is its own undo step (committed by dispatch_event)
         )
-        self._place_tiling()
+        # The new cells were made in place and the old ones haven't moved: no layout.
+        self.selection.set(t.all_parts(), t.all_wires())
+        t.signature = self._selection_signature()
+
+    def _tile_cells(self, offsets: list[Point]) -> list[Cell]:
+        """Copies of the Ctrl+D unit at these offsets, made in one batch."""
+        unit = self.tiling.unit
+        clip, stride = tiled(unit, offsets)
+        parts, wires = instantiate_keyed(self, clip)
+        return [
+            Cell.of(
+                [parts[k * stride + uid] for uid in unit.parts],
+                [wires[k * stride + uid] for uid in sorted(unit.wires)],
+                at,
+            )
+            for k, at in enumerate(offsets)
+        ]
 
     def _space_tiling(self, scroll_y: float) -> None:
         t = self.tiling
@@ -2369,6 +2395,7 @@ class Editor(pyglet.window.Window):
     # ======================================================================
 
     def update(self, dt: float) -> None:
+        t_start = time.perf_counter()
         self.picker.update(dt)
         if self.prompt is not None:
             self.prompt.tick(dt)
@@ -2384,25 +2411,13 @@ class Editor(pyglet.window.Window):
         self.circuit.frame()
         for _ in range(SIM_STEPS_PER_FRAME):
             self.circuit.step()
-        self._tally(dt, time.perf_counter() - t0)
+        sim = time.perf_counter() - t0
         while self.circuit.errors:
             self._report(self.circuit.errors.pop(0))
-        # Only what the sim says changed: touching every view each frame costs ~13 ms per 10k parts.
-        everything, parts, wires = self.circuit.take_changes()
-        if everything:
-            for view in self.part_views.values():
-                view.sync()
-            for wire, view in self.wire_views.items():
-                view.sync(self.circuit.wire_state(wire))
-            return
-        for part in parts:
-            if view := self.part_views.get(
-                part
-            ):  # (hidden parts inside macros have none)
-                view.sync()
-        for wire in wires:
-            if view := self.wire_views.get(wire):
-                view.sync(self.circuit.wire_state(wire))
+        # Every pin, lit body and wire at once (see sync.py): view by view was ~80 ms a
+        # frame on a board of oscillators, where nearly everything changes every tick.
+        self.view_sync(self.circuit, self.world)
+        self._tally(dt, sim, time.perf_counter() - t_start - sim)
 
     def on_resize(self, width, height):
         super().on_resize(width, height)  # keeps the projection matrix in sync
@@ -2482,12 +2497,14 @@ class Editor(pyglet.window.Window):
             self.camera.pan(-d[0] * T.VIEW_KEY_SPEED, -d[1] * T.VIEW_KEY_SPEED)
             self._follow_cursor()
 
-    def _tally(self, dt: float, sim: float) -> None:
-        """Add up one frame's numbers; every STATS_EVERY seconds, show their averages in the bar."""
+    def _tally(self, dt: float, sim: float, ui: float) -> None:
+        """Add up one frame's numbers; every STATS_EVERY seconds, show their averages in the bar.
+        `ui`: the rest of update() (input, panels, syncing views to the sim)."""
         st = self.stats
         st["frames"] += 1
         st["time"] += dt
         st["sim"] += sim
+        st["ui"] += ui
         if st["time"] < STATS_EVERY:
             return
         n, c = st["frames"], self.circuit
@@ -2496,16 +2513,17 @@ class Editor(pyglet.window.Window):
             [  # (rank, text): the bar leaves out the highest ranks first when short on room
                 (0, f"{n / st['time']:.0f} fps"),
                 (1, f"sim {1000 * st['sim'] / n:.2f} ms"),
-                (2, f"draw {1000 * st['draw'] / n:.1f} ms"),
-                (6, f"tick {c.tick}"),
+                (2, f"ui {1000 * st['ui'] / n:.1f} ms"),
+                (3, f"draw {1000 * st['draw'] / n:.1f} ms"),
+                (7, f"tick {c.tick}"),
                 (
-                    3,
+                    4,
                     f"{len(c.parts)} parts"
                     + (f" (+{hidden} in macros)" if hidden else ""),
                 ),
-                (4, f"{len(c.wires)} wires"),
-                (7, f"{len(c.net_value)} nets"),
-                (5, f"zoom {100 * self.camera.zoom:.0f}%"),
+                (5, f"{len(c.wires)} wires"),
+                (8, f"{len(c.net_value)} nets"),
+                (6, f"zoom {100 * self.camera.zoom:.0f}%"),
             ]
         )
         self.stats = dict.fromkeys(st, 0)

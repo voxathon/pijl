@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from .views import PartView, WireView
+from .views import PartView, WireView, select_many
 
 View = PartView | WireView
 
@@ -50,11 +50,8 @@ class Selection:
         """Replace the selection, touching only views whose state actually changes
         (cheap to call on every mouse move while box-selecting)."""
         parts, wires = set(parts), set(wires)
-        for old, new in ((self.parts, parts), (self.wires, wires)):
-            for view in old - new:
-                view.set_selected(False)
-            for view in new - old:
-                view.set_selected(True)
+        select_many(list(self.parts - parts), list(self.wires - wires), False)
+        select_many(list(parts - self.parts), list(wires - self.wires), True)
         self.parts, self.wires = parts, wires
 
     def clear(self) -> None:

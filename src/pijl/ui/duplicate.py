@@ -18,9 +18,10 @@ over with whatever is selected then as the unit.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from ..snapshot import Snapshot
+from ..snapshot import EndRef, Snapshot
 from . import theme as T
 from .views import PartView, Point, WireView
 
@@ -40,10 +41,22 @@ class Cell:
     )
 
     @classmethod
-    def of(cls, parts: list[PartView], wires: list[WireView]) -> Cell:
+    def of(
+        cls, parts: list[PartView], wires: list[WireView], at: Point = (0, 0)
+    ) -> Cell:
+        """A cell of these views, which sit `at` that offset from the unit."""
+        dx, dy = at
         return cls(
-            [(v, v.x, v.y) for v in parts],
-            [(w, list(w.bends), w.src, w.dst) for w in wires],
+            [(v, v.x - dx, v.y - dy) for v in parts],
+            [
+                (
+                    w,
+                    [(x - dx, y - dy) for x, y in w.bends],
+                    (w.src[0] - dx, w.src[1] - dy),
+                    (w.dst[0] - dx, w.dst[1] - dy),
+                )
+                for w in wires
+            ],
         )
 
 
@@ -71,11 +84,16 @@ class Tiling:
     def next_axis(self) -> int:
         return RIGHT if self.last != RIGHT else DOWN
 
-    def grow(self, axis: int, make_cell) -> None:
-        """Double along `axis`; make_cell() returns a fresh Cell at the unit's position."""
+    def grow(self, axis: int, make_cells: Callable[[list[Point]], list[Cell]]) -> None:
+        """Double along `axis`. make_cells(offsets) returns a fresh Cell already in place
+        at each of those offsets from the unit, all made at once (see tiled()): the
+        cells already there stay where they are."""
         shift = (self.cols, 0) if axis == RIGHT else (0, self.rows)
-        for i, j in list(self.cells):
-            self.cells[i + shift[0], j + shift[1]] = make_cell()
+        new = [(i + shift[0], j + shift[1]) for i, j in self.cells]
+        for ij, cell in zip(
+            new, make_cells([self.offset(*ij) for ij in new]), strict=True
+        ):
+            self.cells[ij] = cell
         if axis == RIGHT:
             self.cols *= 2
         else:
@@ -117,6 +135,36 @@ class Tiling:
 
     def all_wires(self) -> list[WireView]:
         return [w for c in self.cells.values() for w, *_ in c.wires]
+
+
+def tiled(unit: Snapshot, offsets: list[Point]) -> tuple[Snapshot, int]:
+    """One snapshot holding a copy of `unit` at each offset, for instantiating all of
+    them in one go. Copy k's uids are k * stride + the unit's uid, so its parts and
+    wires stay together and in the unit's order. Returns it and the stride."""
+    stride = max([*unit.parts, *unit.wires], default=0) + 1
+
+    def ref(r: EndRef, base: int) -> EndRef:
+        return (r[0], base + r[1], *r[2:])
+
+    def pt(p: Point | None, dx: float, dy: float) -> Point | None:
+        return None if p is None else (p[0] + dx, p[1] + dy)
+
+    parts, wires, colors = {}, {}, {}
+    for k, (dx, dy) in enumerate(offsets):
+        base = k * stride
+        for uid, (kind, label, x, y, props) in unit.parts.items():
+            parts[base + uid] = (kind, label, x + dx, y + dy, props)
+        for uid, (src, dst, bends, src_pt, dst_pt) in unit.wires.items():
+            wires[base + uid] = (
+                ref(src, base),
+                ref(dst, base),
+                tuple((bx + dx, by + dy) for bx, by in bends),
+                pt(src_pt, dx, dy),
+                pt(dst_pt, dx, dy),
+            )
+        for uid, color in unit.wire_colors.items():
+            colors[base + uid] = color
+    return Snapshot(parts, wires, colors), stride
 
 
 def _cells(length: float) -> int:

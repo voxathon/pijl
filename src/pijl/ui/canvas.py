@@ -85,12 +85,17 @@ class InstanceBuffer:
         self.data = np.zeros(capacity, kind.dtype)
         self.used = np.zeros(capacity, bool)
         self.dirty = np.zeros(capacity, bool)
+        # What each slot shows the state of (see ui/sync.py): a pin slot or a wire
+        # slot in the circuit, or -1. Freeing a slot forgets it.
+        self.pin_src = np.full(capacity, -1, np.intp)
+        self.wire_src = np.full(capacity, -1, np.intp)
         self.f = {name: self.data[name] for name in kind.dtype.names}
         self.any_dirty = False
         self.realloc = True  # upload everything (new, or grown)
         self.free_slots: list[int] = []  # heap: lowest first
         self.end = 0  # slots below this were handed out at some point
         self.top = 0  # highest slot in use + 1: what gets drawn
+        self.gen = 0  # bumped whenever pin_src / wire_src may have changed (see ViewSync)
         self._make_gl()
 
     def _make_gl(self) -> None:
@@ -155,6 +160,9 @@ class InstanceBuffer:
     def free(self, slot: int) -> None:
         self.data[slot] = self._zero  # all-zero: a degenerate quad, draws nothing
         self.used[slot] = False
+        if self.pin_src[slot] >= 0 or self.wire_src[slot] >= 0:
+            self.pin_src[slot] = self.wire_src[slot] = -1
+            self.gen += 1
         self.mark(slot)
         heapq.heappush(self.free_slots, slot)
         while self.top and not self.used[self.top - 1]:
@@ -166,6 +174,8 @@ class InstanceBuffer:
             return
         self.data[slots] = self._zero
         self.used[slots] = False
+        self.pin_src[slots] = self.wire_src[slots] = -1
+        self.gen += 1
         self.mark_many(slots)
         self.free_slots.extend(slots.tolist())
         heapq.heapify(self.free_slots)
@@ -174,13 +184,29 @@ class InstanceBuffer:
 
     def _grow(self) -> None:
         n = len(self.data)
-        for name in ("data", "used", "dirty"):
+        for name, fill in (
+            ("data", 0),
+            ("used", 0),
+            ("dirty", 0),
+            ("pin_src", -1),
+            ("wire_src", -1),
+        ):
             old = getattr(self, name)
-            new = np.zeros(2 * n, old.dtype)
+            new = np.full(2 * n, fill, old.dtype)
             new[:n] = old
             setattr(self, name, new)
         self.f = {name: self.data[name] for name in self.dtype.names}
         self.realloc = True
+
+    def show_pins(self, slots, pins) -> None:
+        """These slots show these pins' states (pin slots in the circuit)."""
+        self.pin_src[slots] = pins
+        self.gen += 1
+
+    def show_wires(self, slots, wires) -> None:
+        """These slots show these wires' states (wire slots in the circuit)."""
+        self.wire_src[slots] = wires
+        self.gen += 1
 
     def mark(self, slot: int) -> None:
         self.dirty[slot] = True
@@ -268,6 +294,9 @@ class Canvas:
         if buf is None:
             buf = self._buffers[key] = InstanceBuffer(kind)
         return buf
+
+    def buffers(self):
+        return self._buffers.values()
 
     def draw(self) -> None:
         gl.glEnable(gl.GL_BLEND)

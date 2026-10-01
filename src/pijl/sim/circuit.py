@@ -786,6 +786,30 @@ class Circuit:
         i = self._wire_net[wire.slot]
         return Level(int(self.net_value[i])), bool(self.net_conflict[i])
 
+    @property
+    def pin_count(self) -> int:
+        """Pin slots handed out so far (they're never reused)."""
+        return len(self._pins.pins)
+
+    def pin_codes(self, slots: np.ndarray) -> np.ndarray:
+        """The logic codes of these pin slots: Pin.state for many pins at once."""
+        return self._pins.states[slots]
+
+    def wire_states(
+        self, slots: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """wire_state for many wire slots at once: (value codes, conflicts, has a net)."""
+        if self._nets_dirty:
+            self._rebuild_nets()
+        known = slots < len(self._wire_net)
+        net = np.full(len(slots), -1, np.intp)
+        net[known] = self._wire_net[slots[known]]
+        has = net >= 0
+        if not len(self.net_value):
+            return np.zeros(len(slots), CODE), np.zeros(len(slots), bool), has
+        net = np.maximum(net, 0)
+        return self.net_value[net], self.net_conflict[net], has
+
     def take_changes(self) -> tuple[bool, set[Part], list[Wire]]:
         """What changed since the last call: (everything?, parts whose pins changed,
         board wires whose net changed). With everything=True, the rest is empty."""

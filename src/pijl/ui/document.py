@@ -41,6 +41,7 @@ __all__ = [
     "capture",
     "changes",
     "instantiate",
+    "instantiate_keyed",
     "internal_wires",
     "restore",
 ]
@@ -234,13 +235,21 @@ def instantiate(
 ) -> tuple[list[PartView], list[WireView]]:
     """Add a copy of `clip` at its original coordinates, with fresh uids (for paste).
     `live=False`: the parts are ghosts until the caller opens them (see Circuit.open_part)."""
+    parts, wires = instantiate_keyed(editor, clip, live)
+    return list(parts.values()), list(wires.values())
+
+
+def instantiate_keyed(
+    editor: Editor, clip: Snapshot, live: bool = True
+) -> tuple[dict[int, PartView], dict[int, WireView]]:
+    """instantiate(), with the new views keyed by the clip's uids they're copies of."""
     with paused_gc():
         return _instantiate(editor, clip, live)
 
 
 def _instantiate(
     editor: Editor, clip: Snapshot, live: bool
-) -> tuple[list[PartView], list[WireView]]:
+) -> tuple[dict[int, PartView], dict[int, WireView]]:
     views = editor.add_parts(
         [
             (kind, x, y, None, label, props)
@@ -265,7 +274,7 @@ def _instantiate(
                 color=clip.wire_colors.get(uid),
                 check=False,
             )
-    return list(new.values()), [editor.wire_views[w] for w in new_wires.values()]
+    return new, {uid: editor.wire_views[w] for uid, w in new_wires.items()}
 
 
 class History:
