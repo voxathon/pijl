@@ -58,8 +58,9 @@ from __future__ import annotations
 import time
 import traceback
 import copy
-from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Union
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, Callable, Iterable, Mapping, Union
 
 import numpy as np
 from scipy.sparse import coo_matrix
@@ -83,7 +84,9 @@ class _PinStates:
         )  # an input or a pass-through pin: reads its net, never drives
         self.alive = np.zeros(1024, bool)  # its part is still in the circuit
         self.weak = np.zeros(1024, bool)  # a weak output (see PartType.weak)
-        self.pins: list[Pin] = []
+        # By slot; None once its part is gone (slots aren't reused, so nothing else
+        # would ever let go of it)
+        self.pins: list[Pin | None] = []
 
     def add(self, pin: Pin, initial: Level, weak: bool) -> int:
         slot = len(self.pins)
@@ -109,6 +112,12 @@ class _PinStates:
         self.alive[first:end] = True
         self.weak[first:end] = weak
 
+    def kill(self, slots: list[int]) -> None:
+        """These pins' parts are gone."""
+        self.alive[slots] = False
+        for slot in slots:
+            self.pins[slot] = None
+
     def _room(self, n: int) -> None:
         """Arrays long enough for n pins."""
         while n > len(self.states):
@@ -122,7 +131,7 @@ class _WireSlots:
     or wire slots, and whether it's still there."""
 
     def __init__(self) -> None:
-        self.wires: list[Wire] = []
+        self.wires: list[Wire | None] = []  # by slot; None once it's gone (see _PinStates.pins)
         self.alive = np.zeros(256, bool)
         self.board = np.zeros(256, bool)  # on the board (not inside a macro)
         self.end_is_wire = np.zeros((256, 2), bool)
@@ -137,6 +146,12 @@ class _WireSlots:
         self.wires.append(wire)
         self.alive[slot], self.board[slot] = True, board
         self.set_ends(wire)
+
+    def kill(self, slots: list[int]) -> None:
+        """These wires are gone."""
+        self.alive[slots] = False
+        for slot in slots:
+            self.wires[slot] = None
 
     def set_ends(self, wire: Wire) -> None:
         for side, end in enumerate(wire.ends):
@@ -187,48 +202,96 @@ class Pin:
         return f"<Pin {self.part.kind}.{side}{self.index}={self.state}>"
 
 
-@dataclass(eq=False)
+_NO_INNER: Mapping[int, Part] = MappingProxyType({})  # (shared: read-only)
+
+
 class Part:
-    kind: str
-    inputs: list[Pin] = field(default_factory=list)
-    outputs: list[Pin] = field(default_factory=list)
-    # User-given name. Lives in the model (not the UI) because it's circuit data:
-    # when a board is saved as a macro, IN/OUT labels become its pin names.
-    label: str = ""
-    # Stable identity within a circuit. Survives undo/redo (a part deleted and
-    # restored comes back with the same uid) and is what snapshots/save files use
-    # to refer to parts, since Python object identity doesn't survive either.
-    uid: int = 0
-    type: PartType | None = field(default=None, repr=False)
-    props: dict[str, Any] = field(
-        default_factory=dict
-    )  # this instance's settings (see PartType.props)
-    state: dict[str, Any] = field(
-        default_factory=dict
-    )  # scratch space for its PartType's hooks
-    live: bool = False  # opened: placed for real, not a ghost
-    slot: int = -1  # its place in the circuit's per-part arrays (settling)
-    # Macro instances: the body's parts by their uid in the body, the body's wires,
-    # and which pins are joined (instance pin <-> port pin). Hidden parts: `owner`.
-    owner: Part | None = field(default=None, repr=False)
-    inner: dict[int, Part] = field(default_factory=dict, repr=False)
-    inner_wires: list[Wire] = field(default_factory=list, repr=False)
-    links: list[tuple[Pin, Pin]] = field(
-        default_factory=list, repr=False
-    )  # pins that are one net
-    # Per output: the pin its eval value goes to. The output itself, or for a joined
-    # output (which only shows its net) a hidden pin that drives the net. Not in `pins`.
-    drives: list[Pin] = field(default_factory=list, repr=False)
+    """One part. Slotted, and what most parts never need isn't made for them: a plain
+    gate shares empty `inner` / `inner_wires` / `links` with every other part, its
+    `drives` is its `outputs` list, and `state` is made on first use. (A big board
+    has hundreds of thousands of these; see the lazy-handles plan.)"""
+
+    __slots__ = (
+        "kind",
+        "inputs",
+        "outputs",
+        "label",
+        "uid",
+        "type",
+        "props",
+        "_state",
+        "live",
+        "slot",
+        "owner",
+        "inner",
+        "inner_wires",
+        "links",
+        "drives",
+    )
+
+    def __init__(
+        self,
+        kind: str,
+        inputs: list[Pin] | None = None,
+        outputs: list[Pin] | None = None,
+        label: str = "",
+        uid: int = 0,
+        type: PartType | None = None,
+        props: dict[str, Any] | None = None,
+        live: bool = False,
+        slot: int = -1,
+        owner: Part | None = None,
+    ) -> None:
+        self.kind = kind
+        self.inputs = inputs if inputs is not None else []
+        self.outputs = outputs if outputs is not None else []
+        # User-given name. Lives in the model (not the UI) because it's circuit data:
+        # when a board is saved as a macro, IN/OUT labels become its pin names.
+        self.label = label
+        # Stable identity within a circuit. Survives undo/redo (a part deleted and
+        # restored comes back with the same uid) and is what snapshots/save files use
+        # to refer to parts, since Python object identity doesn't survive either.
+        self.uid = uid
+        self.type = type
+        self.props = props if props is not None else {}  # its settings (PartType.props)
+        self._state: dict[str, Any] | None = None  # see `state`
+        self.live = live  # opened: placed for real, not a ghost
+        self.slot = slot  # its place in the circuit's per-part arrays (settling)
+        # Macro instances: the body's parts by their uid in the body, the body's wires,
+        # and which pins are joined (instance pin <-> port pin; also joins, see
+        # PartType.joins). Hidden parts: `owner`. Shared empties until there are some.
+        self.owner = owner
+        self.inner: Mapping[int, Part] = _NO_INNER
+        self.inner_wires: list[Wire] | tuple = ()
+        self.links: list[tuple[Pin, Pin]] | tuple = ()
+        # Per output: the pin its eval value goes to. The output itself, or for a joined
+        # output (which only shows its net) a hidden pin that drives the net. Not in
+        # `pins`. Plain parts: the outputs list itself.
+        self.drives: list[Pin] = self.outputs
+
+    @property
+    def state(self) -> dict[str, Any]:
+        """Scratch space for its PartType's hooks (made when first asked for)."""
+        if self._state is None:
+            self._state = {}
+        return self._state
+
+    @state.setter
+    def state(self, value: dict[str, Any]) -> None:
+        self._state = value
 
     @property
     def pins(self) -> list[Pin]:
         return self.inputs + self.outputs
 
+    def __repr__(self) -> str:
+        return f"Part({self.kind!r}, uid={self.uid}, label={self.label!r}, live={self.live})"
+
 
 Endpoint = Union[Pin, "Wire"]
 
 
-@dataclass(eq=False)
+@dataclass(eq=False, slots=True)
 class Wire:
     # Two ends, each a Pin or another Wire. Normalized by Circuit.connect: an
     # output pin is always `src`, an input pin always `dst` -- so a plain
@@ -277,9 +340,9 @@ class Circuit:
         self._wires: dict[
             Wire, None
         ] = {}  # creation order: a wire always comes after the wires it attaches to
-        self._at: dict[
-            Endpoint, list[Wire]
-        ] = {}  # pin or wire -> the board wires with an end on it
+        # pin or wire -> the board wires with an end on it: the wire itself when there's
+        # one (most pins), else a list (see _link; read it with ends_on)
+        self._at: dict[Endpoint, Wire | list[Wire]] = {}
         self.part_by_uid: dict[
             int, Part
         ] = {}  # board parts (hidden ones have their own uid spaces)
@@ -289,6 +352,7 @@ class Circuit:
         self._next_wire_uid = 1
         # Nets are derived from the wiring and cached until the wiring changes.
         self._nets_dirty = True
+        self._nets_version = 0  # bumped when they're rebuilt (see nets_version)
         # Driver pin slots. Nets with one driver just copy it; the others are reduced.
         self._solo = np.empty(0, np.intp)  # the only driver of its net ...
         self._solo_net = np.empty(0, np.intp)  # ... and that net
@@ -392,23 +456,11 @@ class Circuit:
                 slot += 1
                 mine.append(pin)
             outputs = mine[tm.n_in :]
-            part.__dict__.update(
-                kind=t.kind,
-                inputs=mine[: tm.n_in],
-                outputs=outputs,
-                label="",
-                uid=uid,
-                type=t,
-                props=tm.props(),
-                state={},
-                live=False,
-                slot=self._n_part_slots,
-                owner=owner,
-                inner={},
-                inner_wires=[],
-                links=[],
-                drives=list(outputs),
-            )
+            part.kind, part.type, part.uid, part.label = t.kind, t, uid, ""
+            part.inputs, part.outputs, part.drives = mine[: tm.n_in], outputs, outputs
+            part.props, part._state, part.live = tm.props(), None, False
+            part.slot, part.owner = self._n_part_slots, owner
+            part.inner, part.inner_wires, part.links = _NO_INNER, (), ()
             self._n_part_slots += 1
             if self._n_part_slots > len(self._settle):
                 self._settle = np.concatenate(
@@ -452,7 +504,7 @@ class Circuit:
             )
             for i, name in enumerate(t.outs)
         ]
-        part.drives = list(part.outputs)
+        part.drives = part.outputs
         if joined:
             self._join(part, power_on)
         if getattr(t, "body", None) is not None:
@@ -465,6 +517,7 @@ class Circuit:
         to the body's ports (see the module docstring)."""
         t = inst.type
         body = t.body
+        inst.inner, inst.inner_wires, inst.links = {}, [], list(inst.links)
         for uid, (kind, label, _x, _y, props) in body.parts.items():
             p = self._make(self.registry.get(kind), uid, owner=inst)
             p.label, p.props = label, copy.deepcopy(props)
@@ -489,6 +542,7 @@ class Circuit:
         """Make each of the type's join groups one net: link its pins, turn its outputs into
         pass-through pins, and give each of those a hidden pin to drive the net from."""
         t = part.type
+        part.drives, part.links = list(part.outputs), list(part.links)
         named = dict(zip(t.ins, part.inputs)) | dict(zip(t.outs, part.outputs))
         for group in t.joins:
             pins = [named[name] for name in group]
@@ -590,15 +644,15 @@ class Circuit:
         for part in parts:
             self.close_part(part)
         removed = self.remove_wires(
-            {w for part in parts for pin in part.pins for w in self._at.get(pin, ())}
+            {w for part in parts for pin in part.pins for w in self.ends_on(pin)}
         )
         for part in parts:
             del self._parts[part]
             del self.part_by_uid[part.uid]
         self.revision += 1
         tree = [p for part in parts for p in self._tree(part)]
-        self._pins.alive[[pin.slot for p in tree for pin in p.pins]] = False
-        self._wire_slots.alive[[w.slot for p in tree for w in p.inner_wires]] = False
+        self._pins.kill([pin.slot for p in tree for pin in p.pins])
+        self._wire_slots.kill([w.slot for p in tree for w in p.inner_wires])
         self._settle[[p.slot for p in tree]] = 0
         for p in tree:
             self._linked.pop(p, None)
@@ -734,15 +788,26 @@ class Circuit:
         return wire, replaced
 
     def _link(self, wire: Wire) -> None:
+        at = self._at
         for end in wire.ends:
-            self._at.setdefault(end, []).append(wire)
+            had = at.get(end)
+            if had is None:
+                at[end] = wire
+            elif type(had) is list:
+                had.append(wire)
+            else:
+                at[end] = [had, wire]
 
     def _unlink(self, wire: Wire) -> None:
+        at = self._at
         for end in wire.ends:
-            attached = self._at[end]
-            attached.remove(wire)
-            if not attached:
-                del self._at[end]
+            had = at[end]
+            if type(had) is list:
+                had.remove(wire)
+                if len(had) == 1:
+                    at[end] = had[0]
+            else:  # (it was the only one)
+                del at[end]
 
     def remove_wire(self, wire: Wire) -> list[Wire]:
         """Removes the wire and everything attached to it. Returns them, parents first."""
@@ -758,7 +823,7 @@ class Circuit:
             del self._wires[w]
             del self.wire_by_uid[w.uid]
             self._unlink(w)
-        self._wire_slots.alive[[w.slot for w in removed]] = False
+        self._wire_slots.kill([w.slot for w in removed])
         self._nets_dirty = True
         self.revision += 1
         return removed
@@ -778,7 +843,7 @@ class Circuit:
         slots = self._wire_slots
         self._unlink(keep)
         keep.dst = far
-        for w in list(self._at.get(absorb, ())):
+        for w in list(self.ends_on(absorb)):
             self._unlink(w)
             if w.src is absorb:
                 w.src = keep
@@ -789,7 +854,7 @@ class Circuit:
         self._unlink(absorb)
         del self._wires[absorb]
         del self.wire_by_uid[absorb.uid]
-        slots.alive[absorb.slot] = False
+        slots.kill([absorb.slot])
         self._link(keep)
         slots.set_ends(keep)
         self._nets_dirty = True
@@ -797,21 +862,24 @@ class Circuit:
 
     def attachments(self, wire: Wire) -> list[Wire]:
         """Wires with an end on `wire` (branches, stubs, extra drivers)."""
-        return _by_uid(self._at.get(wire, ()))
+        return _by_uid(self.ends_on(wire))
 
     def wires_at(self, pin: Pin) -> list[Wire]:
-        return _by_uid(self._at.get(pin, ()))
+        return _by_uid(self.ends_on(pin))
 
     def ends_on(self, end: Endpoint) -> tuple[Wire, ...] | list[Wire]:
         """The wires with an end on this pin or wire, in no particular order (fast; don't modify)."""
-        return self._at.get(end, ())
+        had = self._at.get(end)
+        if had is None:
+            return ()
+        return had if type(had) is list else (had,)
 
     def descendants(self, *wires: Wire) -> list[Wire]:
         """Wires attached to these, wires attached to those, and so on (in creation order)."""
         found: set[Wire] = set()
         todo = list(wires)
         while todo:
-            for w in self._at.get(todo.pop(), ()):
+            for w in self.ends_on(todo.pop()):
                 if w not in found:
                     found.add(w)
                     todo.append(w)
@@ -889,6 +957,7 @@ class Circuit:
         self.net_value = np.zeros(n_nets, CODE)
         self.net_conflict = np.zeros(n_nets, bool)
         self._nets_dirty = False
+        self._nets_version += 1
         self._changed_all = True  # net numbers mean something else now; pins were reset
         self._carry()  # readers see their (new) nets now, not a tick later with stale values
 
@@ -908,15 +977,29 @@ class Circuit:
         """The logic codes of these pin slots: Pin.state for many pins at once."""
         return self._pins.states[slots]
 
-    def wire_states(
-        self, slots: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """wire_state for many wire slots at once: (value codes, conflicts, has a net)."""
+    @property
+    def nets_version(self) -> int:
+        """Changes whenever net numbers do (the wiring changed and nets were rebuilt):
+        what wire_nets gave before is stale then."""
+        if self._nets_dirty:
+            self._rebuild_nets()
+        return self._nets_version
+
+    def wire_nets(self, slots: np.ndarray) -> np.ndarray:
+        """The nets of these wire slots (-1: none, e.g. gone). Valid until nets_version
+        changes; index net_value / net_conflict with them (see ui/sync.py)."""
         if self._nets_dirty:
             self._rebuild_nets()
         known = slots < len(self._wire_net)
         net = np.full(len(slots), -1, np.intp)
         net[known] = self._wire_net[slots[known]]
+        return net
+
+    def wire_states(
+        self, slots: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """wire_state for many wire slots at once: (value codes, conflicts, has a net)."""
+        net = self.wire_nets(slots)
         has = net >= 0
         if not len(self.net_value):
             return np.zeros(len(slots), CODE), np.zeros(len(slots), bool), has
@@ -938,7 +1021,9 @@ class Circuit:
         else:
             pins = self._pins.pins
             parts = {
-                pins[i].part for i in np.flatnonzero(states != self._shown).tolist()
+                pins[i].part
+                for i in np.flatnonzero(states != self._shown).tolist()
+                if pins[i] is not None
             }
             changed = (self.net_value != self._shown_value) | (
                 self.net_conflict != self._shown_conflict

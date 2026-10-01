@@ -367,3 +367,16 @@ def test_wire_states_of_slots_it_never_had():
     value, conflict, has = c.wire_states(np.array([w.slot, 99], np.intp))
     assert has.tolist() == [True, False]
     assert value[0] == ZERO and not conflict[0]
+
+
+def test_removed_parts_and_wires_are_let_go():
+    c = Circuit()
+    a, b = c.add_part("IN"), c.add_part("NOT")
+    w, _ = c.connect(a.outputs[0], b.inputs[0])
+    pin_slots = [p.slot for p in b.pins]
+    c.remove_parts([b])  # (takes its wires along)
+    c.step()
+    # nothing in the circuit holds them any more (slots stay taken: never reused)
+    assert all(c._pins.pins[s] is None for s in pin_slots)
+    assert c._wire_slots.wires[w.slot] is None
+    assert not c._at and c.pin_count == 3

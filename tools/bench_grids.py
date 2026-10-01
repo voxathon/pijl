@@ -31,6 +31,7 @@ import time
 
 os.environ["PIJL_DATA"] = tempfile.mkdtemp(prefix="pijl-bench-")
 
+from pyglet import gl  # noqa: E402
 from pyglet.window import key  # noqa: E402
 
 from pijl.snapshot import Snapshot  # noqa: E402
@@ -176,6 +177,27 @@ def steady(ed: Editor, tag: str) -> None:
     report(tag, "sim step", median(ed.circuit.step, 30), 30)
     report(tag, "update() (sim + sync + ui)", median(lambda: ed.update(1 / 60), 30), 30)
     report(tag, "on_draw()", median(lambda: (ed.switch_to(), ed.on_draw()), 30), 30)
+    report(tag, "  upload after a step", statistics.median(upload_only(ed) for _ in range(30)), 30)
+    report(tag, "frame: update + draw + glFinish", median(lambda: full_frame(ed), 30), 30)
+
+
+def upload_only(ed: Editor) -> float:
+    """One sim step and sync, then (timed) only the buffers' uploads."""
+    ed.update(1 / 60)
+    ed.switch_to()
+    gl.glFinish()
+    t = time.perf_counter()
+    for buf in ed.world.buffers():
+        buf._upload()
+    gl.glFinish()
+    return 1000 * (time.perf_counter() - t)
+
+
+def full_frame(ed: Editor) -> None:
+    ed.update(1 / 60)
+    ed.switch_to()
+    ed.on_draw()
+    gl.glFinish()
 
 
 def common(ed: Editor, tag: str) -> None:

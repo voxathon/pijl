@@ -10,8 +10,11 @@ buffer and drawn with a single instanced draw call. The quad's corners come from
 gl_VertexID, so the only per-shape data is the record itself. Setting a property is
 a numpy element write plus a dirty mark; dirty slots are uploaded once per frame.
 
-Shapes carry both of their colors (off and on) plus a state flag, so a pin or wire
-switching on/off is a one-byte write and the shader picks the color.
+Shapes carry both of their colors (off and on) plus a state byte, so a pin or wire
+switching on/off is a one-byte write and the shader picks the color. The state bytes
+live apart from the records, in their own array and GL buffer (`state`, the shaders'
+`state` attribute): on a busy board most of them change every tick, and uploading
+one byte per instance is far cheaper than the whole record around it.
 
 Every kind also has a `lift` field: lifted instances are drawn shifted by the canvas's
 `offset` (a uniform). Dragging a selection lifts it once and then only changes the
@@ -83,6 +86,8 @@ class InstanceBuffer:
         self.dtype = kind.dtype
         self._zero = np.zeros((), kind.dtype)
         self.data = np.zeros(capacity, kind.dtype)
+        self.state = np.zeros(capacity, np.uint8)  # see the module doc; 0 = SHOW_OFF
+        self.state_dirty = False  # upload `state` (all of it in use) next draw
         self.used = np.zeros(capacity, bool)
         self.dirty = np.zeros(capacity, bool)
         # What each slot shows the state of (see ui/sync.py): a pin slot or a wire
@@ -99,9 +104,10 @@ class InstanceBuffer:
         self._make_gl()
 
     def _make_gl(self) -> None:
-        vbo = gl.GLuint()
+        vbo, svbo = gl.GLuint(), gl.GLuint()
         gl.glGenBuffers(1, ctypes.byref(vbo))
-        self.vbo = vbo
+        gl.glGenBuffers(1, ctypes.byref(svbo))
+        self.vbo, self.svbo = vbo, svbo
         self.vao = self.make_vao(self.program)
 
     def make_vao(self, program: ShaderProgram) -> gl.GLuint:
@@ -129,6 +135,14 @@ class InstanceBuffer:
             gl.glEnableVertexAttribArray(loc)
             gl.glVertexAttribPointer(
                 loc, count, gltype, normalized, stride, ctypes.c_void_p(offset)
+            )
+            gl.glVertexAttribDivisor(loc, 1)
+        loc = gl.glGetAttribLocation(program.id, b"state")
+        if loc >= 0:
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.svbo)
+            gl.glEnableVertexAttribArray(loc)
+            gl.glVertexAttribPointer(
+                loc, 1, gl.GL_UNSIGNED_BYTE, gl.GL_TRUE, 1, ctypes.c_void_p(0)
             )
             gl.glVertexAttribDivisor(loc, 1)
         gl.glBindVertexArray(0)
@@ -166,6 +180,9 @@ class InstanceBuffer:
 
     def free(self, slot: int) -> None:
         self.data[slot] = self._zero  # all-zero: a degenerate quad, draws nothing
+        if self.state[slot]:
+            self.state[slot] = 0
+            self.state_dirty = True
         self.used[slot] = False
         if self.pin_src[slot] >= 0 or self.wire_src[slot] >= 0:
             self.pin_src[slot] = self.wire_src[slot] = -1
@@ -180,6 +197,8 @@ class InstanceBuffer:
         if not slots.size:
             return
         self.data[slots] = self._zero
+        self.state[slots] = 0
+        self.state_dirty = True
         self.used[slots] = False
         self.pin_src[slots] = self.wire_src[slots] = -1
         self.gen += 1
@@ -193,6 +212,7 @@ class InstanceBuffer:
         n = len(self.data)
         for name, fill in (
             ("data", 0),
+            ("state", 0),
             ("used", 0),
             ("dirty", 0),
             ("pin_src", -1),
@@ -215,6 +235,11 @@ class InstanceBuffer:
         self.wire_src[slots] = wires
         self.gen += 1
 
+    def set_state(self, slots, values) -> None:
+        """These instances' state bytes (SHOW_*, see sdf_shapes)."""
+        self.state[slots] = values
+        self.state_dirty = True
+
     def mark(self, slot: int) -> None:
         self.dirty[slot] = True
         self.any_dirty = True
@@ -236,6 +261,20 @@ class InstanceBuffer:
     # ---- GPU -----------------------------------------------------------------
 
     def _upload(self) -> None:
+        if self.realloc or self.state_dirty:
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.svbo)
+            if self.realloc:
+                gl.glBufferData(
+                    gl.GL_ARRAY_BUFFER,
+                    self.state.nbytes,
+                    self.state.ctypes.data,
+                    gl.GL_DYNAMIC_DRAW,
+                )
+            elif self.top:
+                gl.glBufferSubData(
+                    gl.GL_ARRAY_BUFFER, 0, self.top, self.state.ctypes.data
+                )
+            self.state_dirty = False
         if not (self.realloc or self.any_dirty):
             return
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)

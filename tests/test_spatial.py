@@ -85,3 +85,27 @@ def test_put_polylines_replaces_what_was_there():
     assert h.near(400, 0, 1) == set()  # w's old boxes are gone
     assert h.near(5, 100, 1) == {"w"} and h.near(15, 15, 1) == {"v"}
     assert h.near(1000.5, 1000.5, 0.1) == {"r"}
+
+
+def test_bounds_follow_every_kind_of_change():
+    import numpy as np
+
+    h = SpatialIndex(capacity=2)
+    assert h.bounds() is None
+    h.put_rect("a", 0, 0, 5, 5)
+    assert h.bounds() == (0, 0, 5, 5)
+    h.put_boxes(["b"], np.array([[10.0, -3, 12, 1]]))
+    assert h.bounds() == (0, -3, 12, 5)
+    h.put_polyline("w", [(0, 0), (0, 40)])
+    assert h.bounds()[3] >= 40
+    h.shift(["b"], 100, 0)
+    assert h.bounds()[2] == 112
+    h.remove_many(["b", "w"])
+    assert h.bounds() == (0, 0, 5, 5)
+    h.put_rect("a", 1, 1, 2, 2)  # (in place: _put)
+    assert h.bounds() == (1, 1, 2, 2)
+    h.remove("a")
+    assert h.bounds() is None
+    h.put_rect("c", 7, 7, 8, 8)
+    h.clear()
+    assert h.bounds() is None

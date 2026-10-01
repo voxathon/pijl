@@ -335,7 +335,8 @@ class Polyline:
         v = value if type(value) is int else show(value)
         if v != self._on:
             self._on = v
-            self._write_flag(0, v)
+            if self._slots.size:
+                self.buf.set_state(self._slots, v)
 
     @property
     def opacity(self) -> int:
@@ -1032,7 +1033,7 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
     for k, name in enumerate(("fill", "fill_on", "edge", "edge_on")):
         f[name][slots] = colors[:, k]
     f["flags"][slots] = 0, 255, 0, 0
-    f["flags"][slots, 0] = on
+    buf.set_state(slots, on)
     f["lift"][slots] = 0.0
     buf.mark_many(slots)
     buf.show_pins(slots, first_pin)  # lit bodies follow their first pin (switches, LEDs)
@@ -1054,7 +1055,7 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
         f["color"][slots] = _rgba(T.PIN_OFF)
         f["color_on"][slots] = _rgba(with_hue(T.PIN_ON, None))
         f["flags"][slots] = 0, 255, 0, 0
-        f["flags"][slots, 0] = SHOW_BY_CODE[codes]
+        buf.set_state(slots, SHOW_BY_CODE[codes])
         f["lift"][slots] = 0.0
         buf.mark_many(slots)
         buf.show_pins(slots, pin_slots)

@@ -44,8 +44,9 @@ float coverage(float d) {
 }
 """
 
-# flags: x = state (what it shows), y = opacity, z / w = per-kind extras. u8, normalized.
-# The state byte: off / on pick the shape's own colors; the rest are patterns.
+# flags: x = unused, y = opacity, z / w = per-kind extras. u8, normalized.
+# The state byte (what it shows) is kept outside the record: InstanceBuffer.state, the
+# `state` attribute. Off / on pick the shape's own colors; the rest are patterns.
 SHOW_OFF, SHOW_ON, SHOW_X, SHOW_Z, SHOW_FIGHT = 0, 255, 1, 2, 3
 SHOW_BY_CODE = np.array(
     [SHOW_Z, SHOW_OFF, SHOW_ON, SHOW_X], np.uint8
@@ -120,6 +121,7 @@ in vec4 rect;     // x, y, width, height
 in float border;  // inside the rectangle
 in vec4 fill; in vec4 fill_on; in vec4 edge; in vec4 edge_on;
 in vec4 flags;
+in float state;  // InstanceBuffer.state
 in float lift;
 out vec2 local;
 out vec2 world;
@@ -134,7 +136,7 @@ void main() {{
     local = corner * rect.zw;
     size = rect.zw;
     bw = border;
-    show = int(flags.x * 255.0 + 0.5);
+    show = int(state * 255.0 + 0.5);
     bool on = show == {SHOW_ON};
     cf = on ? fill_on : fill;
     ce = on ? edge_on : edge;
@@ -199,6 +201,7 @@ in vec2 center;
 in float radius;
 in vec4 color; in vec4 color_on;
 in vec4 flags;
+in float state;  // InstanceBuffer.state
 in float lift;
 out vec2 local;   // the rim is at length 1
 out vec2 world;
@@ -208,7 +211,7 @@ flat out int show;
 void main() {{
     {_CORNER}
     local = (corner * 2.0 - 1.0) * {PAD};
-    show = int(flags.x * 255.0 + 0.5);
+    show = int(state * 255.0 + 0.5);
     c = show == {SHOW_ON} ? color_on : color;
     c.a *= flags.y;
     world = center + lift * lift_offset + local * radius;
@@ -256,6 +259,7 @@ in float radius;
 in vec4 ca; in vec4 ca_on;  // color at a (off / on) ...
 in vec4 cb; in vec4 cb_on;  // ... and at b; blended along the length
 in vec4 flags;              // z / w: round cap at a / b
+in float state;             // InstanceBuffer.state
 in float lift;
 out vec2 uv;                // world units: along the segment from a, and across it
 out vec2 world;
@@ -276,7 +280,7 @@ void main() {{
     float v = mix(-w, w, corner.y);
     uv = vec2(u, v);
     ext = vec2(len, radius);
-    show = int(flags.x * 255.0 + 0.5);
+    show = int(state * 255.0 + 0.5);
     bool on = show == {SHOW_ON};
     c0 = on ? ca_on : ca;
     c1 = on ? cb_on : cb;
@@ -444,15 +448,13 @@ class _Shape:
     @property
     def state(self) -> int:
         """What it shows: a SHOW_* byte. Set it to one, or to a Level or bool (see show())."""
-        return int(self._get("flags")[0])
+        return int(self.buf.state[self.slot])
 
     @state.setter
     def state(self, value) -> None:
-        flags = self.buf.f["flags"]
         v = value if type(value) is int else show(value)
-        if flags[self.slot, 0] != v:
-            flags[self.slot, 0] = v
-            self.buf.mark(self.slot)
+        if self.buf.state[self.slot] != v:
+            self.buf.set_state(self.slot, v)
 
     @property
     def lifted(self) -> bool:

@@ -91,7 +91,7 @@ def test_view_sync_writes_what_the_sim_says(monkeypatch):
     for _ in range(3):
         c.step()
     sync(c, Canvas())
-    flags = buf.f["flags"][:, 0]
+    flags = buf.state
     assert (
         flags[pin_shape] == SHOW_ON
         and flags[wire_shape] == SHOW_OFF
@@ -102,3 +102,38 @@ def test_view_sync_writes_what_the_sim_says(monkeypatch):
         c.step()
     sync(c, Canvas())
     assert flags[pin_shape] == SHOW_OFF and flags[wire_shape] == SHOW_ON
+
+
+def test_view_sync_follows_rewiring_and_shows_fights(monkeypatch):
+    from pijl.sim import Circuit
+    from pijl.ui.sdf_shapes import SHOW_FIGHT, SHOW_OFF, SHOW_ON
+    from pijl.ui.sync import ViewSync
+
+    c = Circuit()
+    a, b, led = c.add_part("IN"), c.add_part("IN"), c.add_part("OUT")
+    w, _ = c.connect(a.outputs[0], led.inputs[0])
+    buf = _buffer(monkeypatch, capacity=8)
+    shape = buf.alloc()
+    buf.show_wires([shape], [w.slot])
+
+    class Canvas:
+        def buffers(self):
+            return [buf]
+
+    sync = ViewSync()
+    a.outputs[0].state, b.outputs[0].state = True, False
+    for _ in range(3):
+        c.step()
+    sync(c, Canvas())
+    assert buf.state[shape] == SHOW_ON
+    # A second driver joins w's net: net numbers change, though no shape did.
+    c.connect(b.outputs[0], w)
+    for _ in range(3):
+        c.step()
+    sync(c, Canvas())
+    assert buf.state[shape] == SHOW_FIGHT
+    a.outputs[0].state = False
+    for _ in range(3):
+        c.step()
+    sync(c, Canvas())
+    assert buf.state[shape] == SHOW_OFF

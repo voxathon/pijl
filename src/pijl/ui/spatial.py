@@ -32,6 +32,8 @@ class SpatialIndex:
         self._free: list[int] = []
         self._end = 0  # rows below this were handed out at some point
         self.where: dict[Hashable, list[int]] = {}  # object -> its boxes' rows
+        self._bounds: tuple | None = None  # bounds() until a box changes (the editor asks every frame)
+        self._bounds_ok = False
 
     def __len__(self) -> int:
         return len(self.where)
@@ -89,6 +91,7 @@ class SpatialIndex:
             owners[i] = obj
         self._owner[rows] = np.repeat(owners, counts)
         self._cols[:, rows] = boxes.T
+        self._bounds_ok = False
         row_list = rows.tolist()
         k, where = 0, self.where
         for obj, c in zip(objs, counts.tolist()):
@@ -104,6 +107,7 @@ class SpatialIndex:
         while len(rows) > len(boxes):
             self._release(rows.pop())
         cols = self._cols
+        self._bounds_ok = False
         for row, (x0, y0, x1, y1) in zip(rows, boxes):
             cols[0, row], cols[1, row], cols[2, row], cols[3, row] = x0, y0, x1, y1
 
@@ -132,6 +136,7 @@ class SpatialIndex:
         self._cols[:2, row], self._cols[2:, row] = np.inf, -np.inf
         self._owner[row] = None
         self._free.append(row)
+        self._bounds_ok = False
 
     def remove(self, obj: Hashable) -> None:
         for row in self.where.pop(obj, ()):
@@ -145,6 +150,7 @@ class SpatialIndex:
             rows = np.array(rows, np.intp)
             self._owner[rows] = None
             self._cols[:2, rows], self._cols[2:, rows] = np.inf, -np.inf
+            self._bounds_ok = False
 
     def shift(self, objs: Iterable[Hashable], dx: float, dy: float) -> None:
         """Move these objects' boxes by (dx, dy), all at once."""
@@ -154,6 +160,7 @@ class SpatialIndex:
             rows = np.array(rows, np.intp)
             self._cols[0::2, rows] += dx
             self._cols[1::2, rows] += dy
+            self._bounds_ok = False
 
     def clear(self) -> None:
         self.__init__()
@@ -171,15 +178,21 @@ class SpatialIndex:
 
     def bounds(self) -> tuple[float, float, float, float] | None:
         """The box around everything (x0, y0, x1, y1), or None if empty."""
+        if self._bounds_ok:
+            return self._bounds
         c = self._cols[:, : self._end]
-        if not len(self.where):
-            return None
-        return (
-            float(c[0].min()),
-            float(c[1].min()),
-            float(c[2].max()),
-            float(c[3].max()),
+        self._bounds = (
+            (
+                float(c[0].min()),
+                float(c[1].min()),
+                float(c[2].max()),
+                float(c[3].max()),
+            )
+            if self.where
+            else None
         )
+        self._bounds_ok = True
+        return self._bounds
 
     def near(self, x: float, y: float, r: float) -> set:
         return self.query(x - r, y - r, x + r, y + r)
