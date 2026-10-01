@@ -165,6 +165,7 @@ from .views import (
     paused_gc,
     project_onto,
     put_down,
+    set_pin_labels,
     theme_color,
 )
 from .wire_edit import WireEditSession
@@ -267,6 +268,7 @@ class Editor(pyglet.window.Window):
         self._bind_project(project)
         self.pin_label_mode = PIN_LABELS_HOVER  # Tab cycles it
         self.hover_view: PartView | None = None  # the part whose pin names hover shows
+        self._pin_label_mode_shown: int | None = None  # what the tags were last set for
         self._wire_batch: dict | None = (
             None  # wires waiting for their views (see wire_batch)
         )
@@ -3063,11 +3065,22 @@ class Editor(pyglet.window.Window):
             )
             if hovered in self.placing_views:
                 hovered = None
-        if mode == PIN_LABELS_HOVER and hovered is self.hover_view:
+        if mode == self._pin_label_mode_shown and hovered is self.hover_view:
             return  # nothing changed (the common case: called on every mouse move)
-        self.hover_view = hovered
-        for view in self.part_views.values():
-            view.set_pin_labels(mode == PIN_LABELS_ALWAYS or view is hovered)
+        self._pin_label_mode_shown, self.hover_view = mode, hovered
+        if mode == PIN_LABELS_ALWAYS:
+            set_pin_labels(list(self.part_views.values()), True)
+            return
+        # Only the views showing tags now, and the hovered one, can change. Oldest
+        # first, as a pass over every view would go (what's freed before a new tag
+        # is made decides its slots).
+        off = [v for v in self.part_table.tagged() if v is not hovered]
+        if hovered is None:
+            set_pin_labels(off, False)
+            return
+        set_pin_labels([v for v in off if v.seq < hovered.seq], False)
+        set_pin_labels([hovered], True)
+        set_pin_labels([v for v in off if v.seq > hovered.seq], False)
 
     def _unplaceable(self, entry: str) -> bool:
         """Macros that can't go on the open board: itself, and anything containing it."""

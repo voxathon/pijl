@@ -4,6 +4,8 @@ Needs a GL window; skipped where one can't be made."""
 
 import os
 
+import numpy as np
+
 import pytest
 
 
@@ -71,3 +73,42 @@ def test_a_dragged_board_is_one_move_and_undoes_exactly(ed):
     assert board(ed) == start and in_sync(ed)
     ed.dispatch_event("on_key_press", key.Y, key.MOD_CTRL)
     assert board(ed) == moved and in_sync(ed)
+
+
+def test_pin_tags_follow_tab_hover_and_drags(ed):
+    from pyglet.window import key
+
+    from pijl.ui.document import capture
+
+    ed._clear_board()
+    ed._reset_history(None)
+    views = [ed.add_part("AND", 200.0 + 160 * i, 100.0) for i in range(4)]
+    glyphs = ed.text.buf
+    base = int(glyphs.used.sum())
+
+    def tab_to(mode):
+        while ed.pin_label_mode != mode:
+            ed.dispatch_event("on_key_press", key.TAB, 0)
+
+    tab_to(2)  # always
+    assert all(v.pin_labels_shown for v in views)
+    with_tags = int(glyphs.used.sum())
+    assert with_tags > base
+    drag_all(ed, 23)  # tags move with their parts: same as made where they land
+    moved = {
+        s: glyphs.f["rect"][s].tolist() for s in np.flatnonzero(glyphs.used[: glyphs.top])
+    }
+    tab_to(0)  # hidden: every tag gone
+    assert not any(v.pin_labels_shown for v in views) and int(glyphs.used.sum()) == base
+    tab_to(2)
+    assert int(glyphs.used.sum()) == with_tags
+    again = {
+        s: glyphs.f["rect"][s].tolist() for s in np.flatnonzero(glyphs.used[: glyphs.top])
+    }
+    assert sorted(again.values()) == sorted(moved.values())
+    tab_to(1)  # hover: only the part under the cursor
+    v = views[2]
+    sx, sy = ed.camera.world_to_screen(v.x + v.w / 2, v.y + v.h / 2)
+    ed.dispatch_event("on_mouse_motion", sx, sy, 0, 0)
+    assert [w.pin_labels_shown for w in views] == [False, False, True, False]
+    assert capture(ed).parts  # (still a sound board)

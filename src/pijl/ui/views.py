@@ -634,20 +634,25 @@ class PartTable:
         self._intsb, self.ints = _buffered("B", 1, cap)  # bits: x / y were given as ints
         self._whb, self.wh = _buffered("i", 2, cap)  # (always whole: see _fill_part_rows)
         self.body = np.full(cap, -1, np.int32)
-        self.flags = np.zeros(cap, np.uint8)  # SELECTED, LIFTED
+        self.flags = np.zeros(cap, np.uint8)  # SELECTED, LIFTED, TAGGED
         self.opacity = np.full(cap, 255, np.uint8)
         self.seq = np.zeros(cap, np.int64)
+        self.view = np.full(cap, None, object)  # the handle (one per view: identity)
         # its pins' slots: pin0, pin0 + 1, ... npin of them; or pin0 = -1 and `pinslots`
         # (a part whose pins weren't made one after another: macros can be)
         self.pin0 = np.zeros(cap, np.int32)
         self.npin = np.zeros(cap, np.int32)
+        # its title's glyphs in the text's buffer, the same way (a run: glyph0 and
+        # nglyph; else listed in `glyphs`). No label object: the title is where the
+        # body is (see PartView.title_at), its layout cached per text (sdf_text).
+        self.glyph0 = np.zeros(cap, np.int32)
+        self.nglyph = np.zeros(cap, np.int32)
+        self.glyphs = np.full(cap, None, object)
         # objects, None meaning the usual: title text, the kind label, the user's label
         # (made on first use), pin tags ((backing slot, label) per pin, while shown),
         # pin tints, body tint, pin slots (see pin0)
         self.title = np.full(cap, None, object)
-        self.kind_text = np.full(cap, None, object)
         self.name = np.full(cap, None, object)
-        self.pin_tags = np.full(cap, None, object)
         self.tints = np.full(cap, None, object)
         self.body_tint = np.full(cap, None, object)
         self.pinslots = np.full(cap, None, object)
@@ -657,13 +662,22 @@ class PartTable:
         # from the body's middle (see PartView.pin_pos)
         self._pin_dyb, self.pin_dy = _buffered("d", 1, cap)
         self.pin_dot = np.full(cap, -1, np.int32)
+        # its name tag, while shown (TAGGED): the backing's slot (RECT, tags layer) and
+        # the text's glyphs, as runs (see glyph0)
+        self.tag_bg = np.full(cap, -1, np.int32)
+        self.tag_g0 = np.zeros(cap, np.int32)
+        self.tag_ng = np.zeros(cap, np.int32)
+        self.tag_glyphs = np.full(cap, None, object)
 
     _COLS = (
         "xy", "ints", "wh", "body", "flags", "opacity", "seq", "pin0", "npin",
-        "title", "kind_text", "name", "pin_tags", "tints", "body_tint", "pinslots",
+        "glyph0", "nglyph", "view", "title", "name", "tints", "body_tint",
+        "pinslots", "glyphs",
     )  # fmt: skip
-    _PIN_COLS = ("pin_row", "pin_out", "pin_dy", "pin_dot")
-    _FILL = {"body": -1, "opacity": 255, "pin_row": -1, "pin_dot": -1}
+    _PIN_COLS = (
+        "pin_row", "pin_out", "pin_dy", "pin_dot", "tag_bg", "tag_g0", "tag_ng", "tag_glyphs",
+    )  # fmt: skip
+    _FILL = {"body": -1, "opacity": 255, "pin_row": -1, "pin_dot": -1, "tag_bg": -1}
     _BUFFERED = {"xy": ("d", 2), "ints": ("B", 1), "wh": ("i", 2), "pin_dy": ("d", 1)}
 
     def _grow(self, names: tuple, n: int) -> None:
@@ -702,13 +716,14 @@ class PartTable:
         pins = self.pins_of(rows)
         self.pin_row[pins] = -1
         self.pin_dot[pins] = -1
+        self._forget_tags(pins)
         self.body[rows] = -1
         self.flags[rows] = 0
-        self.npin[rows] = 0
-        self.pin0[rows] = 0
+        self.npin[rows] = self.pin0[rows] = 0
+        self.nglyph[rows] = self.glyph0[rows] = 0
         for col in (
-            self.title, self.kind_text, self.name, self.pin_tags,
-            self.tints, self.body_tint, self.pinslots,
+            self.view, self.title, self.name,
+            self.tints, self.body_tint, self.pinslots, self.glyphs,
         ):  # fmt: skip
             col[rows] = None
 
@@ -741,13 +756,50 @@ class PartTable:
 
     def pins_of(self, rows: np.ndarray) -> np.ndarray:
         """The pin slots of many views (each view's in order, the views in no set order)."""
-        p0, k = self.pin0[rows], self.npin[rows]
-        run = p0 >= 0
-        p0, k = p0[run].astype(np.intp), k[run].astype(np.intp)
-        total = int(k.sum())
-        out = np.repeat(p0 - (np.cumsum(k) - k), k) + np.arange(total)
-        more = [self.pinslots[r] for r in rows[~run].tolist()]
-        return np.concatenate((out, *more)) if more else out
+        return _runs(self.pin0[rows], self.npin[rows], self.pinslots, rows)
+
+    def title_glyphs(self, row: int) -> np.ndarray:
+        g0 = int(self.glyph0[row])
+        if g0 >= 0:
+            return np.arange(g0, g0 + int(self.nglyph[row]))
+        return self.glyphs[row]
+
+    def titles_of(self, rows: np.ndarray) -> np.ndarray:
+        """The title glyph slots of many views (see pins_of)."""
+        return _runs(self.glyph0[rows], self.nglyph[rows], self.glyphs, rows)
+
+    def tags_of(self, pins: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The name tags of these pins: (backing slots, glyph slots), of those shown."""
+        bg = self.tag_bg[pins]
+        shown = pins[bg >= 0]
+        return bg[bg >= 0], _runs(self.tag_g0[shown], self.tag_ng[shown], self.tag_glyphs, shown)
+
+    def _forget_tags(self, pins: np.ndarray) -> None:
+        self.tag_bg[pins] = -1
+        self.tag_g0[pins] = self.tag_ng[pins] = 0
+        self.tag_glyphs[pins] = None
+
+    def tagged(self) -> list[PartView]:
+        """The views showing their pin name tags, oldest first."""
+        rows = np.flatnonzero(self.flags[: self.n] & TAGGED)
+        return self.view[rows].tolist()
+
+    def _set_runs(self, rows: np.ndarray, slots: np.ndarray, counts: np.ndarray, first, n, listed) -> None:
+        """Rows `rows` (any index array) get the next counts[i] of `slots` each: as a
+        run (first, n) where they're consecutive, else listed."""
+        k = len(counts)
+        starts = np.cumsum(counts) - counts
+        head = np.zeros(k, np.intp)
+        has = counts > 0
+        head[has] = slots[starts[has]]
+        # each slot minus where it would be in a run from its row's first: 0 in a run
+        off = slots - np.repeat(head - starts, counts) - np.arange(len(slots))
+        run = np.ones(k, bool)
+        run[np.repeat(np.arange(k), counts)[off != 0]] = False
+        first[rows] = np.where(run, head, -1)
+        n[rows] = counts
+        for i in np.flatnonzero(~run).tolist():
+            listed[rows[i]] = slots[starts[i] : starts[i] + counts[i]]
 
     def pin_xy(self, pins: np.ndarray) -> np.ndarray:
         """Where these pins are (n x 2): PartView.pin_pos for each, in the same arithmetic."""
@@ -757,6 +809,15 @@ class PartTable:
         px = np.where(self.pin_out[pins], x + w, x)
         py = y + h / 2 + self.pin_dy[pins]
         return np.column_stack((px, py))
+
+
+def _runs(first: np.ndarray, n: np.ndarray, listed: np.ndarray, rows: np.ndarray) -> np.ndarray:
+    """Slots held as runs (first, n; first -1: in `listed` instead), for many rows."""
+    run = first >= 0
+    first, n = first[run].astype(np.intp), n[run].astype(np.intp)
+    out = np.repeat(first - (np.cumsum(n) - n), n) + np.arange(int(n.sum()))
+    more = [listed[r] for r in rows[~run].tolist()]
+    return np.concatenate((out, *more)) if more else out
 
 
 class PartView:
@@ -771,6 +832,7 @@ class PartView:
         self, part: Part, x: float, y: float, table: PartTable, pin_labels: bool = True
     ) -> None:
         self.part, self.table, self.row = part, table, table.new_rows(1)[0]
+        table.view[self.row] = self
         _fill_part_rows([self], [(part, x, y)])
         _make_part_shapes([self], pin_labels)
 
@@ -788,6 +850,8 @@ class PartView:
             view = cls.__new__(cls)
             view.part, view.table, view.row = part, table, row
             views.append(view)
+        if views:
+            table.view[views[0].row : views[0].row + len(views)] = views
         _fill_part_rows(views, placed)
         _make_part_shapes(views, pin_labels)
         return views
@@ -875,18 +939,19 @@ class PartView:
         t = self.table
         return tuple(t.pin_dot[t.pin_slots(self.row)].tolist())
 
-    @property
-    def kind_text(self) -> SDFLabel:
-        return self.table.kind_text[self.row]
+    def title_at(self) -> Point:
+        """Where the title is anchored: the body's middle."""
+        x, y = self.table.pos(self.row)
+        return x + self.w / 2, y + self.h / 2
+
+    def _place_title(self) -> None:
+        glyphs = self.table.title_glyphs(self.row)
+        if glyphs.size:
+            self.text.place_at(glyphs, self.title, *self.title_at(), self.title_size, "center")
 
     @property
     def _name(self) -> SDFLabel | None:
         return self.table.name[self.row]
-
-    @property
-    def pin_tags(self) -> list | tuple:
-        """(tag backing slot, SDF label) per pin, while shown (see set_pin_labels)."""
-        return self.table.pin_tags[self.row] or ()
 
     @property
     def body_tint(self) -> Rgb | None:
@@ -921,22 +986,12 @@ class PartView:
 
     @property
     def pin_labels_shown(self) -> bool:
-        return bool(self.pin_tags)
+        return bool(self.table.flags[self.row] & TAGGED)
 
     def set_pin_labels(self, on: bool) -> None:
         """Show / hide the pin name tags: outside the body, next to each pin, on a dark
         backing so they read over wires and other parts. Only parts whose look asks."""
-        on = on and self.look.pin_labels
-        if on == self.pin_labels_shown:
-            return
-        if self.pin_tags:
-            buf = self.canvas.buffer(RECT, self.layers.tags)
-            for bg, label in self.pin_tags:
-                buf.free(bg)
-                label.delete()
-        self.table.pin_tags[self.row] = None
-        if on:
-            _make_pin_tags([(self, self.text.labels(self._tag_specs()))])
+        set_pin_labels([self], on)
 
     def _tag_specs(self) -> list[tuple]:
         """SDFText.labels specs for the pin name tags' text, in place (see _tag_at)."""
@@ -960,12 +1015,16 @@ class PartView:
         return (px - off if pin.is_input else px + off), py
 
     def _place_pin_tags(self) -> None:
-        if not self.pin_tags:
+        if not self.pin_labels_shown:
             return
-        buf = self.canvas.buffer(RECT, self.layers.tags)
-        for (bg, label), pin in zip(self.pin_tags, self.part.pins):
-            label.move_to(*self._tag_at(pin))
-            _set_rect(buf, bg, _tag_backing(label, pin))
+        t, buf = self.table, self.canvas.buffer(RECT, self.layers.tags)
+        for spec, pin in zip(self._tag_specs(), self.part.pins):
+            text, x, y, size, _, anchor = spec
+            p = np.array([pin.slot])
+            _, glyphs = t.tags_of(p)
+            if glyphs.size:
+                self.text.place_at(glyphs, text, x, y, size, anchor)
+            _set_rect(buf, int(t.tag_bg[pin.slot]), _tag_backing(self.text, spec, pin))
 
     def set_selected(self, on: bool) -> None:
         select_many([self], [], on)
@@ -994,7 +1053,7 @@ class PartView:
         body = self.body
         bodies.f["rect"][body, :2] = (x, y)
         bodies.mark(body)
-        self.kind_text.move_to(x + self.w / 2, y + self.h / 2)
+        self._place_title()
         if self._name is not None:
             self._name.move_to(*self.name_pos())
         dots = self.dots
@@ -1061,13 +1120,21 @@ class PartView:
         a = T.GHOST_OPACITY if ghost else 255
         self.table.opacity[self.row] = a
         _set_opacity(self.canvas.buffer(RECT, self.layers.bodies), self.body, a)
-        self.kind_text.opacity = a
+        glyphs = self.table.title_glyphs(self.row)
+        if glyphs.size:
+            buf = self.text.buf
+            buf.f["color"][glyphs, 3] = a
+            buf.mark_many(glyphs)
         if self._name is not None:
             self._name.opacity = a
-        if self.pin_tags:
+        if self.pin_labels_shown:
+            bgs, glyphs = self.table.tags_of(self.table.pin_slots(self.row))
+            if glyphs.size:
+                buf = self.text.buf
+                buf.f["color"][glyphs, 3] = a
+                buf.mark_many(glyphs)
             tags = self.canvas.buffer(RECT, self.layers.tags)
-            for bg, label in self.pin_tags:
-                label.opacity = a
+            for bg in bgs.tolist():
                 _set_opacity(tags, bg, a)  # (multiplies the backing's own alpha)
         dots = self.dots
         if dots:
@@ -1140,20 +1207,10 @@ def _fill_part_rows(views: list[PartView], placed: list[tuple]) -> None:
     t.wh[rows] = wh
     t.title[rows] = titles
     # pins: a run of slots each, as plain parts' are made (pin0, npin); else listed
+    # (macros' pins can be made apart)
     counts = np.fromiter(map(len, pins), np.intp, n)
     slots = np.fromiter((p.slot for ps in pins for p in ps), np.intp, int(counts.sum()))
-    starts = np.cumsum(counts) - counts
-    first = np.zeros(n, np.intp)
-    has = counts > 0
-    first[has] = slots[starts[has]]
-    # each pin's slot minus where it would be in a run from its part's first: 0 in a run
-    off = slots - np.repeat(first - starts, counts) - np.arange(len(slots))
-    run = np.ones(n, bool)
-    run[np.repeat(np.arange(n), counts)[off != 0]] = False
-    t.pin0[rows] = np.where(run, first, -1)
-    t.npin[rows] = counts
-    for i in np.flatnonzero(~run).tolist():  # (macros' pins can be made apart)
-        t.pinslots[rows.start + i] = slots[starts[i] : starts[i] + counts[i]]
+    t._set_runs(np.arange(rows.start, rows.stop), slots, counts, t.pin0, t.npin, t.pinslots)
     t.pin_room(int(slots.max()) + 1 if len(slots) else 0)
 
 
@@ -1162,7 +1219,7 @@ def _label_anchor(look) -> str:
     return {"left": "right", "right": "left"}.get(look.label, "center")
 
 
-SELECTED, LIFTED = 1, 2  # WireTable.flags
+SELECTED, LIFTED, TAGGED = 1, 2, 4  # WireTable / PartTable flags (TAGGED: parts)
 
 
 def _buffered(code: str, width: int, n: int, old: np.ndarray | None = None):
@@ -1706,14 +1763,24 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
             )
         if pin_labels and v.look.pin_labels:
             specs += v._tag_specs()
-    labels = iter(text.labels(specs))
+    glyphs, per_spec = text.place(specs)
+    first = np.cumsum(per_spec) - per_spec  # where each spec's glyphs start in `glyphs`
+    titles, tag_specs = [], []  # spec indices
+    i = 0
     for v, ps in zip(views, pins):
-        t.kind_text[v.row] = next(labels)
+        titles.append(i)
+        i += 1
         if v.part.label:
-            t.name[v.row] = next(labels)
+            k = first[i]
+            t.name[v.row] = text.wrap(specs[i], glyphs[k : k + per_spec[i]])
+            i += 1
         if pin_labels and v.look.pin_labels:
-            tagged.append((v, [next(labels) for _ in ps]))
-    _make_pin_tags(tagged)
+            tagged.append(v)
+            tag_specs += range(i, i + len(ps))
+            i += len(ps)
+    t._set_runs(rows, *_pick(glyphs, first, per_spec, titles), t.glyph0, t.nglyph, t.glyphs)
+    if tagged:
+        _store_tags(tagged, [specs[i] for i in tag_specs], *_pick(glyphs, first, per_spec, tag_specs))
     # bodies: the look's colors; lit ones (switches, LEDs) also on-colors, on per the first pin
     has_pins = counts > 0
     on = np.full(n, SHOW_OFF, np.uint8)
@@ -1795,29 +1862,63 @@ def _index_many(items: list[tuple]) -> None:
         index.put_many(members)
 
 
-def _tag_backing(label: SDFLabel, pin: Pin) -> tuple[float, float, float, float]:
-    """(x, y, width, height) of the dark backing behind a pin tag's text."""
+def _tag_backing(text: SDFText, spec: tuple, pin: Pin) -> tuple[float, float, float, float]:
+    """(x, y, width, height) of the dark backing behind a pin tag's text (`spec`: see
+    PartView._tag_specs), as an SDFLabel of it would measure."""
     pad_x, pad_y = T.PIN_TAG_PAD
-    h = label.cap_height + 2 * pad_y
-    x = label.x - label.width - pad_x if pin.is_input else label.x - pad_x
-    return x, label.y - h / 2, label.width + 2 * pad_x, h
+    words, x, y, size = spec[:4]
+    width = text.width(words, size)
+    h = text.cap_height(size) + 2 * pad_y
+    left = x - width - pad_x if pin.is_input else x - pad_x
+    return left, y - h / 2, width + 2 * pad_x, h
 
 
-def _make_pin_tags(made: list[tuple[PartView, list[SDFLabel]]]) -> None:
-    """Pin name tags for these views, from their tag texts (made from _tag_specs):
-    the backings, all at once, and the views' pin_tags."""
-    rows, alpha, lift = [], [], []
-    for v, labels in made:
-        rows += [_tag_backing(label, pin) for label, pin in zip(labels, v.part.pins)]
-        alpha += [v.opacity] * len(labels)
-        lift += [1.0 if v.lifted else 0.0] * len(labels)
-    if not rows:
+def _pick(glyphs: np.ndarray, first: np.ndarray, counts: np.ndarray, which: list[int]):
+    """The glyphs of some of SDFText.place's specs: (their slots, how many each)."""
+    which = np.array(which, np.intp)
+    n = counts[which]
+    at = np.repeat(first[which] - (np.cumsum(n) - n), n) + np.arange(int(n.sum()))
+    return glyphs[at] if len(at) else np.empty(0, np.intp), n
+
+
+def set_pin_labels(views: list[PartView], on: bool) -> None:
+    """set_pin_labels for many views at once (only those whose look shows tags, and
+    whose tags aren't that way already)."""
+    if not views:
         return
-    v0 = made[0][0]
-    buf = v0.canvas.buffer(RECT, v0.layers.tags)
-    slots = buf.alloc_many(len(rows))
+    t = views[0].table
+    rows = _rows_of(views)
+    shown = (t.flags[rows] & TAGGED) != 0
+    want = np.array([on and v.look.pin_labels for v in views], bool)
+    change = [v for v, c in zip(views, (shown != want).tolist()) if c]
+    if not change:
+        return
+    if not on:
+        _drop_tags(change)
+        return
+    specs = [spec for v in change for spec in v._tag_specs()]
+    glyphs, counts = t.text.place(specs)
+    _store_tags(change, specs, glyphs, counts)
+
+
+def _store_tags(views: list[PartView], specs: list[tuple], glyphs: np.ndarray, counts: np.ndarray) -> None:
+    """Name tags for every pin of these views, whose text is placed already (specs
+    from _tag_specs, in order; glyphs and counts from SDFText.place): their backings,
+    all at once, and the table's tag columns."""
+    t = views[0].table
+    pins = [p for v in views for p in v.part.pins]
+    rects, alpha, lift = [], [], []
+    for v in views:
+        k = len(v.part.pins)
+        alpha += [v.opacity] * k
+        lift += [1.0 if v.lifted else 0.0] * k
+    rects = [_tag_backing(t.text, spec, pin) for spec, pin in zip(specs, pins)]
+    if not rects:
+        return
+    buf = t.canvas.buffer(RECT, t.layers.tags)
+    slots = buf.alloc_many(len(rects))
     f = buf.f
-    f["rect"][slots] = rows
+    f["rect"][slots] = rects
     f["border"][slots] = 0.0
     for name in ("fill", "fill_on", "edge", "edge_on"):
         f[name][slots] = _rgba(T.PIN_TAG_BG)
@@ -1825,12 +1926,28 @@ def _make_pin_tags(made: list[tuple[PartView, list[SDFLabel]]]) -> None:
     f["flags"][slots, 1] = alpha
     f["lift"][slots] = lift
     buf.mark_many(slots)
-    backings = iter(slots.tolist())
-    for v, labels in made:
-        v.table.pin_tags[v.row] = [(next(backings), label) for label in labels]
-        if v.lifted:
-            for label in labels:
-                label.lifted = True
+    pin_slots = np.fromiter((p.slot for p in pins), np.intp, len(pins))
+    t.tag_bg[pin_slots] = slots
+    t._set_runs(pin_slots, glyphs, counts, t.tag_g0, t.tag_ng, t.tag_glyphs)
+    t.flags[_rows_of([v for v in views if v.part.pins])] |= TAGGED  # (no pins: no tags)
+    lifted = [v for v in views if v.lifted]
+    if lifted:  # (placed unlifted)
+        _, up = t.tags_of(t.pins_of(_rows_of(lifted)))
+        if up.size:
+            t.text.buf.f["lift"][up] = 1.0
+            t.text.buf.mark_many(up)
+
+
+def _drop_tags(views: list[PartView]) -> None:
+    """Take these views' name tags away."""
+    t = views[0].table
+    rows = _rows_of(views)
+    pins = t.pins_of(rows)
+    bgs, glyphs = t.tags_of(pins)
+    t.canvas.buffer(RECT, t.layers.tags).free_many(bgs.astype(np.intp))
+    t.text.buf.free_many(glyphs.astype(np.intp))
+    t._forget_tags(pins)
+    t.flags[rows] &= ~TAGGED & 0xFF
 
 
 def _make_wire_shapes(views: list[WireView], lines: list[list[Point]]) -> None:
@@ -1958,11 +2075,14 @@ class _Slots:
         self.bodies(views, rows)
         dots = t.pin_dot[t.pins_of(rows)]
         self.array(canvas, DOT, layers.pins, dots[dots >= 0])
-        tags = [tag for tags in t.pin_tags[rows].tolist() if tags for tag in tags]
-        self.slots(canvas, RECT, layers.tags, [bg for bg, _ in tags])
-        self.labels([k for k in t.kind_text[rows].tolist() if k is not None and k.slots.size])
+        tagged = rows[(t.flags[rows] & TAGGED) != 0]
+        if tagged.size:
+            bgs, glyphs = t.tags_of(t.pins_of(tagged))
+            self.array(canvas, RECT, layers.tags, bgs)
+        self._add(t.text.buf, t.titles_of(rows))
         self.labels([k for k in t.name[rows].tolist() if k is not None and k.slots.size])
-        self.labels([label for _, label in tags])
+        if tagged.size:
+            self._add(t.text.buf, glyphs.astype(np.intp))
         return self
 
     def wires(self, views: list[WireView], rows=None) -> _Slots:
@@ -2028,10 +2148,9 @@ def delete_views(parts: list[PartView], wires: list[WireView]) -> None:
         # the views are dead: they hold no slots any more (a second delete is a no-op)
         t = parts[0].table
         rows = _rows_of(parts)
-        for col in (t.kind_text, t.name):
-            for label in col[rows].tolist():
-                if label is not None:  # (whoever still has it, has an empty label)
-                    label.slots = NO_SLOTS
+        for label in t.name[rows].tolist():
+            if label is not None:  # (whoever still has it, has an empty label)
+                label.slots = NO_SLOTS
         t.forget(rows)
 
 
@@ -2074,14 +2193,13 @@ def _lift_mirrors(
 
 
 def _labels(views: list[PartView], rows=None) -> list[SDFLabel]:
-    """Every label of these views: titles, user labels, pin tags."""
+    """Every label object of these views: their user labels. (Titles and pin tags
+    have none: see PartTable.glyph0, tag_bg.)"""
     if not views:
         return []
     t = views[0].table
     rows = _rows_of(views) if rows is None else rows
-    out = t.kind_text[rows].tolist()
-    out += [k for k in t.name[rows].tolist() if k is not None]
-    out += [label for tags in t.pin_tags[rows].tolist() if tags for _, label in tags]
+    out = [k for k in t.name[rows].tolist() if k is not None]
     return out
 
 
