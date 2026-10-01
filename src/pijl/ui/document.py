@@ -56,8 +56,14 @@ Change = tuple[dict[int, tuple], dict[int, tuple], dict[int, tuple]]
 
 def capture(editor: Editor, views: Iterable[PartView] | None = None) -> Snapshot:
     """The whole board, or just `views` plus every wire fully inside that set
-    (both ends on those parts, or on wires that are themselves inside)."""
-    views = list(editor.part_views.values() if views is None else views)
+    (both ends on those parts, or on wires that are themselves inside). Parts come in
+    board order (uid order for `views`, which may be a set: copies made from the
+    snapshot are made in its order, which decides their slots and draw order)."""
+    views = (
+        list(editor.part_views.values())
+        if views is None
+        else sorted(views, key=lambda v: v.part.uid)
+    )
     parts = {v.part.uid: part_data(v) for v in views}
     wires, colors = {}, {}
     for view in internal_wires(editor, views):

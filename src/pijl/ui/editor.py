@@ -617,8 +617,9 @@ class Editor(pyglet.window.Window):
         return x.dst if x.src is parent else x.src
 
     def delete_selection(self) -> None:
-        self.remove_wires(list(self.selection.wires))
-        self.remove_parts(list(self.selection.parts))
+        # (in uid order, not the sets': what's freed first is reused last, see spatial.py)
+        self.remove_wires(sorted(self.selection.wires, key=lambda v: v.wire.uid))
+        self.remove_parts(sorted(self.selection.parts, key=lambda v: v.part.uid))
         self.selection.clear()
 
     def pin_pos(self, pin: Pin) -> Point:
@@ -2020,7 +2021,7 @@ class Editor(pyglet.window.Window):
         if not self.selection.parts:
             return
         if not self._tiling_active():
-            unit = list(self.selection.parts)
+            unit = sorted(self.selection.parts, key=lambda v: v.part.uid)
             wires = internal_wires(self, unit)
             self.tiling = Tiling(capture(self, unit), unit, wires)
         t = self.tiling

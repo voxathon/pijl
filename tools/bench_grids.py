@@ -232,7 +232,7 @@ def drag(ed: Editor, phase: int) -> None:
     """phase 0: press on a selected part and move; 1: let go there."""
     from pyglet.window import mouse
 
-    v = next(iter(ed.selection.parts))
+    v = min(ed.selection.parts, key=lambda v: v.part.uid)  # (the same one every run)
     sx, sy = ed.camera.world_to_screen(v.x + v.w / 2, v.y + v.h / 2)
     if phase == 0:
         ed.dispatch_event("on_mouse_press", sx, sy, mouse.LEFT, 0)
