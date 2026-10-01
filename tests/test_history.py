@@ -29,10 +29,10 @@ def test_undo_redo_roundtrip():
     for n in (1, 2, 3):
         h.commit(snap(n))
     assert h.undo() == (
-        {2: (None, ("NOT", "", 2.0, 0.0, {}))},
-        {},
-        {},
-    )  # the step: uid -> (before, after)
+        ({}, {2: ("NOT", "", 2.0, 0.0, {})}),
+        ({}, {}),
+        ({}, {}),
+    )  # the step, per section: (before, after); uid 2 wasn't there before
     assert h.current == snap(2)
     h.undo()
     assert h.current == snap(1)
@@ -70,7 +70,11 @@ def test_record_takes_only_what_changed():
     h = History(snap(3))
     moved = ("NOT", "", 9.0, 9.0, {})
     assert h.record({1: moved, 7: None}, {}, {})  # 7 was never there: not a change
-    assert h.undo_stack[0][0] == ({1: (("NOT", "", 1.0, 0.0, {}), moved)}, {}, {})
+    assert h.undo_stack[0][0] == (
+        ({1: ("NOT", "", 1.0, 0.0, {})}, {1: moved}),
+        ({}, {}),
+        ({}, {}),
+    )
     assert h.current.parts[1] == moved
     assert not h.record({1: moved}, {}, {})
 
@@ -99,3 +103,18 @@ def test_amend_folds_into_the_last_step():
     assert h.current == snap(1)  # both tweaks undone at once
     h.redo()
     assert h.current.parts[0] == b
+
+
+def test_amend_drops_what_ends_up_as_it_started():
+    h = History(snap(2))
+    moved = ("NOT", "", 9.0, 0.0, {})
+    new = ("AND", "", 3.0, 3.0, {})
+    h.record({0: moved, 5: new}, {}, {})  # move 0, add 5
+    h.amend({0: snap(2).parts[0], 1: moved}, {}, {})  # 0 back where it was, move 1
+    h.amend({5: None}, {}, {})  # and 5 gone again
+    (step, _, _), = h.undo_stack
+    assert step[0] == ({1: snap(2).parts[1]}, {1: moved})  # only 1 is left in it
+    h.undo()
+    assert h.current == snap(2)
+    h.redo()
+    assert h.current.parts == {0: snap(2).parts[0], 1: moved}

@@ -50,8 +50,14 @@ __all__ = [
 # they grow across boards and the two timelines can be told apart by which came last.
 STAMPS = itertools.count(1)
 
-# One undo step: for parts, wires and wire colors, uid -> (before, after). None = absent.
-Change = tuple[dict[int, tuple], dict[int, tuple], dict[int, tuple]]
+# One undo step: for parts, wires and wire colors, what the uids it touches looked like
+# before and after, as two dicts (uid -> value). A uid missing from one of them was
+# absent then. (Two dicts instead of uid -> (before, after) pairs: a step that adds or
+# removes a big batch is one dict of the values, not a pair per uid as well.)
+Section = tuple[dict[int, object], dict[int, object]]
+Change = tuple[Section, Section, Section]
+
+NO_PROPS: dict = {}  # props of a part that has none (shared: never write to it)
 
 
 def capture(editor: Editor, views: Iterable[PartView] | None = None) -> Snapshot:
@@ -94,7 +100,7 @@ def changes(
 
 def part_data(view: PartView) -> PartData:
     p = view.part
-    return p.kind, p.label, view.x, view.y, copy.deepcopy(p.props) if p.props else {}
+    return p.kind, p.label, view.x, view.y, copy.deepcopy(p.props) if p.props else NO_PROPS
 
 
 def wire_data(view: WireView) -> WireData:
@@ -280,7 +286,19 @@ def _instantiate(
                 color=clip.wire_colors.get(uid),
                 check=False,
             )
+    if not _colored(clip):
+        # The copies are wired only to each other: with no colors among them, paint()
+        # would leave every one of them neutral, which is how new views start.
+        Touched.paint_parts.difference_update(p.uid for p in new_parts.values())
+        Touched.paint_wires.difference_update(w.uid for w in new_wires.values())
     return new, {uid: editor.wire_views[w] for uid, w in new_wires.items()}
+
+
+def _colored(clip: Snapshot) -> bool:
+    """Does anything in `clip` have a color of its own (see paint.py)?"""
+    return bool(clip.wire_colors) or any(
+        "color" in props for *_, props in clip.parts.values()
+    )
 
 
 class History:
@@ -305,21 +323,25 @@ class History:
         return self.current.parts, self.current.wires, self.current.wire_colors
 
     def _diff(self, parts: dict, wires: dict, colors: dict) -> Change:
-        """uid -> (before, after) for the entries that differ from `current`."""
-        return tuple(
-            {
-                uid: (cur.get(uid), new)
-                for uid, new in now.items()
-                if cur.get(uid) != new
-            }
-            for now, cur in zip((parts, wires, colors), self._sections())
-        )
+        """The entries that differ from `current`: (before, after) per section."""
+        out = []
+        for now, cur in zip((parts, wires, colors), self._sections()):
+            before, after = {}, {}
+            for uid, new in now.items():
+                old = cur.get(uid)
+                if old != new:
+                    if old is not None:
+                        before[uid] = old
+                    if new is not None:
+                        after[uid] = new
+            out.append((before, after))
+        return tuple(out)
 
     def record(self, parts: dict, wires: dict, colors: dict) -> bool:
         """A new step: what these uids look like now (see changes()); None = gone.
         No-op (returns False) if that's what they looked like already."""
         change = self._diff(parts, wires, colors)
-        if not any(change):
+        if _empty(change):
             return False
         _apply(self._sections(), change, 1)
         after = next(STAMPS)
@@ -346,18 +368,24 @@ class History:
         if not self.undo_stack:
             return self.record(parts, wires, colors)
         change = self._diff(parts, wires, colors)
-        if not any(change):
+        if _empty(change):
             return False
         _apply(self._sections(), change, 1)
         top, before, _ = self.undo_stack[-1]
-        merged = tuple(dict(section) for section in top)
-        for into, section in zip(merged, change):
-            for uid, (old, new) in section.items():
-                first = into[uid][0] if uid in into else old
-                if first == new:
-                    into.pop(uid, None)
-                else:
-                    into[uid] = (first, new)
+        merged = tuple((dict(b), dict(a)) for b, a in top)
+        for (into_b, into_a), (b, a) in zip(merged, change):
+            for uid in b.keys() | a.keys():
+                # what it was before the merged step: the older step's, if it had it
+                had = uid in into_b or uid in into_a
+                first = into_b.get(uid) if had else b.get(uid)
+                new = a.get(uid)
+                into_b.pop(uid, None)
+                into_a.pop(uid, None)
+                if first != new:
+                    if first is not None:
+                        into_b[uid] = first
+                    if new is not None:
+                        into_a[uid] = new
         self.state = next(STAMPS)
         self.undo_stack[-1] = (merged, before, self.state)
         self.redo_stack.clear()
@@ -386,17 +414,24 @@ class History:
 def _apply(sections: tuple[dict, dict, dict], change: Change, side: int) -> None:
     """Set every entry of `change` to its before (side 0) or after (side 1) value."""
     for d, section in zip(sections, change):
-        for uid, pair in section.items():
-            if pair[side] is None:
-                d.pop(uid, None)
-            else:
-                d[uid] = pair[side]
+        to, other = section[side], section[1 - side]
+        for uid in other.keys() - to.keys():  # absent on that side
+            d.pop(uid, None)
+        d.update(to)
+
+
+def _empty(change: Change) -> bool:
+    return not any(b or a for b, a in change)
+
+
+def section_uids(section: Section) -> set[int]:
+    return section[0].keys() | section[1].keys()
 
 
 def change_uids(change: Change) -> tuple[set[int], set[int]]:
     """The part and wire uids an undo step touches (wire colors count as wires)."""
     parts, wires, colors = change
-    return set(parts), set(wires) | set(colors)
+    return section_uids(parts), section_uids(wires) | section_uids(colors)
 
 
 def _ref(end) -> EndRef:

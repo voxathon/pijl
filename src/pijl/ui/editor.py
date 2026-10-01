@@ -2120,7 +2120,7 @@ class Editor(pyglet.window.Window):
         self.selection.clear()
         restore(self, self.history.current, change_uids(change))
         # parts at the ends of wires that came or went: their pins' colors may change
-        for uid in _pin_part_uids(pair for pair in change[1].values()):
+        for uid in _pin_part_uids((d,) for side in change[1] for d in side.values()):
             Touched.part(uid)
 
     def _begin_group_drag(self, grabbed: PartView) -> None:
