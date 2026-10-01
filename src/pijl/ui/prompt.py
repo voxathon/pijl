@@ -87,7 +87,7 @@ class Prompt:
             + PAD / 2
         )
         self.shade = shapes.Rectangle(
-            0, 0, win_w, win_h, color=T.PROMPT_SHADE, batch=batch, group=shade_g
+            0, 0, win_w, win_h, color=(0, 0, 0, 110), batch=batch, group=shade_g
         )
         self.panel = Box(W, self.h, max(1, round(S)), *T.MENU_PANEL, batch, bg)
 

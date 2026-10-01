@@ -1,5 +1,4 @@
-"""The editor: input handling (a small state machine), sim ticking, drawing -- for
-every viewport window onto the board (the main one and any extra ones: viewport.py).
+"""The editor window: input handling (a small state machine), sim ticking, drawing.
 
 Design rule for carpal-tunnel friendliness: nothing *requires* holding a
 mouse button. Placing parts and drawing wires are "click to start, click to
@@ -76,10 +75,6 @@ Controls
   Ctrl+Z / Ctrl+Y          undo / redo (also Ctrl+Shift+Z). During an action, Ctrl+Z cancels it.
                            Every finished edit is recorded automatically; see document.py.
   right-drag empty space   pan (middle-drag pans in any mode)
-  right-click empty space  board menu: Open new viewport -- another window onto the board, just
-                           the board and its zoom (see viewport.py). Each has its own camera;
-                           everything else works across them (start a wire in one, end it in
-                           another). Prompts stay in the main window (the others dim meanwhile).
   W A S D                  move the view (slower than dragging; speed in theme.py)
   hold Ctrl                snap parts and wire bends to the grid
   hold Ctrl+Shift          snap to the finer subgrid instead
@@ -149,11 +144,11 @@ from .document import (
     restore,
 )
 from .duplicate import DOWN, RIGHT, Cell, Tiling
+from .grid import Grid
 from .library import Library, LibraryHistory, Step
 from .line_edit import LineEdit
 from .menu import RAINBOW, ContextMenu, MenuItem
 from .miniview import Miniview
-from .viewport import ExtraViewport, Viewport
 from .paint import paint, part_color
 from .picker import PartPicker, Row
 from .popover import NumberPopover
@@ -257,24 +252,14 @@ def _direction(
     return dx / n * dt, dy / n * dt
 
 
-class Editor:
+class Editor(pyglet.window.Window):
     def __init__(self) -> None:
-        self.history: History | None = None  # set up by _start_document
-        self._ready = False  # until the end of __init__: viewports' events are dropped
-        # The main window: its picker and status bar cover some of the board. `vp` is
-        # the viewport the current event came from (see handle and viewport.py).
-        self.main = Viewport(
-            self,
-            insets=lambda: (self.picker.width, BAR_H),
-            width=1280,
-            height=720,
-            caption="pijl",
-            resizable=True,
-            vsync=True,
-            config=_make_config(),
+        self.history: History | None = (
+            None  # set up by _start_document; checked by dispatch_event
         )
-        self.vp: Viewport = self.main
-        self.viewports: list[Viewport] = [self.main]
+        super().__init__(
+            1280, 720, caption="pijl", resizable=True, vsync=True, config=_make_config()
+        )
         # the open document: a macro, or an untitled board (set early: the picker asks about it)
         self.doc: str | None = None  # its macro's id (see storage.py); None = untitled
         self.saved_state = 0  # history.state of what's on disk (dirty = it differs)
@@ -294,33 +279,30 @@ class Editor:
         self._wire_batch: dict | None = (
             None  # wires waiting for their views (see wire_batch)
         )
+        self.camera = Camera()
+        self.grid = Grid()
         self.keys = key.KeyStateHandler()  # live "is this key down?" lookups
-        self.main.push_handlers(self.keys)  # (and every other viewport's)
+        self.push_handlers(self.keys)
 
         self.world = Canvas(pyglet.graphics.Batch())  # parts and wires; see canvas.py
         self.layers = Layers()
         self.text = SDFText(self.world, self.layers.text_order)
-        self.hud = self.main.hud
+        self.hud = pyglet.graphics.Batch()
         self.library = self._load_library()
         self.picker = PartPicker(
             self.library,
             self.hud,
-            self.main.height,
-            self.main.pixel_ratio(),
+            self.height,
+            self._pixel_ratio(),
             swatch=self._swatch,
             name_of=self._entry_title,
             disabled=self._unplaceable,
         )
         # Screen-space things that belong to the board, drawn over the HUD: the selection
-        # box (the miniview scales the main window's with the board) and the context menu
-        # (the miniview shows it at its own size, where it was opened). Each is drawn in
-        # the window it's in: the box in that viewport's overlay, the menu in menu_vp.
-        self.overlay = self.main.overlay
+        # box (the miniview scales it with the board) and the context menu (the miniview shows
+        # it at its own size, where it was opened)
+        self.overlay = pyglet.graphics.Batch()
         self.menu = ContextMenu(pyglet.graphics.Batch())
-        self.menu_vp: Viewport = self.main
-        # the window a label or wire is being edited in (it alone shows handles, caret)
-        self.edit_vp: Viewport = self.main
-        self.popover_vp: Viewport = self.main
         # Problems (part scripts, files) in red; notices ("saved adder") in grey, for a few seconds
         self.status = pyglet.text.Label(
             "",
@@ -328,11 +310,11 @@ class Editor:
             font_size=10,
             color=T.MENU_DANGER,
             x=self.picker.width + 8,
-            y=self.main.height - 8,
+            y=self.height - 8,
             anchor_y="top",
             batch=self.hud,
         )
-        self.bar = StatusBar(self.hud, self.main.width)
+        self.bar = StatusBar(self.hud, self.width)
         self.mini = Miniview(self.overlay, self.menu)  # top right: G, arrows
         # While G is down: [it was open before, used since (scrolled / steered)] -- a
         # plain tap toggles it
@@ -355,13 +337,12 @@ class Editor:
         # interaction state
         self.mode = Mode.IDLE
         self.panning = False  # orthogonal to mode: you can pan while carrying things
-        # A right press on empty board: (x, y) -- a menu opens there on release, unless
-        # it turned into a drag (a pan) first
-        self.board_menu_at: tuple[float, float] | None = None
         self.map_button: int | None = (
             None  # same for pointing in the miniview: the button held in it
         )
+        self.mouse = (0, 0)  # last known cursor position, screen space
         self.hit_scale: float | None = None  # see hit_zoom
+        self.mouse_in = False  # is it over the window at all?
         self.active: PartView | None = None  # part being pressed / dragged
         self.grab = (0.0, 0.0)  # part origin minus cursor, world units
         self.press_at = (0, 0)  # screen pos of the press on a part / wire / picker row
@@ -430,7 +411,6 @@ class Editor:
 
         self._start_document()
         pyglet.clock.schedule_interval(self.update, 1 / 60)
-        self._ready = True
 
     # ======================================================================
     # model + view bookkeeping
@@ -707,7 +687,7 @@ class Editor:
     def hit_zoom(self) -> float:
         """Screen px per world unit where the click is: the view's, or the miniview's
         while a click in it is being hit-tested."""
-        return self.hit_scale or self.vp.camera.zoom
+        return self.hit_scale or self.camera.zoom
 
     @property
     def slop(self) -> float:
@@ -784,11 +764,9 @@ class Editor:
         if self.mini_steer is not None:  # clicked while steering it: at the cursor's spot
             x, y = self.mini_steer
             self._end_mini_steer()
-        self.vp.mouse = (x, y)
-        wx, wy = self.vp.camera.screen_to_world(x, y)
-        in_picker = (  # None unless the cursor is over the picker
-            self.picker.hit(x, y) if self.vp is self.main else None
-        )
+        self.mouse = (x, y)
+        wx, wy = self.camera.screen_to_world(x, y)
+        in_picker = self.picker.hit(x, y)  # None unless the cursor is over the picker
         tool = (
             in_picker.part
             if isinstance(in_picker, Row) and in_picker.what == "part"
@@ -796,10 +774,7 @@ class Editor:
         )
 
         if self.mode is Mode.POPOVER:
-            if self.vp is not self.popover_vp:  # another window: a click outside it
-                self._close_popover(take_typed=True)
-            else:
-                self._popover_press(x, y, button)
+            self._popover_press(x, y, button)
             return
 
         if self.mode is Mode.PROMPT:
@@ -812,21 +787,19 @@ class Editor:
             return
 
         if self.mode is Mode.MENU:
-            menu_vp = self.menu_vp
-            here = self.vp is menu_vp  # (a click in another window is outside it)
-            item = self.menu.item_at(x, y) if here else None
+            item = self.menu.item_at(x, y)
             if button == mouse.LEFT and item is not None and item.submenu:
                 self.menu.hover(x, y)  # opens on hover already; a click just makes sure
                 return
-            inside = here and self.menu.contains(x, y)
+            inside = self.menu.contains(x, y)
             self._close_menu()
             if button == mouse.LEFT and item is not None:
                 # Done: the cursor goes back to where you right-clicked (what the menu was
                 # about, and where the miniview still looks), so e.g. Branch starts from there.
                 # Only for board menus: the library's and the status bar's stay put.
                 ax, ay = self.menu.anchor
-                if not self._on_panels(ax, ay, menu_vp):
-                    menu_vp.warp(ax, ay)
+                if not self.picker.contains(ax, ay) and not self.bar.contains(ax, ay):
+                    self._warp(ax, ay)
                 item.action()  # after closing: may start another mode (e.g. label editing)
                 return
             if button == mouse.MIDDLE:
@@ -842,7 +815,7 @@ class Editor:
             self._finish_rename(commit=True)  # same for collection names
             return
 
-        if self.vp is self.main and self.mini.contains(x, y):
+        if self.mini.contains(x, y):
             # Point in it (with any button, in any mode that isn't holding a button already):
             # its crosshair goes there; the view stays put.
             if self.map_button is None and not self.panning and self.mode in STEERABLE:
@@ -857,7 +830,7 @@ class Editor:
         if button == mouse.MIDDLE:
             self.panning = True
             return
-        if self.vp is self.main and self.bar.contains(x, y):
+        if self.bar.contains(x, y):
             if (
                 button == mouse.LEFT
                 and self.bar.cog_hit(x, y)
@@ -866,9 +839,6 @@ class Editor:
                 self._cog_menu()
             return  # the bar isn't board: no placing, bends or selecting under it
         if self.mode is Mode.EDITING_WIRE and in_picker:
-            self._finish_wire_edit(commit=True)  # like any click away from the wire
-            return
-        if self.mode is Mode.EDITING_WIRE and self.vp is not self.edit_vp:
             self._finish_wire_edit(commit=True)  # like any click away from the wire
             return
         if self.mode is Mode.EDITING_WIRE:
@@ -998,7 +968,6 @@ class Editor:
 
         elif button == mouse.RIGHT and not self._item_menu(x, y, wx, wy, modifiers):
             self.panning = True
-            self.board_menu_at = (x, y)
 
     def _item_menu(
         self, x: float, y: float, wx: float, wy: float, modifiers: int, board=None
@@ -1076,10 +1045,6 @@ class Editor:
         finally:
             self.hit_scale = None
 
-    def _board_menu(self, x: float, y: float) -> None:
-        """Right-click on empty board: what there is to do with the board itself."""
-        self._open_menu(x, y, [MenuItem("Open new viewport", self.open_viewport)])
-
     def _mini_select(self, wx: float, wy: float, modifiers: int) -> None:
         """A left click in the miniview: selects what's there, like a click on the board
         (Shift toggles it; on nothing, a plain click clears)."""
@@ -1104,8 +1069,8 @@ class Editor:
 
         def board(action):
             def run():
-                self.main.center_on(wx, wy)
-                self.main.warp(*self.main.camera.world_to_screen(wx, wy))
+                self._center_on(wx, wy)
+                self._warp(*self.camera.world_to_screen(wx, wy))
                 self._follow_cursor()
                 action()
 
@@ -1121,20 +1086,15 @@ class Editor:
     def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers):
         if self.mini_steer is not None:
             return  # (can't happen: a press ends it)
-        self.vp.mouse = (x, y)
+        self.mouse = (x, y)
         if self.mode is Mode.POPOVER:
-            if self.vp is self.popover_vp:
-                self._popover_drag(x)
+            self._popover_drag(x)
             return
         if self.map_button is not None:
             self.mini.point(x, y)  # (never pans the view, even dragged off it)
             return
         if self.panning:
-            self.vp.camera.pan(dx, dy)
-            if self.board_menu_at is not None:
-                px, py = self.board_menu_at
-                if abs(x - px) + abs(y - py) >= T.DRAG_THRESHOLD_PX:
-                    self.board_menu_at = None  # a pan, not a click
+            self.camera.pan(dx, dy)
         elif self.mode is Mode.PRESSING_PART:
             px, py = self.press_at
             if abs(x - px) + abs(y - py) >= T.DRAG_THRESHOLD_PX:
@@ -1168,40 +1128,28 @@ class Editor:
     def on_mouse_motion(self, x, y, dx, dy):
         if self._steer_mini(dx, dy):
             return  # (the cursor stays where it was)
-        self.vp.mouse, self.vp.mouse_in = (x, y), True
-        self.bar.set_hover(
-            self.mode is Mode.IDLE and self.vp is self.main and self.bar.cog_hit(x, y)
-        )
+        self.mouse, self.mouse_in = (x, y), True
+        self.bar.set_hover(self.mode is Mode.IDLE and self.bar.cog_hit(x, y))
         if self.mode is Mode.PROMPT:
             self.prompt.hover(x, y)
             return
-        hover_ok = self.vp is self.main and self.mode in (
-            Mode.IDLE,
-            Mode.PLACING_PART,
-            Mode.WIRING,
-        )
+        hover_ok = self.mode in (Mode.IDLE, Mode.PLACING_PART, Mode.WIRING)
         self.picker.set_hover(self.picker.hit(x, y) if hover_ok else None)
         if self.mode is Mode.MENU:
-            if self.vp is self.menu_vp:
-                self.menu.hover(x, y)
-        elif (
-            self.mode is Mode.EDITING_WIRE
-            and self.vp is self.edit_vp
-            and self.wire_edit.set_hover(
-                self._wire_edit_target(x, y)
-            )
+            self.menu.hover(x, y)
+        elif self.mode is Mode.EDITING_WIRE and self.wire_edit.set_hover(
+            self._wire_edit_target(x, y)
         ):
-            window = self.vp
-            hand = window.get_system_mouse_cursor(window.CURSOR_HAND)
-            window.set_mouse_cursor(hand if self.wire_edit.hover else None)
+            hand = self.get_system_mouse_cursor(self.CURSOR_HAND)
+            self.set_mouse_cursor(hand if self.wire_edit.hover else None)
         self._follow_cursor()
         self._update_pin_labels()
 
     def on_mouse_enter(self, x, y):
-        self.vp.mouse, self.vp.mouse_in = (x, y), True
+        self.mouse, self.mouse_in = (x, y), True
 
     def on_mouse_leave(self, x, y):
-        self.vp.mouse_in = False
+        self.mouse_in = False
 
     def on_mouse_release(self, x, y, button, modifiers):
         if button == self.map_button:
@@ -1216,10 +1164,6 @@ class Editor:
         # That is what makes press-and-hold on a picker part or pin harmless.
         if button in (mouse.MIDDLE, mouse.RIGHT) and self.panning:
             self.panning = False
-            if button == mouse.RIGHT and self.board_menu_at is not None:
-                at, self.board_menu_at = self.board_menu_at, None
-                if self.mode is Mode.IDLE:
-                    self._board_menu(*at)
         elif button == mouse.LEFT and self.mode is Mode.PRESSING_PART:
             # A click without movement: clickable parts (switches) get the click,
             # everything else gets selected.
@@ -1251,18 +1195,16 @@ class Editor:
             self.mode, self.picker_row = Mode.IDLE, None
 
     def on_mouse_scroll(self, x, y, scroll_x, scroll_y):
-        self.vp.mouse = (x, y)
+        self.mouse = (x, y)
         if self.mode is Mode.POPOVER:
             return  # (it's pinned to where it opened: don't let the board move away under it)
         if self.mode is Mode.PROMPT:
             if scroll_y:
                 self.prompt.move(-1 if scroll_y > 0 else 1)
             return
-        if self.mode is Mode.MENU and (
-            self._on_picker(x, y) or self.vp is not self.menu_vp
-        ):
+        if self.mode is Mode.MENU and self.picker.contains(x, y):
             self._close_menu()  # (the picker would scroll away under a menu on it)
-        if self._on_picker(x, y):
+        if self.picker.contains(x, y):
             self.picker.scroll_by(
                 scroll_y
             )  # eases there; a drag follows along (see PartPicker.update)
@@ -1277,18 +1219,16 @@ class Editor:
         ):
             self._space_tiling(scroll_y)
             return
-        if (self.vp is self.main and self.mini.scrolls(x, y)) or (
-            self._g_held() and self.mini.open
-        ):
+        if self.mini.scrolls(x, y) or (self._g_held() and self.mini.open):
             self.mini.adjust(scroll_y)  # its zoom; the view stays put
             self._mini_used()
             return
         if (
             self.mode is Mode.MENU
         ):  # zoom around what the menu belongs to, so it stays on it
-            self.vp.camera.scroll(*self.menu.anchor, scroll_y)
+            self.camera.scroll(*self.menu.anchor, scroll_y)
             return
-        self.vp.camera.scroll(x, y, scroll_y)
+        self.camera.scroll(x, y, scroll_y)
         self._follow_cursor()
 
     def on_key_press(self, symbol, modifiers):
@@ -1424,10 +1364,8 @@ class Editor:
     # ---- helpers -----------------------------------------------------------
 
     def _open_menu(self, x: float, y: float, items: list[MenuItem]) -> None:
-        self.menu.open(x, y, items, self.vp.width, self.vp.height)
+        self.menu.open(x, y, items, self.width, self.height)
         self.menu.hover(x, y)
-        self.menu_vp = self.vp
-        self.mini.own_menu = self.vp is not self.main  # (its anchor isn't main's screen)
         self.mode = Mode.MENU
 
     @staticmethod
@@ -1537,8 +1475,8 @@ class Editor:
         )
         p = Prompt(
             self.hud,
-            self.main.width,
-            self.main.height,
+            self.width,
+            self.height,
             s.title(key) + _count(views),
             text="" if value is MIXED else value,
             max_len=s.max_len,
@@ -1560,12 +1498,11 @@ class Editor:
     def _open_popover(self, views: list[PartView], key: str, s: Number, value) -> None:
         self._cancel()
         hint = s.hint or f"{s.show(s.min)} to {s.show(s.max)}"
-        self.popover_vp = self.vp
         self.popover = NumberPopover(
-            self.vp.hud,
-            self.vp.width,
-            self.vp.height,
-            self.vp.mouse,
+            self.hud,
+            self.width,
+            self.height,
+            self.mouse,
             s.title(key) + _count(views),
             s,
             None if value is MIXED else value,
@@ -1664,7 +1601,6 @@ class Editor:
         self.mode = Mode.IDLE
 
     def _start_wire_edit(self, view: WireView) -> None:
-        self.edit_vp = self.vp
         self.selection.discard(view)  # one glow at a time
         self.mode = Mode.EDITING_WIRE
         parents = {
@@ -1679,9 +1615,9 @@ class Editor:
             if e is view.wire
         ]
         self.wire_edit = WireEditSession(
-            view, self.vp.camera, self.world, self.layers, parents, branches
+            view, self.camera, self.world, self.layers, parents, branches
         )
-        self.wire_edit.set_hover(self._wire_edit_target(*self.vp.mouse))
+        self.wire_edit.set_hover(self._wire_edit_target(*self.mouse))
 
     def _wire_edit_target(self, x: float, y: float):
         return self.wire_edit.target_at(
@@ -1718,11 +1654,10 @@ class Editor:
             self.refresh_wires([self.wire_edit.view])
         self.wire_edit.close()
         self.wire_edit = None
-        self.vp.set_mouse_cursor(None)
+        self.set_mouse_cursor(None)
         self.mode = Mode.IDLE
 
     def _start_edit(self, view: PartView) -> None:
-        self.edit_vp = self.vp
         self.mode = Mode.EDITING_LABEL
         self.edit_view = view
         self.edit = LineEdit(view.part.label, LABEL_MAX)
@@ -1892,8 +1827,8 @@ class Editor:
 
         p = Prompt(
             self.hud,
-            self.main.width,
-            self.main.height,
+            self.width,
+            self.height,
             title,
             message="Are you sure? " + " ".join(line for line in lines if line),
             danger=True,
@@ -2044,8 +1979,8 @@ class Editor:
         old = self._title(id)
         p = Prompt(
             self.hud,
-            self.main.width,
-            self.main.height,
+            self.width,
+            self.height,
             f"Rename {old}",
             text=old,
             max_len=NAME_MAX,
@@ -2134,6 +2069,16 @@ class Editor:
     def _finish_rename(self, commit: bool) -> None:
         self.picker.finish_rename(commit)
         self.mode = Mode.IDLE
+
+    def _warp(self, sx: float, sy: float) -> None:
+        """Move the cursor to screen point (sx, sy), in window px (the OS wants physical px)."""
+        r = self._pixel_ratio()
+        self.set_mouse_position(round(sx * r), round(sy * r))
+        self.mouse = (sx, sy)  # (before the OS's motion event arrives)
+
+    def _pixel_ratio(self) -> float:
+        fb_w, _ = self.get_framebuffer_size()
+        return fb_w / self.width if self.width else 1.0
 
     def _start_placing(self, kind: str) -> None:
         if self._unplaceable(kind):
@@ -2319,7 +2264,7 @@ class Editor:
         ]
 
     def _move_group(self) -> None:
-        wx, wy = self.vp.camera.screen_to_world(*self.vp.mouse)
+        wx, wy = self.camera.screen_to_world(*self.mouse)
         # Snap the grabbed part's origin; everything else moves by the same delta, so
         # the group keeps its shape (and snapped layouts stay snapped).
         ox, oy = self.snapped(wx + self.grab[0], wy + self.grab[1])
@@ -2361,7 +2306,7 @@ class Editor:
         self.drag_delta = (0.0, 0.0)
 
     def _update_box(self) -> None:
-        sx, sy = self.vp.mouse
+        sx, sy = self.mouse
         px, py = self.press_at
         if (
             self.box_shapes is None
@@ -2369,7 +2314,7 @@ class Editor:
         ):
             return  # not a drag yet; a plain click just leaves the selection cleared
         # Anchor in world space so panning/zooming mid-drag keeps the start corner in place.
-        ax, ay = self.vp.camera.world_to_screen(*self.box_start)
+        ax, ay = self.camera.world_to_screen(*self.box_start)
         x0, x1 = sorted((ax, sx))
         y0, y1 = sorted((ay, sy))
         if self.box_shapes is None:
@@ -2380,7 +2325,7 @@ class Editor:
                     1,
                     1,
                     color=T.SELECT_BOX_FILL,
-                    batch=self.vp.overlay,
+                    batch=self.overlay,
                     group=self.hud_box_group,
                 ),
                 shapes.Box(
@@ -2390,7 +2335,7 @@ class Editor:
                     1,
                     thickness=1,
                     color=T.SELECT,
-                    batch=self.vp.overlay,
+                    batch=self.overlay,
                     group=self.hud_box_group,
                 ),
             )
@@ -2398,8 +2343,8 @@ class Editor:
             shape.position = (x0, y0)
             shape.width, shape.height = max(x1 - x0, 1), max(y1 - y0, 1)
         (wx0, wy0), (wx1, wy1) = (
-            self.vp.camera.screen_to_world(x0, y0),
-            self.vp.camera.screen_to_world(x1, y1),
+            self.camera.screen_to_world(x0, y0),
+            self.camera.screen_to_world(x1, y1),
         )
         base_parts, base_wires = self.box_base
         self.selection.set(
@@ -2452,7 +2397,7 @@ class Editor:
         elif self.mode is Mode.EDITING_WIRE:
             if self.wire_edit.dragging is not None:
                 self.wire_edit.drag_to(
-                    *self.vp.camera.screen_to_world(*self.vp.mouse), self.snapped
+                    *self.camera.screen_to_world(*self.mouse), self.snapped
                 )
                 self.refresh_wires([self.wire_edit.view])
             else:
@@ -2467,7 +2412,7 @@ class Editor:
         self._update_preview()
 
     def _update_preview(self) -> None:
-        wx, wy = self.vp.camera.screen_to_world(*self.vp.mouse)
+        wx, wy = self.camera.screen_to_world(*self.mouse)
         target = self.wire_target(wx, wy)
         valid = target is not None and self.can_wire_to(target[0])
         end = target[1] if valid else self.snapped(wx, wy)  # valid targets always win
@@ -2522,25 +2467,14 @@ class Editor:
 
     _EDIT_EVENTS = frozenset({"on_mouse_press", "on_mouse_release", "on_key_press"})
 
-    def handle(self, vp: Viewport, event_type: str, *args) -> None:
-        """An input event from viewport vp (it's `vp` meanwhile: screen points are its).
-
-        After any click/release/key that leaves the editor idle, snapshot the board
+    def dispatch_event(self, event_type, *args):
+        """After any click/release/key that leaves the editor idle, snapshot the board
         and record it if it changed. So every action -- including ones added later --
         is undoable without writing inverse operations, and no-ops (a click on
         empty space, a switch toggle) don't clutter the history.
 
         Only what views say they changed gets looked at (see _record)."""
-        if not self._ready:
-            return
-        if (
-            self.mode is Mode.PROMPT
-            and vp is not self.main
-            and event_type.startswith("on_mouse")
-        ):
-            return  # (a prompt is up in the main window: the others are dimmed)
-        self.vp = vp
-        getattr(self, event_type)(*args)
+        result = super().dispatch_event(event_type, *args)
         if (
             event_type in self._EDIT_EVENTS
             and self.history is not None
@@ -2552,6 +2486,7 @@ class Editor:
             if self.mode is Mode.IDLE:  # (not halfway through naming a collection)
                 self._library_checkpoint()
             self._save_library()  # picker rearrangements are saved as they happen (no-op if unchanged)
+        return result
 
     # ======================================================================
     # tick + draw
@@ -2566,7 +2501,7 @@ class Editor:
             self.popover.tick(dt)
         self._update_caption()
         self.status.x = self.picker.width + 8  # follows the panel sliding in / out
-        self.bar.place(self.picker.width, self.main.width)
+        self.bar.place(self.picker.width, self.width)
         self._move_keys(dt)
         self._update_mini(dt)
         t0 = time.perf_counter()
@@ -2593,58 +2528,53 @@ class Editor:
             if view := self.wire_views.get(wire):
                 view.sync(self.circuit.wire_state(wire))
 
-    def resized(self, vp: Viewport, width: int, height: int) -> None:
-        if not self._ready:
-            return
-        if self.popover is not None and vp is self.popover_vp:
-            self.popover.layout(width, height)
-        if vp is not self.main:
-            return
+    def on_resize(self, width, height):
+        super().on_resize(width, height)  # keeps the projection matrix in sync
         self.status.y = height - 8
         self.bar.place(self.picker.width, width)
         if self.prompt is not None:
             self.prompt.layout(width, height)
-        self.picker.resize(height, self.main.pixel_ratio())
+        if self.popover is not None:
+            self.popover.layout(width, height)
+        self.picker.resize(height, self._pixel_ratio())
 
-    def draw(self, vp: Viewport) -> None:
-        """One viewport's frame: the board through its camera, then its own screen-space
-        things (the main window's: the miniview, picker and bar)."""
-        if not self._ready:
-            return
+    def on_draw(self):
         t0 = time.perf_counter()
-        vp.clear()
-        vp.grid.draw(
-            vp,
-            vp.camera,
+        self.clear()
+        self.grid.draw(
+            self,
+            self.camera,
             emphasized=self.snapping,  # also paints the background
             divisions=self.grid_divisions,
         )
-        vp.view = vp.camera.matrix()
-        self.world.draw(top=vp is self.edit_vp)
-        vp.view = Mat4()  # identity: HUD is in screen pixels
-        if vp is self.main:
-            self.mini.draw(vp, self.world, vp.grid)
-        else:
-            vp.show_zoom()
-        vp.hud.draw()
-        vp.overlay.draw()
-        if vp is self.menu_vp:
-            self.menu.batch.draw()
-        if self.mode is Mode.PROMPT and vp is not self.main:
-            vp.draw_shade()  # (the prompt is in the main window)
+        self.view = self.camera.matrix()
+        self.world.draw()
+        self.view = Mat4()  # identity: HUD is in screen pixels
+        self.mini.draw(self, self.world, self.grid)
+        self.hud.draw()
+        self.overlay.draw()
+        self.menu.batch.draw()
         self.stats["draw"] += (
             time.perf_counter() - t0
         )  # CPU side: issuing the draws, not the GPU's work
 
-    def _on_picker(self, x: float, y: float) -> bool:
-        """Is screen point (x, y) of the current viewport on the picker (main window only)?"""
-        return self.vp is self.main and self.picker.contains(x, y)
+    def _board_center(self) -> tuple[float, float]:
+        """The middle of the visible board (right of the picker, above the bar), screen px."""
+        return (self.picker.width + self.width) / 2, (BAR_H + self.height) / 2
 
-    def _on_panels(self, x: float, y: float, vp: Viewport) -> bool:
-        """Is screen point (x, y) of vp on the main window's picker or status bar?"""
-        return vp is self.main and (
-            self.picker.contains(x, y) or self.bar.contains(x, y)
+    def _visible_world(self) -> tuple[float, float, float, float]:
+        """The world rect you can see: right of the picker, above the bar."""
+        (x0, y0), (x1, y1) = (
+            self.camera.screen_to_world(self.picker.width, BAR_H),
+            self.camera.screen_to_world(self.width, self.height),
         )
+        return x0, y0, x1, y1
+
+    def _center_on(self, wx: float, wy: float) -> None:
+        """Move the camera so (wx, wy) is in the middle of the visible board."""
+        sx, sy = self._board_center()
+        z = self.camera.zoom
+        self.camera.x, self.camera.y = wx - sx / z, wy - sy / z
 
     def _board_bounds(self) -> tuple[float, float, float, float] | None:
         """The box around every part and wire, or None for an empty board."""
@@ -2658,21 +2588,21 @@ class Editor:
             max(b[3] for b in boxes),
         )
 
-    @staticmethod
-    def _fit(board, vp: Viewport) -> tuple[tuple[float, float, float, float], int]:
-        """`board` with a margin around it, and the level at which that fits vp's board part."""
+    def _fit(self, board) -> tuple[tuple[float, float, float, float], int]:
+        """`board` with a margin around it, and the level at which that fits the visible board."""
         x0, y0, x1, y1 = board
         m = max(FIT_MARGIN, FIT_MARGIN_SHARE * max(x1 - x0, y1 - y0))
         x0, y0, x1, y1 = x0 - m, y0 - m, x1 + m, y1 + m
-        level = Camera.fit_level(x1 - x0, y1 - y0, *vp.board_size())
+        level = Camera.fit_level(
+            x1 - x0, y1 - y0, self.width - self.picker.width, self.height - BAR_H
+        )
         return (x0, y0, x1, y1), level
 
     def _update_zoom_floor(self, board) -> None:
         """Zooming out goes as far as it takes to see the whole board (at least to MIN_LEVEL)."""
-        for vp in self.viewports:
-            vp.camera.min_level = (
-                MIN_LEVEL if board is None else min(MIN_LEVEL, self._fit(board, vp)[1])
-            )
+        self.camera.min_level = (
+            MIN_LEVEL if board is None else min(MIN_LEVEL, self._fit(board)[1])
+        )
 
     # ---- the miniview's keys: G, arrows, G+mouse (see the module docstring) ----
 
@@ -2705,10 +2635,12 @@ class Editor:
 
     def _park_mini(self) -> None:
         mini = self.mini
-        main = self.main
-        mini.park(mini.pointer or main.camera.screen_to_world(*main.board_center()))
+        mini.park(mini.pointer or self._board_center_world())
         mini.open = True
         self._mini_used()
+
+    def _board_center_world(self) -> Point:
+        return self.camera.screen_to_world(*self._board_center())
 
     def _steer_mini(self, dx: float, dy: float) -> bool:
         """G+mouse: the motion moves it (parked), finely, and the cursor stays put: the
@@ -2716,8 +2648,8 @@ class Editor:
         if self.mini_steer is None:
             if not self._g_held() or self.mode not in STEERABLE:
                 return False
-            self.mini_steer = self.main.mouse  # (this event's x, y is already past it)
-            self.main.set_exclusive_mouse(True)
+            self.mini_steer = self.mouse  # (this event's x, y is already past it)
+            self.set_exclusive_mouse(True)
         self._park_mini()
         k = T.MINI_MOUSE_SENSITIVITY
         self.mini.nudge(dx * k, dy * k)
@@ -2732,8 +2664,8 @@ class Editor:
 
     def _end_mini_steer(self) -> None:
         if self.mini_steer is not None:
-            self.main.set_exclusive_mouse(False)
-            self.main.warp(*self.mini_steer)  # back where it was, visible again
+            self.set_exclusive_mouse(False)
+            self._warp(*self.mini_steer)  # back where it was, visible again
             self.mini_steer = None
 
     def on_deactivate(self):
@@ -2766,25 +2698,24 @@ class Editor:
             self.mini.nudge(d[0] * T.MINI_ARROW_SPEED, d[1] * T.MINI_ARROW_SPEED)
         wasd = [float(k[s]) for s in (key.A, key.D, key.W, key.S)]
         if d := _direction(*wasd, dt):
-            self.vp.camera.pan(-d[0] * T.VIEW_KEY_SPEED, -d[1] * T.VIEW_KEY_SPEED)
+            self.camera.pan(-d[0] * T.VIEW_KEY_SPEED, -d[1] * T.VIEW_KEY_SPEED)
             self._follow_cursor()
 
     def _update_mini(self, dt: float) -> None:
         board = self._board_bounds()
         self._update_zoom_floor(board)
-        main = self.main
-        on_board = not self.picker.contains(*main.mouse) and not self.bar.contains(
-            *main.mouse
+        on_board = not self.picker.contains(*self.mouse) and not self.bar.contains(
+            *self.mouse
         )
         self.mini.update(
             dt,
-            main.camera,
+            self.camera,
             board,
-            main.visible_world(),
-            main.mouse if main.mouse_in else None,
+            self._visible_world(),
+            self.mouse if self.mouse_in else None,
             on_board,
-            main.width,
-            main.height,
+            self.width,
+            self.height,
         )
 
     def _tally(self, dt: float, sim: float) -> None:
@@ -2810,60 +2741,22 @@ class Editor:
                 ),
                 (4, f"{len(c.wires)} wires"),
                 (7, f"{len(c.net_value)} nets"),
-                (5, f"zoom {100 * self.main.camera.zoom:.0f}%"),
+                (5, f"zoom {100 * self.camera.zoom:.0f}%"),
             ]
         )
         self.stats = dict.fromkeys(st, 0)
 
-    def close_viewport(self, vp: Viewport) -> None:
-        """Its close button. The main window's quits (asking about unsaved changes first);
-        another just goes, and whatever was going on in it with it."""
-        if vp is self.main:
-            if self.mode is Mode.PROMPT:
-                return  # already asking something; answer that first
-            self._cancel()
-            self._unsaved_then(self._quit)
-            return
-        if vp not in self.viewports:
-            return
-        if self.mode is not Mode.IDLE and vp in (
-            self.vp,
-            self.menu_vp,
-            self.edit_vp,
-            self.popover_vp,
-        ):
-            self._cancel()
-        self.viewports.remove(vp)
-        for name in ("vp", "menu_vp", "edit_vp", "popover_vp"):
-            if getattr(self, name) is vp:
-                setattr(self, name, self.main)
-        vp.editor = None  # (closing sends events of its own: deactivate, leave)
-        vp.close()
-
-    def open_viewport(self) -> Viewport:
-        """Another window onto the board, looking where the current one does."""
-        here = self.vp
-        vp = ExtraViewport(
-            self,
-            width=800,
-            height=600,
-            caption=f"pijl - viewport {len(self.viewports)}",
-            resizable=True,
-            vsync=False,  # (one vsync'd window paces the loop; more would divide it)
-            config=_make_config(),
-        )
-        vp.push_handlers(self.keys)
-        vp.camera.level = here.camera.level
-        vp.center_on(*here.camera.screen_to_world(*here.board_center()))
-        self.viewports.append(vp)
-        return vp
+    def on_close(self):
+        # Not calling super() (it closes right away): unsaved changes get asked about first.
+        if self.mode is Mode.PROMPT:
+            return  # already asking something; answer that first
+        self._cancel()
+        self._unsaved_then(self._quit)
 
     def _quit(self) -> None:
         self._save_library()
         self.circuit.close_all()  # every opened part gets its close()
-        for vp in reversed(self.viewports):
-            vp.editor = None
-            vp.close()
+        self.close()
 
     def _report(self, msg: str) -> None:
         """Show a problem at the top of the window (the newest one) and on stderr."""
@@ -2902,7 +2795,7 @@ class Editor:
         if not self.store.ids():
             self._build_demo()
         self._reset_history(None)
-        self.main.camera.center_on(*HOME, self.main.width, self.main.height)
+        self.camera.center_on(*HOME, self.width, self.height)
 
     def _record(self, amend: bool = False) -> bool:
         """Write what views reported changed (views.Touched) into the undo history, as a
@@ -2954,7 +2847,7 @@ class Editor:
         # if the file needed repairs, the board shows them and saving writes them.
         self._reset_history(id)
         self.project.remember_open(id)
-        self._fit_camera(self.main)
+        self._fit_camera()
         if loaded.warnings:
             for w in loaded.warnings:
                 print(f"{name}: {w}", file=sys.stderr)
@@ -2971,8 +2864,8 @@ class Editor:
         self._clear_board()
         self._reset_history(None)
         self.project.remember_open(None)
-        self.main.camera.set_level(0, 0, 0)
-        self.main.camera.center_on(*HOME, self.main.width, self.main.height)
+        self.camera.set_level(0, 0, 0)
+        self.camera.center_on(*HOME, self.width, self.height)
 
     def _save(self, then=None) -> None:
         """Save under the current title (asking for one if untitled), then call `then`."""
@@ -2984,8 +2877,8 @@ class Editor:
     def _save_as(self, then=None) -> None:
         p = Prompt(
             self.hud,
-            self.main.width,
-            self.main.height,
+            self.width,
+            self.height,
             "Save macro as",
             text=self.doc_title or "",
             max_len=NAME_MAX,
@@ -3069,8 +2962,8 @@ class Editor:
         names = list(by_title)
         p = Prompt(
             self.hud,
-            self.main.width,
-            self.main.height,
+            self.width,
+            self.height,
             "Open macro",
             text="",
             max_len=NAME_MAX,
@@ -3115,8 +3008,8 @@ class Editor:
 
         p = Prompt(
             self.hud,
-            self.main.width,
-            self.main.height,
+            self.width,
+            self.height,
             f"Unsaved changes to {self.doc_title or 'the untitled board'}",
             hint="Enter: save them   D: discard them   Esc: cancel",
         )
@@ -3127,7 +3020,6 @@ class Editor:
         self.prompt, self.prompt_enter, self.prompt_key = prompt, enter, on_key
         self.picker.set_hover(None)
         self.mode = Mode.PROMPT
-        self.main.activate()  # (it's always in the main window)
 
     def _close_prompt(self) -> None:
         if self.prompt is not None:
@@ -3142,7 +3034,7 @@ class Editor:
             return  # nothing changed since last frame
         self._caption_for = state
         name = f"{title or 'untitled'}{' *' if self.dirty else ''}"
-        self.main.set_caption(f"pijl - {name}")
+        self.set_caption(f"pijl - {name}")
         self.bar.set_doc(f"{self.project.name} / {name}")
 
     def _home(self, fit: bool) -> None:
@@ -3151,32 +3043,33 @@ class Editor:
         if self.keys[key.G]:  # (with Ctrl+G, G's press toggled parking: this parks it anyway)
             board = self._board_bounds()
             if fit and board is not None:
-                self.mini.fit(self._fit(board, self.main)[0])
+                self.mini.fit(self._fit(board)[0])
             else:
                 self.mini.look_at(HOME)
             self.mini.open = True
             self._mini_used()  # (letting go of G leaves it open)
             return
         if fit:
-            self._fit_camera(self.vp)
+            self._fit_camera()
         else:
-            self.vp.camera.set_level(0, 0, 0)
-            self.vp.camera.center_on(*HOME, self.vp.width, self.vp.height)
+            self.camera.set_level(0, 0, 0)
+            self.camera.center_on(*HOME, self.width, self.height)
         self._follow_cursor()
 
-    def _fit_camera(self, vp: Viewport) -> None:
-        """Show everything on the board, centered in vp's board part (right of the
-        picker, in the main window). Zooms out if it doesn't fit, never in past 1:1."""
+    def _fit_camera(self) -> None:
+        """Show everything on the board, centered in the space right of the picker.
+        Zooms out if it doesn't fit, never in past 1:1."""
         board = self._board_bounds()
         self._update_zoom_floor(board)
-        camera = vp.camera
         if board is None:
-            camera.set_level(0, 0, 0)
-            camera.center_on(*HOME, vp.width, vp.height)
+            self.camera.set_level(0, 0, 0)
+            self.camera.center_on(*HOME, self.width, self.height)
             return
-        (x0, y0, x1, y1), level = self._fit(board, vp)
-        camera.level = max(camera.min_level, min(0, level))
-        vp.center_on((x0 + x1) / 2, (y0 + y1) / 2)
+        (x0, y0, x1, y1), level = self._fit(board)
+        self.camera.level = max(self.camera.min_level, min(0, level))
+        sx, sy = self._board_center()
+        self.camera.x = (x0 + x1) / 2 - sx / self.camera.zoom
+        self.camera.y = (y0 + y1) / 2 - sy / self.camera.zoom
 
     # ---- projects and the cogwheel menu ---------------------------------------------
 
@@ -3220,9 +3113,7 @@ class Editor:
         )
 
     def _show_controls(self) -> None:
-        sheet = ControlsSheet(
-            self.hud, self.main.width, self.main.height, self.main.pixel_ratio()
-        )
+        sheet = ControlsSheet(self.hud, self.width, self.height, self._pixel_ratio())
 
         def page(symbol: int) -> None:
             if symbol in (key.PAGEUP, key.PAGEDOWN):
@@ -3233,8 +3124,8 @@ class Editor:
     def _new_project_dialog(self) -> None:
         p = Prompt(
             self.hud,
-            self.main.width,
-            self.main.height,
+            self.width,
+            self.height,
             "New project",
             text="",
             max_len=NAME_MAX,
@@ -3356,9 +3247,9 @@ class Editor:
         if (
             mode == PIN_LABELS_HOVER
             and self.mode is not Mode.PROMPT
-            and not self._on_picker(*self.vp.mouse)
+            and not self.picker.contains(*self.mouse)
         ):
-            wx, wy = self.vp.camera.screen_to_world(*self.vp.mouse)
+            wx, wy = self.camera.screen_to_world(*self.mouse)
             pin = self.pin_at(wx, wy)
             hovered = (
                 self.part_views[pin.part] if pin is not None else self.part_at(wx, wy)
