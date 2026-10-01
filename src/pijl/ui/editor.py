@@ -2651,6 +2651,15 @@ class Editor(pyglet.window.Window):
         self.selection.clear()
         self.tiling = None
         restore(self, EMPTY)  # removes (and closes) everything
+        # A fresh circuit and view tables: their slots are never reused (a stale handle
+        # mustn't see a newer part), so without this every board opened since start
+        # would still take up its rows.
+        self.circuit = Circuit(self.catalog, settle_ticks=SETTLE_TICKS)
+        self.wire_index.clear()
+        self.part_index.clear()
+        self.wire_table = WireTable(self.world, self.layers, self.wire_index)
+        self.part_table = PartTable(self.world, self.layers, self.text, self.part_index)
+        self.hover_view = None
 
     def _load(self, id: str) -> None:
         name = self._title(id)

@@ -17,7 +17,8 @@ To compare against another commit, run it from an extracted copy of that commit'
 
 On a version with PartTable it also checks internal consistency: pins held per row =
 the part's pins, dots and pin-end wires at pin_pos (printed as "table problems").
-MEQ_DUMP="step,step" MEQ_OUT=prefix saves those steps' frames as .npy."""
+MEQ_DUMP="step,step" MEQ_OUT=prefix saves those steps' frames as .npy. Settling (the
+sim's power-on noise) is off unless MEQ_SETTLE=1 (deterministic either way: seeded)."""
 import hashlib
 import json
 import os
@@ -40,6 +41,10 @@ class _T:  # (frozen clock: patterns that animate draw the same every run)
 _C.time = _T
 
 from pijl.sim.circuit import Pin  # noqa: E402
+import pijl.ui.editor as _E  # noqa: E402
+
+if not os.environ.get("MEQ_SETTLE"):  # (no settling noise: every run the same)
+    _E.SETTLE_TICKS = 0
 from pijl.snapshot import Snapshot  # noqa: E402
 from pijl.ui.document import capture  # noqa: E402
 
@@ -205,7 +210,8 @@ def frames(ed, n=4):
 ed = B.fresh_editor()
 from pijl.ui.sdf_shapes import DOT as _C_DOT  # noqa: E402
 
-ed.circuit.settle_ticks = 0
+if not os.environ.get("MEQ_SETTLE"):
+    ed.circuit.settle_ticks = 0
 for id, snap in (("ha", HALF_ADDER), ("two", TWO), ("three", THREE)):
     ed.store.save(id, snap, ed.catalog, id)
 ed.picker.refresh() if hasattr(ed.picker, "refresh") else None
@@ -309,7 +315,8 @@ digest(ed, "undo drag")
 
 ed.store.save("board", capture(ed), ed.catalog, "board")
 ed._load("board")
-ed.circuit.settle_ticks = 0
+if not os.environ.get("MEQ_SETTLE"):
+    ed.circuit.settle_ticks = 0
 frames(ed, 8)
 digest(ed, "save+open")
 

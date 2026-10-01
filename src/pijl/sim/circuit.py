@@ -305,7 +305,7 @@ class Part:
     # as they were). `label`: the user-given name. It lives in the model (not the
     # UI) because it's circuit data: when a board is saved as a macro, IN/OUT labels
     # become its pin names.
-    __slots__ = ("_c", "slot", "_ins", "_outs", "type", "uid", "kind", "label", "_props")
+    __slots__ = ("_c", "slot", "_ins", "_outs", "type", "uid", "kind", "label", "_props", "_state")
 
     @property
     def props(self) -> dict[str, Any]:
@@ -323,12 +323,15 @@ class Part:
 
     @property
     def state(self) -> dict[str, Any]:
-        """Scratch space for its PartType's hooks (made when first asked for)."""
-        return self._c._state.setdefault(self.slot, {})
+        """Scratch space for its PartType's hooks (made when first asked for; hooks get
+        the handle, so it lives there -- and stays with it after the part is gone)."""
+        if self._state is None:
+            self._state = {}
+        return self._state
 
     @state.setter
     def state(self, value: dict[str, Any]) -> None:
-        self._c._state[self.slot] = value
+        self._state = value
 
     @property
     def live(self) -> bool:
@@ -489,7 +492,6 @@ class Circuit:
         self._inner_wires: dict[int, np.ndarray] = {}  # macro instance -> its wire slots
         self._links: dict[int, np.ndarray] = {}  # pin slot pairs joined into one net (k x 2)
         self._drives: dict[int, list[int]] = {}  # joined parts: per output, its driver pin
-        self._state: dict[int, dict] = {}  # Part.state
         self._types: list[PartType] = []
         self._type_pins = np.zeros(0, np.intp)  # per type: its pin count (pin_slots_of)
         self._type_ids: dict[PartType, int] = {}
@@ -591,8 +593,7 @@ class Circuit:
     # the next len(ins) + len(outs) slots), label, props (None inside a macro until
     # asked for: then a copy of the body's). What few parts have is kept by slot in
     # dicts, as small int arrays: a macro's body parts and wires (_inner,
-    # _inner_wires), links (pin slot pairs), joined outputs' driver pins (_drives);
-    # and hook scratch space (_state).
+    # _inner_wires), links (pin slot pairs), joined outputs' driver pins (_drives).
 
     def _new_rows(self, k: int) -> range:
         first = self._n_part_slots
@@ -630,7 +631,7 @@ class Circuit:
             part._c, part.slot, part._ins, part._outs = self, slot, None, None
             t = part.type = self._types[self._type_id[slot]]
             part.uid, part.kind = int(self._uid[slot]), t.kind
-            part.label, part._props = self._label[slot], self._props[slot]
+            part.label, part._props, part._state = self._label[slot], self._props[slot], None
         return part
 
     def _make_many(
@@ -977,8 +978,12 @@ class Circuit:
         self._wire_slots.kill([w for s in tree for w in np.asarray(self._inner_wires.get(s, ())).tolist()])
         self._settle[at] = 0
         self._alive[at] = False
+        # (the rows stay dead: let go of what they held -- a handle someone still has
+        # keeps its own copy of what it needs)
+        self._handles[at] = self._label[at] = self._props[at] = None
         for s in tree:
-            self._linked.pop(s, None)
+            for d in (self._linked, self._inner, self._inner_wires, self._links, self._drives):
+                d.pop(s, None)
         self._nets_dirty = self._kinds_dirty = self._batches_dirty = True
         return removed
 
