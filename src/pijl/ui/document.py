@@ -116,7 +116,8 @@ def changes(
 
 def part_data(view: PartView) -> PartData:
     p = view.part
-    return p.kind, p.label, view.x, view.y, copy.deepcopy(p.props) if p.props else NO_PROPS
+    x, y = view.table.pos(view.row)
+    return p.kind, p.label, x, y, copy.deepcopy(p.props) if p.props else NO_PROPS
 
 
 def wire_data(view: WireView) -> WireData:

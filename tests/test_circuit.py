@@ -166,6 +166,22 @@ def test_removing_a_wire_removes_its_branches():
     assert c.wires == []
 
 
+def test_with_descendants_matches_descendants():
+    c = Circuit()
+    a = c.add_part("IN")
+    nots = [c.add_part("NOT") for _ in range(6)]
+    trunk, _ = c.connect(a.outputs[0], nots[0].inputs[0])
+    b1, _ = c.connect(trunk, nots[1].inputs[0])
+    b2, _ = c.connect(b1, nots[2].inputs[0])
+    b3, _ = c.connect(b2, nots[3].inputs[0])  # four deep
+    other, _ = c.connect(nots[4].outputs[0], nots[5].inputs[0])
+    c.remove_wire(b3)  # (a dead wire's slot is never found again)
+    for start in ([trunk], [b1], [b2], [other], [b1, other]):
+        want = sorted(w.slot for w in [*start, *c.descendants(*start)])
+        got = c.with_descendants(np.array([w.slot for w in start])).tolist()
+        assert got == want
+
+
 def test_replacing_input_wire_cannot_saw_off_own_branch():
     c = Circuit()
     a, n1 = c.add_part("IN"), c.add_part("NOT")
@@ -196,6 +212,7 @@ def test_merge_splices_branch_onto_trunk():
     assert c.attachments(trunk) == [twig] and c.attachments(branch) == []
     assert c.wires_at(n2.inputs[0]) == [trunk] and c.wires_at(n1.inputs[0]) == []
     assert c.descendants(trunk) == [twig]
+    assert c.with_descendants(np.array([trunk.slot])).tolist() == [trunk.slot, twig.slot]
     a.outputs[0].state = True
     settle(c)
     assert (

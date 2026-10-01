@@ -11,6 +11,8 @@ from __future__ import annotations
 import gc
 import itertools
 import math
+import operator
+from array import array
 from collections.abc import Mapping
 from contextlib import contextmanager
 from types import MappingProxyType
@@ -612,137 +614,310 @@ class Box:
             edge.delete()
 
 
-class PartView:
-    """A part on the board: where it is, and its shapes as slots in the canvas's
-    instance buffers (body, pin dots, pin tag backings) plus its text labels. Slotted,
-    with no object per shape: a big board has hundreds of thousands of these."""
+class PartTable:
+    """Every part view's data, as columns with a row per view (see WireTable, the same
+    idea): position, size, flags, its body's slot, and which pins are its. Per pin, by
+    the circuit's pin slot: whose view it is, its side and offset, its dot's slot -- so
+    where every pin of a selection is, is one array expression (Editor.refresh_wires).
+    The labels are still objects (SDFLabel), held in object columns.
 
-    __slots__ = (
-        "part",
-        "seq",
-        "index",
-        "x",
-        "y",
-        "w",
-        "h",
-        "title",
-        "title_size",
-        "look",
-        "canvas",
-        "layers",
-        "text",
-        "opacity",
-        "lifted",
-        "_selected",
-        "_tints",
-        "body_tint",
-        "body",
-        "dots",
-        "kind_text",
-        "_name",
-        "pin_tags",
-    )
+    Rows aren't reused, as in WireTable."""
 
     def __init__(
-        self,
-        part: Part,
-        x: float,
-        y: float,
-        canvas: Canvas,
-        layers: Layers,
-        text: SDFText,
-        pin_labels: bool = True,
-        index: SpatialIndex | None = None,
+        self, canvas: Canvas, layers: Layers, text: SDFText, index: SpatialIndex | None
     ) -> None:
-        """`index`: where to register for hit testing; kept up to date as it moves."""
-        self._init(part, x, y, canvas, layers, text, index)
+        self.canvas, self.layers, self.text, self.index = canvas, layers, text, index
+        self.n = 0
+        cap = 1024
+        # (_xyb, _intsb, ...: the same memory as Python arrays, see _buffered)
+        self._xyb, self.xy = _buffered("d", 2, cap)
+        self._intsb, self.ints = _buffered("B", 1, cap)  # bits: x / y were given as ints
+        self._whb, self.wh = _buffered("i", 2, cap)  # (always whole: see _fill_part_rows)
+        self.body = np.full(cap, -1, np.int32)
+        self.flags = np.zeros(cap, np.uint8)  # SELECTED, LIFTED
+        self.opacity = np.full(cap, 255, np.uint8)
+        self.seq = np.zeros(cap, np.int64)
+        # its pins' slots: pin0, pin0 + 1, ... npin of them; or pin0 = -1 and `pinslots`
+        # (a part whose pins weren't made one after another: macros can be)
+        self.pin0 = np.zeros(cap, np.int32)
+        self.npin = np.zeros(cap, np.int32)
+        # objects, None meaning the usual: title text, the kind label, the user's label
+        # (made on first use), pin tags ((backing slot, label) per pin, while shown),
+        # pin tints, body tint, pin slots (see pin0)
+        self.title = np.full(cap, None, object)
+        self.kind_text = np.full(cap, None, object)
+        self.name = np.full(cap, None, object)
+        self.pin_tags = np.full(cap, None, object)
+        self.tints = np.full(cap, None, object)
+        self.body_tint = np.full(cap, None, object)
+        self.pinslots = np.full(cap, None, object)
+        # by pin slot
+        self.pin_row = np.full(cap, -1, np.int32)
+        self.pin_out = np.zeros(cap, bool)
+        # from the body's middle (see PartView.pin_pos)
+        self._pin_dyb, self.pin_dy = _buffered("d", 1, cap)
+        self.pin_dot = np.full(cap, -1, np.int32)
+
+    _COLS = (
+        "xy", "ints", "wh", "body", "flags", "opacity", "seq", "pin0", "npin",
+        "title", "kind_text", "name", "pin_tags", "tints", "body_tint", "pinslots",
+    )  # fmt: skip
+    _PIN_COLS = ("pin_row", "pin_out", "pin_dy", "pin_dot")
+    _FILL = {"body": -1, "opacity": 255, "pin_row": -1, "pin_dot": -1}
+    _BUFFERED = {"xy": ("d", 2), "ints": ("B", 1), "wh": ("i", 2), "pin_dy": ("d", 1)}
+
+    def _grow(self, names: tuple, n: int) -> None:
+        for name in names:
+            old = getattr(self, name)
+            if name in self._BUFFERED:
+                buf, view = _buffered(*self._BUFFERED[name], n, old)
+                setattr(self, f"_{name}b", buf)
+                setattr(self, name, view)
+                continue
+            fill = None if old.dtype == object else self._FILL.get(name, 0)
+            new = np.full((n, *old.shape[1:]), fill, old.dtype)
+            new[: len(old)] = old
+            setattr(self, name, new)
+
+    def new_rows(self, k: int) -> range:
+        cap = len(self.seq)
+        if self.n + k > cap:
+            while self.n + k > cap:
+                cap *= 2
+            self._grow(self._COLS, cap)
+        rows = range(self.n, self.n + k)
+        self.n += k
+        return rows
+
+    def pin_room(self, top: int) -> None:
+        """Pin columns long enough for pin slots below `top`."""
+        cap = len(self.pin_row)
+        if top > cap:
+            while top > cap:
+                cap *= 2
+            self._grow(self._PIN_COLS, cap)
+
+    def forget(self, rows: np.ndarray) -> None:
+        """Dead views' rows (their shapes are freed already): let go of what they hold."""
+        pins = self.pins_of(rows)
+        self.pin_row[pins] = -1
+        self.pin_dot[pins] = -1
+        self.body[rows] = -1
+        self.flags[rows] = 0
+        self.npin[rows] = 0
+        self.pin0[rows] = 0
+        for col in (
+            self.title, self.kind_text, self.name, self.pin_tags,
+            self.tints, self.body_tint, self.pinslots,
+        ):  # fmt: skip
+            col[rows] = None
+
+    # ---- one row -----------------------------------------------------------------
+
+    def coord(self, row: int, k: int) -> float:
+        """x (k = 0) or y (1), as it was given (an int stays an int)."""
+        v = self._xyb[2 * row + k]
+        return int(v) if self._intsb[row] >> k & 1 else v
+
+    def pos(self, row: int) -> Point:
+        """(x, y), as given."""
+        xy = self._xyb
+        x, y = xy[2 * row], xy[2 * row + 1]
+        b = self._intsb[row]
+        if b:
+            x, y = (int(x) if b & 1 else x), (int(y) if b & 2 else y)
+        return x, y
+
+    def set_coord(self, row: int, k: int, v: float) -> None:
+        self._xyb[2 * row + k] = v
+        bit = 1 << k
+        self._intsb[row] = (self._intsb[row] & ~bit) | (bit if type(v) is int else 0)
+
+    def pin_slots(self, row: int) -> np.ndarray:
+        p0 = int(self.pin0[row])
+        if p0 >= 0:
+            return np.arange(p0, p0 + int(self.npin[row]))
+        return self.pinslots[row]
+
+    def pins_of(self, rows: np.ndarray) -> np.ndarray:
+        """The pin slots of many views (each view's in order, the views in no set order)."""
+        p0, k = self.pin0[rows], self.npin[rows]
+        run = p0 >= 0
+        p0, k = p0[run].astype(np.intp), k[run].astype(np.intp)
+        total = int(k.sum())
+        out = np.repeat(p0 - (np.cumsum(k) - k), k) + np.arange(total)
+        more = [self.pinslots[r] for r in rows[~run].tolist()]
+        return np.concatenate((out, *more)) if more else out
+
+    def pin_xy(self, pins: np.ndarray) -> np.ndarray:
+        """Where these pins are (n x 2): PartView.pin_pos for each, in the same arithmetic."""
+        row = self.pin_row[pins]
+        x, y = self.xy[row, 0], self.xy[row, 1]
+        w, h = self.wh[row, 0], self.wh[row, 1]
+        px = np.where(self.pin_out[pins], x + w, x)
+        py = y + h / 2 + self.pin_dy[pins]
+        return np.column_stack((px, py))
+
+
+class PartView:
+    """A part on the board: where it is, and its shapes as slots in the canvas's
+    instance buffers (body, pin dots, pin tag backings) plus its text labels.
+
+    A handle: what it knows is a row of its PartTable (the part itself aside)."""
+
+    __slots__ = ("part", "row", "table")
+
+    def __init__(
+        self, part: Part, x: float, y: float, table: PartTable, pin_labels: bool = True
+    ) -> None:
+        self.part, self.table, self.row = part, table, table.new_rows(1)[0]
+        _fill_part_rows([self], [(part, x, y)])
         _make_part_shapes([self], pin_labels)
 
     @classmethod
     def many(
         cls,
         placed: list[tuple[Part, float, float]],
-        canvas: Canvas,
-        layers: Layers,
-        text: SDFText,
+        table: PartTable,
         pin_labels: bool = True,
-        index: SpatialIndex | None = None,
     ) -> list[PartView]:
         """A view for each (part, x, y): the same as making them one by one, in order, but
         their shapes are made all at once (undo, loading, pasting thousands of parts)."""
         views = []
-        for part, x, y in placed:
+        for (part, _, _), row in zip(placed, table.new_rows(len(placed))):
             view = cls.__new__(cls)
-            view._init(part, x, y, canvas, layers, text, index)
+            view.part, view.table, view.row = part, table, row
             views.append(view)
+        _fill_part_rows(views, placed)
         _make_part_shapes(views, pin_labels)
         return views
 
-    def _init(
-        self,
-        part: Part,
-        x: float,
-        y: float,
-        canvas: Canvas,
-        layers: Layers,
-        text: SDFText,
-        index: SpatialIndex | None,
-    ) -> None:
-        """Everything but the shapes (see _make_part_shapes)."""
-        self.part = part
-        self.seq = next(_seq)
-        self.index = index
-        self.x, self.y = x, y
-        self.text = text
-        self.look = look = part.type.look
-        title = part.type.title or part.kind
-        title_size = T.IO_TITLE_SIZE if look.narrow else T.TITLE_SIZE
-        n = max(len(part.inputs), len(part.outputs), 1)
-        self.w = T.IO_WIDTH if look.narrow else T.PART_WIDTH
-        if not look.narrow:  # long titles (macro names) widen the body, in grid steps
-            need = text.measure(title, title_size) + 2 * T.TITLE_PAD
-            self.w = max(self.w, math.ceil(need / (2 * T.GRID)) * 2 * T.GRID)
-        self.h = (n + 1) * T.PIN_SPACING  # multiple of GRID, see theme.py
-        self.title, self.title_size = title, title_size
-        self.canvas, self.layers = canvas, layers
-        # (tag backing slot, SDF label) per pin, while shown (see set_pin_labels)
-        self.pin_tags: list | tuple = ()
-        self.opacity = 255
-        self.lifted = (
-            False  # being dragged: drawn at the canvas's offset (see set_lifted)
-        )
-        # Selected: the body's `sel` flag, drawn as a ring around it (see select_many).
-        self._selected = False
-        self._tints: list[Rgb | None] | None = None  # see pin_tints
-        self.body_tint: Rgb | None = None  # hue for a lit body (switches, LEDs)
-        # Made by _make_part_shapes: slots in the bodies (RECT) and pins (DOT) buffers,
-        # the title, and the user's label (made when it first has text: see `name`)
-        self.body: int = -1
-        self.dots: tuple[int, ...] = ()
-        self.kind_text: SDFLabel
-        self._name: SDFLabel | None = None
+    # ---- what's in the row ----------------------------------------------------
+
+    @property
+    def x(self) -> float:
+        return self.table.coord(self.row, 0)
+
+    @x.setter
+    def x(self, v: float) -> None:
+        self.table.set_coord(self.row, 0, v)
+
+    @property
+    def y(self) -> float:
+        return self.table.coord(self.row, 1)
+
+    @y.setter
+    def y(self, v: float) -> None:
+        self.table.set_coord(self.row, 1, v)
+
+    @property
+    def w(self) -> int:
+        return self.table._whb[2 * self.row]
+
+    @property
+    def h(self) -> int:
+        return self.table._whb[2 * self.row + 1]
+
+    @property
+    def seq(self) -> int:
+        return int(self.table.seq[self.row])
+
+    @property
+    def index(self) -> SpatialIndex | None:
+        return self.table.index
+
+    @property
+    def canvas(self) -> Canvas:
+        return self.table.canvas
+
+    @property
+    def layers(self) -> Layers:
+        return self.table.layers
+
+    @property
+    def text(self) -> SDFText:
+        return self.table.text
+
+    @property
+    def look(self):
+        return self.part.type.look
+
+    @property
+    def title(self) -> str:
+        return self.table.title[self.row]
+
+    @property
+    def title_size(self) -> float:
+        return T.IO_TITLE_SIZE if self.look.narrow else T.TITLE_SIZE
+
+    @property
+    def opacity(self) -> int:
+        return int(self.table.opacity[self.row])
+
+    @property
+    def lifted(self) -> bool:
+        """Being dragged: drawn at the canvas's offset (see set_lifted)."""
+        return bool(self.table.flags[self.row] & LIFTED)
+
+    @property
+    def selected(self) -> bool:
+        """The body's `sel` flag, drawn as a ring around it (see select_many)."""
+        return bool(self.table.flags[self.row] & SELECTED)
+
+    @property
+    def body(self) -> int:
+        """Its slot in the bodies (RECT) buffer."""
+        return int(self.table.body[self.row])
+
+    @property
+    def dots(self) -> tuple[int, ...]:
+        """Its pins' slots in the pins (DOT) buffer, in part.pins order."""
+        t = self.table
+        return tuple(t.pin_dot[t.pin_slots(self.row)].tolist())
+
+    @property
+    def kind_text(self) -> SDFLabel:
+        return self.table.kind_text[self.row]
+
+    @property
+    def _name(self) -> SDFLabel | None:
+        return self.table.name[self.row]
+
+    @property
+    def pin_tags(self) -> list | tuple:
+        """(tag backing slot, SDF label) per pin, while shown (see set_pin_labels)."""
+        return self.table.pin_tags[self.row] or ()
+
+    @property
+    def body_tint(self) -> Rgb | None:
+        """Hue for a lit body (switches, LEDs)."""
+        return self.table.body_tint[self.row]
+
+    # ---- labels -------------------------------------------------------------
 
     @property
     def name(self) -> SDFLabel:
         """The label showing the user's name for the part (part.label)."""
-        if self._name is None:  # (empty, as it would have been made: see refresh_name)
-            self._name = SDFLabel(
-                self.text,
+        t, row = self.table, self.row
+        if t.name[row] is None:  # (empty, as it would have been made: see refresh_name)
+            label = t.name[row] = SDFLabel(
+                t.text,
                 "",
                 *self.name_pos(),
                 T.LABEL_SIZE,
                 (*T.LABEL_TEXT[:3], self.opacity),
                 _label_anchor(self.look),
             )
-            self._name.lifted = self.lifted
-        return self._name
+            label.lifted = self.lifted
+        return t.name[row]
 
     @property
     def pin_tints(self) -> list[Rgb | None]:
         """Hue for each lit pin (paint.py)."""
-        if self._tints is None:
+        tints = self.table.tints[self.row]
+        if tints is None:
             return [None] * (len(self.part.inputs) + len(self.part.outputs))
-        return self._tints
+        return tints
 
     @property
     def pin_labels_shown(self) -> bool:
@@ -759,7 +934,7 @@ class PartView:
             for bg, label in self.pin_tags:
                 buf.free(bg)
                 label.delete()
-        self.pin_tags = ()
+        self.table.pin_tags[self.row] = None
         if on:
             _make_pin_tags([(self, self.text.labels(self._tag_specs()))])
 
@@ -792,58 +967,53 @@ class PartView:
             label.move_to(*self._tag_at(pin))
             _set_rect(buf, bg, _tag_backing(label, pin))
 
-    @property
-    def selected(self) -> bool:
-        return self._selected
-
     def set_selected(self, on: bool) -> None:
         select_many([self], [], on)
 
     def intersects(self, x0: float, y0: float, x1: float, y1: float) -> bool:
         """Does the body overlap the world-space rectangle (x0, y0)-(x1, y1)?"""
-        return (
-            self.x <= x1
-            and x0 <= self.x + self.w
-            and self.y <= y1
-            and y0 <= self.y + self.h
-        )
+        x, y = self.x, self.y
+        return x <= x1 and x0 <= x + self.w and y <= y1 and y0 <= y + self.h
 
     # ---- geometry --------------------------------------------------------
 
     def pin_pos(self, pin: Pin) -> Point:
-        side = self.part.inputs if pin.is_input else self.part.outputs
-        n = len(side)
-        px = self.x if pin.is_input else self.x + self.w
-        # index 0 at the top, pins centered vertically
-        py = self.y + self.h / 2 + ((n - 1) / 2 - pin.index) * T.PIN_SPACING
-        return px, py
+        t, row = self.table, self.row
+        x, y = t.pos(row)
+        wh = t._whb
+        px = x if pin.is_input else x + wh[2 * row]
+        # index 0 at the top, pins centered vertically: pin_dy is
+        # ((n - 1) / 2 - pin.index) * T.PIN_SPACING, n the pins on its side
+        # (PartTable.pin_xy: the same, in bulk)
+        return px, y + wh[2 * row + 1] / 2 + t._pin_dyb[pin.slot]
 
     def move_to(self, x: float, y: float) -> None:
         self.x, self.y = x, y
         Touched.parts.add(self.part.uid)
         bodies = self.canvas.buffer(RECT, self.layers.bodies)
-        bodies.f["rect"][self.body, :2] = (x, y)
-        bodies.mark(self.body)
+        body = self.body
+        bodies.f["rect"][body, :2] = (x, y)
+        bodies.mark(body)
         self.kind_text.move_to(x + self.w / 2, y + self.h / 2)
         if self._name is not None:
             self._name.move_to(*self.name_pos())
-        if self.dots:
+        dots = self.dots
+        if dots:
             buf = self.canvas.buffer(DOT, self.layers.pins)
             center = buf.f["center"]
-            for dot, pin in zip(self.dots, self.part.pins):
+            for dot, pin in zip(dots, self.part.pins):
                 center[dot] = self.pin_pos(pin)
                 buf.mark(dot)
         self._place_pin_tags()
         self._register()
 
     def name_pos(self) -> Point:
+        x, y, w, h = self.x, self.y, self.w, self.h
         if self.look.label == "left":
-            return self.x - T.LABEL_GAP, self.y + self.h / 2
+            return x - T.LABEL_GAP, y + h / 2
         if self.look.label == "right":
-            return self.x + self.w + T.LABEL_GAP, self.y + self.h / 2
-        return self.x + self.w / 2, self.y - T.LABEL_GAP - self.text.cap_height(
-            T.LABEL_SIZE
-        ) / 2
+            return x + w + T.LABEL_GAP, y + h / 2
+        return x + w / 2, y - T.LABEL_GAP - self.text.cap_height(T.LABEL_SIZE) / 2
 
     def refresh_name(self) -> None:
         """Show part.label (after it was edited)."""
@@ -852,12 +1022,14 @@ class PartView:
             self.name.set_text(self.part.label)
 
     def contains(self, wx: float, wy: float) -> bool:
-        return self.x <= wx <= self.x + self.w and self.y <= wy <= self.y + self.h
+        x, y = self.x, self.y
+        return x <= wx <= x + self.w and y <= wy <= y + self.h
 
     def distance_to(self, wx: float, wy: float) -> float:
         """From the body's edge (0 inside)."""
-        dx = max(self.x - wx, 0.0, wx - self.x - self.w)
-        dy = max(self.y - wy, 0.0, wy - self.y - self.h)
+        x, y = self.x, self.y
+        dx = max(x - wx, 0.0, wx - x - self.w)
+        dy = max(y - wy, 0.0, wy - y - self.h)
         return math.hypot(dx, dy)
 
     def pin_at(self, wx: float, wy: float, slop: float) -> Pin | None:
@@ -881,11 +1053,13 @@ class PartView:
     def _index_box(self) -> tuple[float, float, float, float]:
         """What the spatial index knows it by: the body, and the pins sticking out of its sides."""
         r = T.PIN_RADIUS
-        return self.x - r, self.y, self.x + self.w + r, self.y + self.h
+        x, y = self.x, self.y
+        return x - r, y, x + self.w + r, y + self.h
 
     def set_ghost(self, ghost: bool) -> None:
         """Semi-transparent while being carried around before placement."""
-        a = self.opacity = T.GHOST_OPACITY if ghost else 255
+        a = T.GHOST_OPACITY if ghost else 255
+        self.table.opacity[self.row] = a
         _set_opacity(self.canvas.buffer(RECT, self.layers.bodies), self.body, a)
         self.kind_text.opacity = a
         if self._name is not None:
@@ -895,23 +1069,26 @@ class PartView:
             for bg, label in self.pin_tags:
                 label.opacity = a
                 _set_opacity(tags, bg, a)  # (multiplies the backing's own alpha)
-        if self.dots:
+        dots = self.dots
+        if dots:
             pins = self.canvas.buffer(DOT, self.layers.pins)
-            for dot in self.dots:
+            for dot in dots:
                 _set_opacity(pins, dot, a)
 
     def set_tints(self, pins: list[Rgb | None], body: Rgb | None) -> None:
         if pins == self.pin_tints and body == self.body_tint:
             return
-        self._tints = None if all(t is None for t in pins) else pins
-        self.body_tint = body
+        t, row = self.table, self.row
+        t.tints[row] = None if all(c is None for c in pins) else pins
+        t.body_tint[row] = body
         self._recolor()
 
     def _recolor(self) -> None:
         """Both colors of every pin (and of a lit body), per the tints."""
-        if self.dots:
+        dots = self.dots
+        if dots:
             buf = self.canvas.buffer(DOT, self.layers.pins)
-            for dot, tint in zip(self.dots, self.pin_tints):
+            for dot, tint in zip(dots, self.pin_tints):
                 _set_dot_colors(buf, dot, T.PIN_OFF, with_hue(T.PIN_ON, tint))
         if self.look.lit:
             off, on = (
@@ -920,12 +1097,64 @@ class PartView:
             )
             buf = self.canvas.buffer(RECT, self.layers.bodies)
             f = buf.f
-            f["fill"][self.body], f["edge"][self.body] = _rgba(off[0]), _rgba(off[1])
-            f["fill_on"][self.body], f["edge_on"][self.body] = _rgba(on[0]), _rgba(on[1])
-            buf.mark(self.body)
+            body = self.body
+            f["fill"][body], f["edge"][body] = _rgba(off[0]), _rgba(off[1])
+            f["fill_on"][body], f["edge_on"][body] = _rgba(on[0]), _rgba(on[1])
+            buf.mark(body)
 
     def delete(self) -> None:
         delete_views([self], [])
+
+
+def _fill_part_rows(views: list[PartView], placed: list[tuple]) -> None:
+    """New views' rows (consecutive), from their (part, x, y): everything but the
+    shapes (see _make_part_shapes)."""
+    if not views:
+        return
+    t, n = views[0].table, len(views)
+    rows = slice(views[0].row, views[0].row + n)
+    text = t.text
+    t.seq[rows] = list(itertools.islice(_seq, n))
+    t.xy[rows] = np.fromiter(
+        itertools.chain.from_iterable((x, y) for _, x, y in placed), np.float64, 2 * n
+    ).reshape(n, 2)
+    t.ints[rows] = [(type(x) is int) | (type(y) is int) << 1 for _, x, y in placed]
+    by_type: dict[tuple, tuple] = {}  # (type, pins a side) -> (w, h, title)
+    wh, titles, pins = [], [], []
+    for part, _, _ in placed:
+        ins, outs = part.inputs, part.outputs
+        key = (id(part.type), part.kind, len(ins), len(outs))
+        made = by_type.get(key)
+        if made is None:
+            look = part.type.look
+            title = part.type.title or part.kind
+            w = T.IO_WIDTH if look.narrow else T.PART_WIDTH
+            if not look.narrow:  # long titles (macro names) widen the body, in grid steps
+                need = text.measure(title, T.TITLE_SIZE) + 2 * T.TITLE_PAD
+                w = max(w, math.ceil(need / (2 * T.GRID)) * 2 * T.GRID)
+            n_pins = max(len(ins), len(outs), 1)
+            made = by_type[key] = (w, (n_pins + 1) * T.PIN_SPACING, title)  # (see theme.py)
+        wh.append(made[:2])
+        titles.append(made[2])
+        pins.append(part.pins)
+    t.wh[rows] = wh
+    t.title[rows] = titles
+    # pins: a run of slots each, as plain parts' are made (pin0, npin); else listed
+    counts = np.fromiter(map(len, pins), np.intp, n)
+    slots = np.fromiter((p.slot for ps in pins for p in ps), np.intp, int(counts.sum()))
+    starts = np.cumsum(counts) - counts
+    first = np.zeros(n, np.intp)
+    has = counts > 0
+    first[has] = slots[starts[has]]
+    # each pin's slot minus where it would be in a run from its part's first: 0 in a run
+    off = slots - np.repeat(first - starts, counts) - np.arange(len(slots))
+    run = np.ones(n, bool)
+    run[np.repeat(np.arange(n), counts)[off != 0]] = False
+    t.pin0[rows] = np.where(run, first, -1)
+    t.npin[rows] = counts
+    for i in np.flatnonzero(~run).tolist():  # (macros' pins can be made apart)
+        t.pinslots[rows.start + i] = slots[starts[i] : starts[i] + counts[i]]
+    t.pin_room(int(slots.max()) + 1 if len(slots) else 0)
 
 
 def _label_anchor(look) -> str:
@@ -934,6 +1163,20 @@ def _label_anchor(look) -> str:
 
 
 SELECTED, LIFTED = 1, 2  # WireTable.flags
+
+
+def _buffered(code: str, width: int, n: int, old: np.ndarray | None = None):
+    """A column whose memory is a Python array ("d" float64, "i" int32, "B" uint8):
+    (the array, a numpy view of it, n x width). Whole-column work goes through the
+    view; one item at a time, indexing the array is several times quicker than numpy
+    (the per-part reads: positions, pin positions)."""
+    buf = bytearray(n) if code == "B" else array(code, [0]) * (n * width)
+    view = np.frombuffer(buf, {"d": np.float64, "i": np.int32, "B": np.uint8}[code])
+    if width > 1:
+        view = view.reshape(n, width)
+    if old is not None:
+        view[: len(old)] = old
+    return buf, view
 
 
 class WireTable:
@@ -952,8 +1195,10 @@ class WireTable:
         self._buf = None
         self.n = 0  # rows handed out
         cap = 1024
-        self.xy = np.zeros((cap, 4))  # src x, y, dst x, y
-        self.ints = np.zeros(cap, np.uint8)  # bits: which of those were given as ints
+        # src x, y, dst x, y; bits: which of those were given as ints (_xyb, _intsb:
+        # the same memory as Python arrays, see _buffered)
+        self._xyb, self.xy = _buffered("d", 4, cap)
+        self._intsb, self.ints = _buffered("B", 1, cap)
         self.seg = np.full(cap, -1, np.int32)  # the line's segment, when it has one
         self.dot = np.full((cap, 2), -1, np.int32)  # junction dot on src / dst end
         self.flags = np.zeros(cap, np.uint8)  # SELECTED, LIFTED
@@ -969,6 +1214,7 @@ class WireTable:
         self.stops = np.full(cap, None, object)
         self.lstops = np.full(cap, None, object)
         self.pair = np.full(cap, None, object)
+        self.row_of = np.full(cap, -1, np.int32)  # by circuit wire slot: its view's row
         # row -> [layout key, fractions per vertex, colors per stops] (see _layout), for
         # the lines laid out for a gradient; the rest are a segment per pair of points
         self.grad: dict[int, list] = {}
@@ -989,6 +1235,11 @@ class WireTable:
             n = len(self.seg)
             for name in self._COLS:
                 old = getattr(self, name)
+                if name in ("xy", "ints"):
+                    buf, view = _buffered("d" if name == "xy" else "B", old.shape[1] if old.ndim > 1 else 1, 2 * n, old)
+                    setattr(self, f"_{name}b", buf)
+                    setattr(self, name, view)
+                    continue
                 fill = {"seg": -1, "dot": -1, "opacity": 255, "wslot": -1}.get(name, 0)
                 new = np.full((2 * n, *old.shape[1:]), None if old.dtype == object else fill, old.dtype)
                 new[:n] = old
@@ -999,6 +1250,9 @@ class WireTable:
 
     def forget(self, rows: np.ndarray) -> None:
         """Dead views' rows (their shapes are freed already): let go of what they hold."""
+        wslot = self.wslot[rows]
+        mine = self.row_of[wslot] == rows  # (unless a newer view has its wire already)
+        self.row_of[wslot[mine]] = -1
         self.seg[rows] = -1
         self.dot[rows] = -1
         self.flags[rows] = 0
@@ -1011,16 +1265,19 @@ class WireTable:
 
     def end(self, row: int, k: int) -> Point:
         """The src (k = 0) or dst (1) end, as it was given (ints stay ints)."""
-        x, y = self.xy[row, 2 * k : 2 * k + 2].tolist()
-        bits = int(self.ints[row]) >> (2 * k)
+        i = 4 * row + 2 * k
+        xy = self._xyb
+        x, y = xy[i], xy[i + 1]
+        bits = self._intsb[row] >> (2 * k)
         if bits & 3:
             x, y = (int(x) if bits & 1 else x), (int(y) if bits & 2 else y)
         return x, y
 
     def set_end(self, row: int, k: int, p: Point) -> None:
         x, y = p
-        self.xy[row, 2 * k], self.xy[row, 2 * k + 1] = x, y
-        self.ints[row] = (int(self.ints[row]) & ~(3 << 2 * k)) | _int_bits(x, y, k)
+        i = 4 * row + 2 * k
+        self._xyb[i], self._xyb[i + 1] = x, y
+        self._intsb[row] = (self._intsb[row] & ~(3 << 2 * k)) | _int_bits(x, y, k)
 
     def points(self, row: int) -> list[Point]:
         b = self.bends[row]
@@ -1134,7 +1391,13 @@ def _fill_rows(views: list[WireView], specs: list[tuple]) -> None:
     t, n = views[0].table, len(views)
     rows = slice(views[0].row, views[0].row + n)
     t.seq[rows] = list(itertools.islice(_seq, n))
-    t.wslot[rows] = np.fromiter((w.slot for w, *_ in specs), np.int64, n)
+    wslot = np.fromiter((w.slot for w, *_ in specs), np.intp, n)
+    t.wslot[rows] = wslot
+    if wslot.max() >= len(t.row_of):
+        grown = np.full(2 * int(wslot.max()) + 2, -1, np.int32)
+        grown[: len(t.row_of)] = t.row_of
+        t.row_of = grown
+    t.row_of[wslot] = np.arange(rows.start, rows.stop)
     ends = [(*src, *dst) for _, src, _, dst, _ in specs]
     t.xy[rows] = np.fromiter(itertools.chain.from_iterable(ends), np.float64, 4 * n).reshape(n, 4)
     t.ints[rows] = [
@@ -1247,7 +1510,8 @@ class WireView:
 
     def set_ends(self, src: Point, dst: Point) -> None:
         t = self.table
-        if t.xy[self.row].tolist() == [*src, *dst]:
+        i = 4 * self.row
+        if t._xyb[i : i + 4].tolist() == [*src, *dst]:
             return  # (re-attaching after a move often lands exactly where it was)
         t.set_end(self.row, 0, src)
         t.set_end(self.row, 1, dst)
@@ -1381,13 +1645,12 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
     theirs), in the same arithmetic as pin_pos / name_pos."""
     if not views:
         return
-    v0 = views[0]
-    canvas, layers, text = v0.canvas, v0.layers, v0.text
+    t = views[0].table
+    canvas, layers, text = t.canvas, t.layers, t.text
     n = len(views)
-    xs = np.fromiter((v.x for v in views), np.float64, n)
-    ys = np.fromiter((v.y for v in views), np.float64, n)
-    ws = np.fromiter((v.w for v in views), np.float64, n)
-    hs = np.fromiter((v.h for v in views), np.float64, n)
+    rows = _rows_of(views)
+    xs, ys = t.xy[rows, 0], t.xy[rows, 1]
+    ws, hs = t.wh[rows, 0].astype(np.float64), t.wh[rows, 1].astype(np.float64)
     # pins: per view, how many and where they start in the flat list
     pins = [v.part.pins for v in views]
     flat = [p for ps in pins for p in ps]
@@ -1398,14 +1661,12 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
     # what each view's look decides, and the pin layout of each (look, pins, size)
     looks: dict[int, tuple] = {}
     group_of: dict[tuple, list[int]] = {}
-    for i, v in enumerate(views):
+    for i, (v, w, h) in enumerate(zip(views, ws.tolist(), hs.tolist())):
         look = v.look
         if id(look) not in looks:
             looks[id(look)] = _look_data(look)
         part = v.part
-        group_of.setdefault(
-            (id(look), len(part.inputs), len(part.outputs), v.w, v.h), []
-        ).append(i)
+        group_of.setdefault((id(look), len(part.inputs), len(part.outputs), w, h), []).append(i)
     is_out = np.zeros(len(flat), bool)
     pin_dy = np.zeros(len(flat))  # from the body's middle (see pin_pos)
     lit = np.zeros(n, bool)
@@ -1447,9 +1708,9 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
             specs += v._tag_specs()
     labels = iter(text.labels(specs))
     for v, ps in zip(views, pins):
-        v.kind_text = next(labels)
+        t.kind_text[v.row] = next(labels)
         if v.part.label:
-            v._name = next(labels)
+            t.name[v.row] = next(labels)
         if pin_labels and v.look.pin_labels:
             tagged.append((v, [next(labels) for _ in ps]))
     _make_pin_tags(tagged)
@@ -1473,8 +1734,7 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
     f["lift"][slots] = 0.0
     buf.mark_many(slots)
     buf.show_pins(slots, first_pin)  # lit bodies follow their first pin (switches, LEDs)
-    for v, body in zip(views, slots.tolist()):
-        v.body = body
+    t.body[rows] = slots
     # pin dots
     buf = canvas.buffer(DOT, layers.pins)
     slots = buf.alloc_many(len(flat))
@@ -1495,18 +1755,14 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
         f["lift"][slots] = 0.0
         buf.mark_many(slots)
         buf.show_pins(slots, pin_slots)
-    dots = slots.tolist()
-    for v, k, c in zip(views, starts.tolist(), counts.tolist()):
-        v.dots = tuple(dots[k : k + c])
+    t.pin_dot[pin_slots] = slots
+    t.pin_row[pin_slots] = np.repeat(rows, counts)
+    t.pin_out[pin_slots] = is_out
+    t.pin_dy[pin_slots] = pin_dy
     # the spatial index: the body, and the pins sticking out of its sides (_index_box)
-    r = T.PIN_RADIUS
-    boxes = np.column_stack((xs - r, ys, (xs + ws) + r, ys + hs))
-    by_index: dict[int, tuple] = {}
-    for i, v in enumerate(views):
-        if v.index is not None:
-            by_index.setdefault(id(v.index), (v.index, []))[1].append(i)
-    for index, members in by_index.values():
-        index.put_boxes([views[i] for i in members], boxes[members])
+    if t.index is not None:
+        r = T.PIN_RADIUS
+        t.index.put_boxes(views, np.column_stack((xs - r, ys, (xs + ws) + r, ys + hs)))
     Touched.part_many(
         v.part.uid for v in views
     )  # new: its own color (props) needs painting
@@ -1571,7 +1827,7 @@ def _make_pin_tags(made: list[tuple[PartView, list[SDFLabel]]]) -> None:
     buf.mark_many(slots)
     backings = iter(slots.tolist())
     for v, labels in made:
-        v.pin_tags = [(next(backings), label) for label in labels]
+        v.table.pin_tags[v.row] = [(next(backings), label) for label in labels]
         if v.lifted:
             for label in labels:
                 label.lifted = True
@@ -1676,30 +1932,43 @@ class _Slots:
         if labels:
             self._add(labels[0].buf, np.concatenate([label.slots for label in labels]))
 
-    def lines(self, views: list[WireView]) -> None:
+    def lines(self, views: list[WireView], rows=None) -> None:
         """Their lines' segments."""
         if views:
             t = views[0].table
-            self._add(t.buf, t.segments(_rows_of(views)))
+            self._add(t.buf, t.segments(_rows_of(views) if rows is None else rows))
 
-    def parts(self, views: list[PartView]) -> _Slots:
-        if not views:
-            return self
-        canvas, layers = views[0].canvas, views[0].layers
-        self.slots(canvas, RECT, layers.bodies, [v.body for v in views])
-        self.slots(canvas, DOT, layers.pins, [d for v in views for d in v.dots])
-        self.slots(canvas, RECT, layers.tags, [bg for v in views for bg, _ in v.pin_tags])
-        self.labels([v.kind_text for v in views if v.kind_text.slots.size])
-        self.labels(
-            [v._name for v in views if v._name is not None and v._name.slots.size]
-        )
-        self.labels([label for v in views for _, label in v.pin_tags])
-        return self
-
-    def wires(self, views: list[WireView]) -> _Slots:
+    def bodies(self, views: list[PartView], rows=None) -> None:
         if views:
             t = views[0].table
-            rows = _rows_of(views)
+            body = t.body[_rows_of(views) if rows is None else rows]
+            self.array(t.canvas, RECT, t.layers.bodies, body[body >= 0])
+
+    def array(self, canvas: Canvas, kind, layer, slots: np.ndarray) -> None:
+        """slots(), from an array."""
+        if slots.size:
+            self._add(canvas.buffer(kind, layer), slots.astype(np.intp))
+
+    def parts(self, views: list[PartView], rows=None) -> _Slots:
+        if not views:
+            return self
+        t = views[0].table
+        canvas, layers = t.canvas, t.layers
+        rows = _rows_of(views) if rows is None else rows
+        self.bodies(views, rows)
+        dots = t.pin_dot[t.pins_of(rows)]
+        self.array(canvas, DOT, layers.pins, dots[dots >= 0])
+        tags = [tag for tags in t.pin_tags[rows].tolist() if tags for tag in tags]
+        self.slots(canvas, RECT, layers.tags, [bg for bg, _ in tags])
+        self.labels([k for k in t.kind_text[rows].tolist() if k is not None and k.slots.size])
+        self.labels([k for k in t.name[rows].tolist() if k is not None and k.slots.size])
+        self.labels([label for _, label in tags])
+        return self
+
+    def wires(self, views: list[WireView], rows=None) -> _Slots:
+        if views:
+            t = views[0].table
+            rows = _rows_of(views) if rows is None else rows
             self._add(t.buf, t.segments(rows))
             dots = t.dot[rows].ravel()
             self._add(t.buf, dots[dots >= 0])
@@ -1712,8 +1981,8 @@ class _Slots:
 
 def lift(parts: list[PartView], wires: list[WireView], on: bool) -> None:
     """set_lifted for many parts and wires at once."""
-    parts, wires = _lift_mirrors(parts, wires, on)
-    for buf, slots in _Slots().parts(parts).wires(wires):
+    parts, prows, wires, wrows = _lift_mirrors(parts, wires, on)
+    for buf, slots in _Slots().parts(parts, prows).wires(wires, wrows):
         buf.set_lift(slots, on)
 
 
@@ -1724,12 +1993,16 @@ def put_down(
     whole (bends and junction ends too, no new layout). Dropping a dragged selection;
     every shape is written once. (A rigid move changes no colors: not reported to
     paint.py. The caller re-attaches wires stretched between these and the rest.)"""
-    _lift_mirrors(parts, wires, False)
+    prows, wrows = _rows_of(parts), _rows_of(wires)
+    _lift_mirrors(parts, wires, False, prows, wrows)
     if dx or dy:
-        moved = (_move_part_mirrors(parts, dx, dy), _move_wire_mirrors(wires, dx, dy))
+        moved = (
+            _move_part_mirrors(parts, dx, dy, prows),
+            _move_wire_mirrors(wires, dx, dy, wrows),
+        )
         if moved[0] or moved[1]:
             Touched.moved.append((*moved, dx, dy))
-    for buf, slots in _Slots().parts(parts).wires(wires):
+    for buf, slots in _Slots().parts(parts, prows).wires(wires, wrows):
         buf.set_lift(slots, False)
         if dx or dy:
             buf.shift(slots, dx, dy)
@@ -1751,14 +2024,15 @@ def delete_views(parts: list[PartView], wires: list[WireView]) -> None:
         buf.free_many(slots)
     if wires:
         wires[0].table.forget(_rows_of(wires))
-    # the views are dead: they hold no slots any more (a second delete is a no-op)
-    for v in parts:
-        v.body, v.dots = -1, ()
-        v.kind_text.slots = NO_SLOTS
-        if v._name is not None:
-            v._name.slots = NO_SLOTS
-        v.pin_tags = ()
-        v._selected = False
+    if parts:
+        # the views are dead: they hold no slots any more (a second delete is a no-op)
+        t = parts[0].table
+        rows = _rows_of(parts)
+        for col in (t.kind_text, t.name):
+            for label in col[rows].tolist():
+                if label is not None:  # (whoever still has it, has an empty label)
+                    label.slots = NO_SLOTS
+        t.forget(rows)
 
 
 def select_many(parts: list[PartView], wires: list[WireView], on: bool) -> None:
@@ -1766,20 +2040,18 @@ def select_many(parts: list[PartView], wires: list[WireView], on: bool) -> None:
     themselves (`sel`: the body, the line's segments), which the canvas draws again as
     outlines and halos (see canvas.Echo, sdf_shapes.RECT_OUTLINE / SEGMENT_HALO): one
     write per buffer, and nothing to keep in step when they move, lift or go away."""
-    parts = [v for v in parts if v._selected != on]
-    wires = _flag_wires(wires, SELECTED, on)
+    parts, prows = _flag(parts, SELECTED, on)
+    wires, wrows = _flag(wires, SELECTED, on)
     if not (parts or wires):
         return
     value = 255 if on else 0
-    for v in parts:
-        v._selected = on
-    t = wires[0].table if wires else None
-    canvas, layers = (parts[0].canvas, parts[0].layers) if parts else (t.canvas, t.layers)
+    t = (parts or wires)[0].table
+    canvas, layers = t.canvas, t.layers
     canvas.echo(RECT_OUTLINE, layers.selection, RECT, layers.bodies)
     canvas.echo(SEGMENT_HALO, layers.wire_halo, SEGMENT, layers.wires)
     flagged = _Slots()
-    flagged.slots(canvas, RECT, layers.bodies, [v.body for v in parts])
-    flagged.lines(wires)
+    flagged.bodies(parts, prows)
+    flagged.lines(wires, wrows)
     for buf, slots in flagged:
         buf.f["sel"][slots, 0] = value
         buf.mark_many(slots)
@@ -1790,39 +2062,52 @@ def select_many(parts: list[PartView], wires: list[WireView], on: bool) -> None:
 
 
 def _lift_mirrors(
-    parts: list[PartView], wires: list[WireView], on: bool
-) -> tuple[list, list]:
-    """Mark them (un)lifted; returns the ones that weren't already."""
-    parts = [v for v in parts if v.lifted != on]
-    wires = _flag_wires(wires, LIFTED, on)
+    parts: list[PartView], wires: list[WireView], on: bool, prows=None, wrows=None
+) -> tuple[list, np.ndarray, list, np.ndarray]:
+    """Mark them (un)lifted; returns the ones that weren't already, and their rows."""
+    parts, prows = _flag(parts, LIFTED, on, prows)
+    wires, wrows = _flag(wires, LIFTED, on, wrows)
     value = 1.0 if on else 0.0
-    for v in parts:
-        v.lifted = on
-        v.kind_text._lift = value  # (what glyphs they get later start with)
-        if v._name is not None:
-            v._name._lift = value
-        for _, label in v.pin_tags:
-            label._lift = value
-    return parts, wires
+    for label in _labels(parts, prows):
+        label._lift = value  # (what glyphs they get later start with)
+    return parts, prows, wires, wrows
 
 
-def _rows_of(views: list[WireView]) -> np.ndarray:
-    return np.fromiter((v.row for v in views), np.intp, len(views))
-
-
-def _flag_wires(views: list[WireView], flag: int, on: bool) -> list[WireView]:
-    """Set or clear a WireTable flag on these; returns the ones it changed."""
+def _labels(views: list[PartView], rows=None) -> list[SDFLabel]:
+    """Every label of these views: titles, user labels, pin tags."""
     if not views:
-        return views
+        return []
     t = views[0].table
-    rows = _rows_of(views)
+    rows = _rows_of(views) if rows is None else rows
+    out = t.kind_text[rows].tolist()
+    out += [k for k in t.name[rows].tolist() if k is not None]
+    out += [label for tags in t.pin_tags[rows].tolist() if tags for _, label in tags]
+    return out
+
+
+def _rows_of(views: list) -> np.ndarray:
+    return np.fromiter(map(_ROW, views), np.intp, len(views))
+
+
+_ROW = operator.attrgetter("row")
+
+
+def _flag(views: list, flag: int, on: bool, rows=None) -> tuple[list, np.ndarray]:
+    """Set or clear a flag (SELECTED, LIFTED) of these views in their table; returns
+    the ones it changed, and their rows. (`rows`: the views', if the caller has them.)"""
+    if not views:
+        return views, NO_SLOTS
+    t = views[0].table
+    rows = _rows_of(views) if rows is None else rows
     had = (t.flags[rows] & flag) != 0
     if on:
         t.flags[rows] |= flag
     else:
         t.flags[rows] &= ~flag & 0xFF
     changed = had != on
-    return views if changed.all() else [v for v, c in zip(views, changed.tolist()) if c]
+    if changed.all():
+        return views, rows
+    return [v for v, c in zip(views, changed.tolist()) if c], rows[changed]
 
 
 def _exact(x, d: float) -> bool:
@@ -1831,37 +2116,44 @@ def _exact(x, d: float) -> bool:
     return type(x) is float and (x + d) - d == x
 
 
-def _move_part_mirrors(views: list[PartView], dx: float, dy: float) -> list[int]:
+def _move_part_mirrors(
+    views: list[PartView], dx: float, dy: float, rows=None
+) -> list[int]:
     """Move these views' coordinates by (dx, dy). Returns the uids of the ones that
     moved exactly (see _exact); the others are reported as changed (Touched)."""
-    exact, other = [], []
-    for v in views:
-        x, y = v.x, v.y
-        v.x, v.y = x + dx, y + dy
-        (exact if _exact(x, dx) and _exact(y, dy) else other).append(v.part.uid)
-        for label in (v.kind_text, v._name) if v._name is not None else (v.kind_text,):
-            label.x += dx
-            label.y += dy
-        for _, label in v.pin_tags:
-            label.x += dx
-            label.y += dy
-    _shift_indexed(views, dx, dy)
-    Touched.parts.update(other)
-    return exact
+    if not views:
+        return []
+    t = views[0].table
+    rows = _rows_of(views) if rows is None else rows
+    xy, ints = t.xy[rows], t.ints[rows]
+    d = np.array([dx, dy])
+    ok = (((xy + d) - d == xy) & ((ints[:, None] >> np.arange(2)) & 1 == 0)).all(axis=1)
+    t.xy[rows] = xy + d
+    lost = (0 if type(dx) is int else 1) | (0 if type(dy) is int else 2)
+    if lost:
+        t.ints[rows] = ints & (~lost & 0xFF)
+    for label in _labels(views, rows):
+        label.x += dx
+        label.y += dy
+    if t.index is not None:
+        t.index.shift(views, dx, dy)
+    good = ok.tolist()
+    Touched.parts.update(v.part.uid for v, g in zip(views, good) if not g)
+    return [v.part.uid for v, g in zip(views, good) if g]
 
 
-def _move_wire_mirrors(views: list[WireView], dx: float, dy: float) -> list[int]:
+def _move_wire_mirrors(
+    views: list[WireView], dx: float, dy: float, rows=None
+) -> list[int]:
     """_move_part_mirrors for wires. A wire whose data has no coordinates (pin to pin,
     no bends: see document.wire_data) is the same after a move: not reported at all."""
     if not views:
         return []
     t = views[0].table
-    rows = _rows_of(views)
-    # which ends are in the data (junctions: see wire_data), and moved exactly
-    junction = np.array(
-        [(not isinstance(v.wire.src, Pin), not isinstance(v.wire.dst, Pin)) for v in views],
-        bool,
-    ).reshape(-1, 2)
+    rows = _rows_of(views) if rows is None else rows
+    # which ends are in the data (junctions, see wire_data: the ends with a dot), and
+    # moved exactly
+    junction = t.dot[rows] >= 0
     xy, ints = t.xy[rows], t.ints[rows]
     d = np.array([dx, dy, dx, dy])
     ok = ((xy + d) - d == xy) & ((ints[:, None] >> np.arange(4)) & 1 == 0)
@@ -1885,15 +2177,6 @@ def _move_wire_mirrors(views: list[WireView], dx: float, dy: float) -> list[int]
     if t.index is not None:
         t.index.shift(views, dx, dy)
     return exact
-
-
-def _shift_indexed(views: list, dx: float, dy: float) -> None:
-    by_index: dict[int, tuple] = {}
-    for v in views:
-        if v.index is not None:
-            by_index.setdefault(id(v.index), (v.index, []))[1].append(v)
-    for index, members in by_index.values():
-        index.shift(members, dx, dy)
 
 
 def arc_length_at(points: list[Point], p: Point) -> float:

@@ -137,3 +137,23 @@ def test_view_sync_follows_rewiring_and_shows_fights(monkeypatch):
         c.step()
     sync(c, Canvas())
     assert buf.state[shape] == SHOW_OFF
+
+
+def test_part_table_finds_pins_in_runs_and_lists():
+    from pijl.ui.views import PartTable
+
+    t = PartTable(None, None, None, None)
+    rows = t.new_rows(4)
+    t.pin0[rows.start : rows.stop] = [10, 0, -1, 40]
+    t.npin[rows.start : rows.stop] = [3, 0, 2, 1]
+    t.pinslots[rows.start + 2] = np.array([7, 3])  # (made apart: listed)
+    got = t.pins_of(np.arange(rows.start, rows.stop)).tolist()
+    assert sorted(got) == [3, 7, 10, 11, 12, 40]
+    assert t.pin_slots(rows.start).tolist() == [10, 11, 12]
+    assert t.pin_slots(rows.start + 2).tolist() == [7, 3]
+    t.set_coord(rows.start, 0, 5)
+    t.set_coord(rows.start, 1, 2.5)
+    for _ in range(3000):  # growing keeps what's there, through the Python-array columns
+        t.new_rows(1)
+    assert t.pos(rows.start) == (5, 2.5) and type(t.pos(rows.start)[0]) is int
+    assert t.pin_slots(rows.start + 3).tolist() == [40]

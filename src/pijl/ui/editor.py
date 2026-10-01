@@ -95,6 +95,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
 
+import numpy as np
 import pyglet
 from pyglet import shapes
 from pyglet.math import Mat4
@@ -149,6 +150,7 @@ from .spatial import SpatialIndex, ordered
 from .status_bar import BAR_H, StatusBar
 from .sync import ViewSync
 from .views import (
+    PartTable,
     PartView,
     Layers,
     Point,
@@ -322,6 +324,7 @@ class Editor(pyglet.window.Window):
         self.part_index = SpatialIndex()
         self.wire_index = SpatialIndex()
         self.wire_table = WireTable(self.world, self.layers, self.wire_index)
+        self.part_table = PartTable(self.world, self.layers, self.text, self.part_index)
 
         # interaction state
         self.mode = Mode.IDLE
@@ -426,11 +429,8 @@ class Editor(pyglet.window.Window):
                     c.open_parts(parts)
                 views = PartView.many(
                     [(p, s[1], s[2]) for p, s in zip(parts, specs)],
-                    self.world,
-                    self.layers,
-                    self.text,
+                    self.part_table,
                     pin_labels=self.pin_label_mode == PIN_LABELS_ALWAYS,
-                    index=self.part_index,
                 )
                 for part, view in zip(parts, views):
                     self.part_views[part] = view
@@ -617,12 +617,25 @@ class Editor(pyglet.window.Window):
         """Re-attach the ends of `views` -- and of every wire hanging off them -- to
         their pins / parent wires. Pin ends snap to the pin; junction ends slide to
         the nearest point on their parent wire. Parents go first (creation order)."""
-        todo = {v.wire for v in views}
-        if not todo:
+        if not views:
             return
-        for wire in sorted(
-            todo.union(self.circuit.descendants(*todo)), key=lambda w: w.uid
-        ):  # parents first
+        wt, pt, ws = self.wire_table, self.part_table, self.circuit._wire_slots
+        slots = self.circuit.with_descendants(
+            wt.wslot[np.fromiter((v.row for v in views), np.intp, len(views))]
+        )
+        # Pin to pin: where both ends should be, all at once; the ones already there
+        # (after a rigid move, nearly all) are left alone, as set_ends would.
+        plain = ~ws.end_is_wire[slots].any(axis=1)
+        pp = slots[plain]
+        pins, rows = ws.end_slot[pp], wt.row_of[pp]
+        known = (rows >= 0) & (pins < len(pt.pin_row)).all(axis=1)
+        known[known] &= (pt.pin_row[pins[known]] >= 0).all(axis=1)
+        there = np.zeros(len(pp), bool)
+        there[known] = (
+            pt.pin_xy(pins[known].ravel()).reshape(-1, 4) == wt.xy[rows[known]]
+        ).all(axis=1)
+        redo = [ws.wires[s] for s in slots[~plain].tolist() + pp[~there].tolist()]
+        for wire in sorted(redo, key=lambda w: w.uid):  # parents first
             view = self.wire_views[wire]
             src, dst = wire.src, wire.dst
             view.set_ends(
@@ -1987,8 +2000,13 @@ class Editor(pyglet.window.Window):
     def _selection_signature(self):
         """What the selection is and where it sits: a Ctrl+D block keeps growing only
         while this is unchanged since its last step."""
+        parts = sorted(self.selection.parts, key=lambda v: v.row)
+        t = self.part_table
+        rows = np.fromiter((v.row for v in parts), np.intp, len(parts))
         return (
-            frozenset((v, v.x, v.y) for v in self.selection.parts),
+            tuple(parts),
+            t.xy[rows].tobytes(),
+            t.ints[rows].tobytes(),
             frozenset(self.selection.wires),
         )
 

@@ -874,6 +874,27 @@ class Circuit:
             return ()
         return had if type(had) is list else (had,)
 
+    def with_descendants(self, slots: np.ndarray) -> np.ndarray:
+        """descendants(), by wire slot and with the given ones too: every wire attached
+        to these, to those, and so on, as sorted slots. With arrays: no walk per wire."""
+        ws = self._wire_slots
+        n = len(ws.wires)
+        found = np.zeros(n, bool)
+        found[slots] = True
+        # the wires with an end on another wire, and those ends
+        kids = np.flatnonzero(ws.alive[:n] & ws.end_is_wire[:n].any(axis=1))
+        is_wire = ws.end_is_wire[kids]
+        on = np.where(is_wire, ws.end_slot[kids], 0)
+        new = found
+        while kids.size:
+            hit = ((new[on] & is_wire).any(axis=1)) & ~found[kids]
+            if not hit.any():
+                break
+            new = np.zeros(n, bool)
+            new[kids[hit]] = True
+            found |= new
+        return np.flatnonzero(found)
+
     def descendants(self, *wires: Wire) -> list[Wire]:
         """Wires attached to these, wires attached to those, and so on (in creation order)."""
         found: set[Wire] = set()
