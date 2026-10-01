@@ -65,6 +65,12 @@ Move = tuple[np.ndarray, float, float]
 Section = tuple[dict[int, object], dict[int, object], tuple[Move, ...]]
 Change = tuple[Section, Section, Section]
 
+# How much the undo history may hold, in values (a part's or wire's data on one side
+# of a step; a moved uid counts as 1/16: it's 8 bytes in a move, not a tuple). About
+# 100 bytes each, so ~400 MB. Steps past it are dropped oldest first, like past
+# History.limit -- but the newest step is always kept, however big.
+MAX_VALUES = 4_000_000
+
 MIN_MOVE_GROUP = 8  # fewer than this moved by one delta: kept as plain values
 
 NO_PROPS: dict = {}  # props of a part that has none (shared: never write to it)
@@ -318,7 +324,9 @@ class History:
     names the point in the timeline: every new step gets a new one, so "has anything
     changed since it was saved?" is a comparison of two numbers."""
 
-    def __init__(self, initial: Snapshot, limit: int = 500) -> None:
+    def __init__(
+        self, initial: Snapshot, limit: int = 500, max_values: int = MAX_VALUES
+    ) -> None:
         self.current = Snapshot(
             dict(initial.parts), dict(initial.wires), dict(initial.wire_colors)
         )
@@ -327,6 +335,7 @@ class History:
         ] = []  # (change, state before, state after)
         self.redo_stack: list[tuple[Change, int, int]] = []
         self.limit = limit
+        self.max_values = max_values
         self.state = 0
 
     def _sections(self) -> tuple[dict, dict, dict]:
@@ -366,8 +375,8 @@ class History:
             change = _add_moves(change, moves, self._sections())
         after = next(STAMPS)
         self.undo_stack.append((change, self.state, after))
-        del self.undo_stack[: -self.limit]
         self.redo_stack.clear()
+        self._trim()
         self.state = after
         return True
 
@@ -410,7 +419,18 @@ class History:
         self.state = next(STAMPS)
         self.undo_stack[-1] = (_compress(merged), before, self.state)
         self.redo_stack.clear()
+        self._trim()
         return True
+
+    def _trim(self) -> None:
+        """Drop the oldest steps past `limit` steps or `max_values` values."""
+        stack = self.undo_stack
+        drop = max(0, len(stack) - self.limit)
+        total = sum(_size(change) for change, _, _ in stack[drop:])
+        while total > self.max_values and drop < len(stack) - 1:
+            total -= _size(stack[drop][0])
+            drop += 1
+        del stack[:drop]
 
     def undo(self) -> Change | None:
         """Step back; returns the change undone (restore() the board at its uids)."""
@@ -458,6 +478,14 @@ def _add_moves(change: Change, moves: tuple, sections: tuple[dict, dict, dict]) 
             before, after, old = out[i]
             out[i] = (before, after, (*old, *groups))
     return tuple(out)
+
+
+def _size(change: Change) -> int:
+    """How much a step holds, in values (see MAX_VALUES)."""
+    return sum(
+        len(b) + len(a) + sum(len(uids) for uids, _, _ in moves) // 16
+        for b, a, moves in change
+    )
 
 
 def _empty(change: Change) -> bool:

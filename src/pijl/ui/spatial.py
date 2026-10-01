@@ -12,6 +12,7 @@ exact test.
 
 from __future__ import annotations
 
+import itertools
 import math
 from collections.abc import Hashable, Iterable
 
@@ -144,34 +145,34 @@ class SpatialIndex:
             self._release(row)
 
     def remove_many(self, objs: Iterable[Hashable]) -> None:
-        rows = self._rows([self.where.pop(obj, ()) for obj in objs])
-        if rows:
-            self._free.extend(rows)
-            rows = np.array(rows, np.intp)
+        pop = self.where.pop
+        rows = self._rows([pop(obj, ()) for obj in objs])
+        if len(rows):
+            self._free.extend(rows.tolist())
             self._owner[rows] = None
             self._cols[:2, rows], self._cols[2:, rows] = np.inf, -np.inf
             self._bounds_ok = False
 
     def shift(self, objs: Iterable[Hashable], dx: float, dy: float) -> None:
         """Move these objects' boxes by (dx, dy), all at once."""
-        where = self.where
-        rows = self._rows([where.get(obj, ()) for obj in objs])
-        if rows:
-            rows = np.array(rows, np.intp)
+        rows = self._rows(list(map(self.where.get, objs, itertools.repeat(()))))
+        if len(rows):
             self._cols[0::2, rows] += dx
             self._cols[1::2, rows] += dy
             self._bounds_ok = False
 
     @staticmethod
-    def _rows(entries: list) -> list[int]:
-        """The rows of many `where` entries, flattened."""
+    def _rows(entries: list) -> np.ndarray:
+        """The rows of many `where` entries, flattened, in order."""
+        if set(map(type, entries)) <= {int}:  # (one box each: the usual)
+            return np.array(entries, np.intp)
         out = []
         for e in entries:
             if type(e) is int:
                 out.append(e)
             else:
                 out.extend(e)
-        return out
+        return np.array(out, np.intp)
 
     def clear(self) -> None:
         self.__init__()

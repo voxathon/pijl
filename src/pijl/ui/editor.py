@@ -154,6 +154,7 @@ from .views import (
     Point,
     Polyline,
     Touched,
+    WireTable,
     WireView,
     arc_length_at,
     points_before,
@@ -320,6 +321,7 @@ class Editor(pyglet.window.Window):
         # Where every view is, for hit testing without looking at all of them (views keep it current)
         self.part_index = SpatialIndex()
         self.wire_index = SpatialIndex()
+        self.wire_table = WireTable(self.world, self.layers, self.wire_index)
 
         # interaction state
         self.mode = Mode.IDLE
@@ -362,12 +364,8 @@ class Editor(pyglet.window.Window):
         # selection
         self.selection = Selection()
         # Moving a group (dragging, or carrying new parts / a paste): see _begin_move
-        self.drag_group: list[
-            tuple[PartView, float, float]
-        ] = []  # parts moving + their start origins
-        self.drag_wires: list[
-            tuple[WireView, list[Point], Point, Point]
-        ] = []  # wires inside the group + start shape
+        self.drag_group: list[PartView] = []  # parts moving
+        self.drag_wires: list[WireView] = []  # wires inside the group
         self.drag_origin = (0.0, 0.0)  # start origin of the grabbed part
         self.drag_delta = (0.0, 0.0)  # how far the group has moved so far
         self.stretched: list[
@@ -475,12 +473,7 @@ class Editor(pyglet.window.Window):
         finally:
             pending, self._wire_batch = self._wire_batch, None
             with paused_gc():
-                views = WireView.many(
-                    list(pending.values()),
-                    self.world,
-                    self.layers,
-                    index=self.wire_index,
-                )
+                views = WireView.many(list(pending.values()), self.wire_table)
             for wire, view in zip(pending, views):
                 self.wire_views[wire] = view
 
@@ -521,14 +514,7 @@ class Editor(pyglet.window.Window):
                 self._wire_batch[wire] = (wire, src, list(bends), dst, color)
             else:
                 self.wire_views[wire] = WireView(
-                    wire,
-                    src,
-                    list(bends),
-                    dst,
-                    self.world,
-                    self.layers,
-                    color,
-                    index=self.wire_index,
+                    wire, src, list(bends), dst, self.wire_table, color
                 )
         return wire
 
@@ -596,14 +582,7 @@ class Editor(pyglet.window.Window):
         for gone in (w, splice):
             self._drop_wire_view(gone)
         self.wire_views[w] = WireView(
-            w,
-            src_pos,
-            bends,
-            self.end_pos(w.dst, far_pos),
-            self.world,
-            self.layers,
-            color,
-            index=self.wire_index,
+            w, src_pos, bends, self.end_pos(w.dst, far_pos), self.wire_table, color
         )
         self.refresh_wires([self.wire_views[w]])
 
@@ -645,8 +624,10 @@ class Editor(pyglet.window.Window):
             todo.union(self.circuit.descendants(*todo)), key=lambda w: w.uid
         ):  # parents first
             view = self.wire_views[wire]
+            src, dst = wire.src, wire.dst
             view.set_ends(
-                self.end_pos(wire.src, view.src), self.end_pos(wire.dst, view.dst)
+                self.pin_pos(src) if type(src) is Pin else self.end_pos(src, view.src),
+                self.pin_pos(dst) if type(dst) is Pin else self.end_pos(dst, view.dst),
             )
 
     def end_pos(self, end: Pin | Wire, near: Point) -> Point:
@@ -2140,8 +2121,7 @@ class Editor(pyglet.window.Window):
         (see canvas.py): until _end_move they're drawn shifted by the canvas's offset and
         keep their old coordinates, so a mouse move costs one offset change -- plus
         re-shaping the few wires stretched between the group and the rest of the board."""
-        self.drag_group = [(v, v.x, v.y) for v in views]
-        self.drag_wires = [(w, list(w.bends), w.src, w.dst) for w in wires]
+        self.drag_group, self.drag_wires = list(views), list(wires)
         self.drag_delta = (0.0, 0.0)
         lift(views, wires, True)
         c, parts, inside = (
@@ -2197,16 +2177,11 @@ class Editor(pyglet.window.Window):
         """Put the lifted group down where it was dragged to, for real."""
         dx, dy = self.drag_delta
         self.world.offset = (0.0, 0.0)
-        parts, wires = (
-            [v for v, *_ in self.drag_group],
-            [v for v, *_ in self.drag_wires],
-        )
-        put_down(
-            parts, wires, dx, dy
-        )  # (lifted, they kept their coordinates: from where they were picked up)
+        # (lifted, they kept their coordinates: from where they were picked up)
+        put_down(self.drag_group, self.drag_wires, dx, dy)
         # exact final attachment, as if it had been moved step by step
         live = [v for v, *_ in self.stretched if v.wire in self.wire_views]
-        self.refresh_wires([*live, *(v for v, *_ in self.drag_wires)])
+        self.refresh_wires([*live, *self.drag_wires])
         self.drag_group, self.drag_wires, self.stretched, self.stretched_tail = (
             [],
             [],

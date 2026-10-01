@@ -66,6 +66,19 @@ def test_limit_drops_oldest():
     assert h.current == snap(6) and h.undo() is None
 
 
+def test_size_cap_drops_oldest_but_keeps_the_newest():
+    h = History(snap(0), max_values=10)
+    h.commit(snap(4))  # 4 values
+    h.commit(snap(8))  # 4 more: 8, fits
+    assert len(h.undo_stack) == 2
+    h.commit(snap(12))  # 12: the oldest goes
+    assert len(h.undo_stack) == 2
+    h.commit(snap(40))  # 28 on its own: over, but the newest stays
+    assert len(h.undo_stack) == 1
+    h.undo()
+    assert h.current == snap(12) and h.undo() is None
+
+
 def test_record_takes_only_what_changed():
     h = History(snap(3))
     moved = ("NOT", "", 9.0, 9.0, {})

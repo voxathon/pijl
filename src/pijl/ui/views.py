@@ -247,16 +247,7 @@ class Polyline:
     def _build(self) -> None:
         """Lay segments along the points, unless they already are, then color them."""
         stops = self._stops
-        # The layout depends on where the stops are and which neighbors differ, not on
-        # the colors themselves (see _lay_out).
-        key = (
-            None
-            if stops is None
-            else (
-                tuple(f for f, _ in stops),
-                tuple(c0 != c1 for (_, c0), (_, c1) in zip(stops, stops[1:])),
-            )
-        )
+        key = _stops_key(stops)
         if key != self._layout_key:
             self._lay_out()
             self._layout_key = key
@@ -270,97 +261,35 @@ class Polyline:
         if self._colors is None:
             self._colors = {}
         if k not in self._colors:
-            pairs = [sample(stops, f) for f in self._vfracs]
-            self._colors[k] = (
-                np.array([_rgba(p[0]) for p in pairs], np.uint8),
-                np.array([_rgba(p[1]) for p in pairs], np.uint8),
-            )
-        offs, ons = self._colors[k]
-        f = self.buf.f
-        f["ca"][slots], f["cb"][slots] = offs[:-1], offs[1:]
-        f["ca_on"][slots], f["cb_on"][slots] = ons[:-1], ons[1:]
-        self.buf.mark_many(slots)
+            self._colors[k] = _gradient_colors(stops, self._vfracs)
+        _write_gradient(self.buf, slots, *self._colors[k])
 
     def _color_plain(self) -> None:
         """Every segment in the one (off, on) pair."""
-        slots = self._slots
-        if slots.size:
-            f = self.buf.f
-            off, on = _rgba(self._pair[0]), _rgba(self._pair[1])
-            f["ca"][slots] = f["cb"][slots] = off
-            f["ca_on"][slots] = f["cb_on"][slots] = on
-            self.buf.mark_many(slots)
+        if self._slots.size:
+            _write_plain(self.buf, self._slots, self._pair)
 
     def _lay_out(self) -> None:
-        """Place segments along the points. A gradient splits them further: at every stop,
-        and in GRADIENT_STEPS pieces between stops, so each piece blends only a little."""
+        """Place segments along the points (see _layout)."""
         self._colors = None
-        pts = self.points
-        cum = [0.0]
-        for a, b in zip(pts, pts[1:]):
-            cum.append(cum[-1] + math.dist(a, b))
-        total = cum[-1]
-        if self._stops is None or total == 0:
-            verts, corner_idx = pts, list(range(1, len(pts) - 1))
-            vfracs = None  # one color everywhere: only the count matters
-        else:
-            fracs = [c / total for c in cum]
-            cuts = set()
-            for (f0, c0), (f1, c1) in zip(self._stops, self._stops[1:]):
-                cuts.add(f0)
-                if c0 != c1:
-                    cuts.update(
-                        f0 + (f1 - f0) * i / GRADIENT_STEPS
-                        for i in range(1, GRADIENT_STEPS)
-                    )
-            cuts = sorted(
-                f for f in cuts if 0 < f < 1 and all(abs(f - g) > 1e-9 for g in fracs)
-            )
-            verts, vfracs, k, corner_idx = [pts[0]], [0.0], 0, []
-            for i, (a, b) in enumerate(zip(pts, pts[1:])):
-                while k < len(cuts) and cuts[k] < fracs[i + 1]:
-                    t = (cuts[k] - fracs[i]) / (fracs[i + 1] - fracs[i])
-                    verts.append((a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])))
-                    vfracs.append(cuts[k])
-                    k += 1
-                if i + 1 < len(pts) - 1:
-                    corner_idx.append(len(verts))
-                verts.append(b)
-                vfracs.append(fracs[i + 1])
-        self._vfracs = vfracs
-        self._plain = vfracs is None
+        verts, self._vfracs, corner_idx = _layout(self.points, self._stops)
+        self._plain = self._vfracs is None
         n_seg = max(len(verts) - 1, 0)
         buf, slots = self.buf, self._slots
         if len(slots) < n_seg:  # new segments, set up like the others
             new = buf.alloc_many(n_seg - len(slots))
-            f = buf.f
-            f["radius"][new] = self.thickness / 2
-            f["flags"][new] = 0, self._opacity, 0, 0
-            f["lift"][new] = 1.0 if self._lift else 0.0
+            _new_segments(buf, new, self.thickness, self._opacity, self._lift, self._sel)
             if self._on:
                 buf.set_state(new, self._on)
-            if self._sel:
-                f["sel"][new, 0] = self._sel
             if self.source >= 0:
                 buf.show_wires(new, self.source)
-            buf.mark_many(new)
             slots = self._slots = np.concatenate((slots, new))
         elif len(slots) > n_seg:  # (the last ones go, last first)
             for s in slots[n_seg:].tolist()[::-1]:
                 buf.free(s)
             slots = self._slots = slots[:n_seg] if n_seg else NO_SLOTS
-        if not n_seg:
-            return
-        # round caps only at the real corners (pieces of one straight segment need none, and the
-        # line's own ends stay square: they sit under a pin or junction dot, or on the cursor)
-        v = np.array(verts, np.float64)
-        k = np.arange(n_seg)
-        f = buf.f
-        f["a"][slots] = v[:-1]
-        f["b"][slots] = v[1:]
-        f["flags"][slots, 2] = np.where(np.isin(k, corner_idx), 255, 0)
-        f["flags"][slots, 3] = np.where(np.isin(k + 1, corner_idx), 255, 0)
-        buf.mark_many(slots)
+        if n_seg:
+            _write_layout(buf, slots, verts, corner_idx)
 
     @property
     def color(self):
@@ -431,6 +360,98 @@ class Polyline:
         self._slots = NO_SLOTS
 
 
+def _layout(pts: list[Point], stops) -> tuple[list[Point], list[float] | None, list[int]]:
+    """Where a line's segments go: (vertices, the fraction of the length at each one,
+    which of them are real corners). One color (`stops` None) is a segment per pair of
+    points, and the fractions are None: only the count matters. A gradient splits
+    them further: at every stop, and in GRADIENT_STEPS pieces between stops, so each
+    piece blends only a little."""
+    cum = [0.0]
+    for a, b in zip(pts, pts[1:]):
+        cum.append(cum[-1] + math.dist(a, b))
+    total = cum[-1]
+    if stops is None or total == 0:
+        return pts, None, list(range(1, len(pts) - 1))
+    fracs = [c / total for c in cum]
+    cuts = set()
+    for (f0, c0), (f1, c1) in zip(stops, stops[1:]):
+        cuts.add(f0)
+        if c0 != c1:
+            cuts.update(f0 + (f1 - f0) * i / GRADIENT_STEPS for i in range(1, GRADIENT_STEPS))
+    cuts = sorted(f for f in cuts if 0 < f < 1 and all(abs(f - g) > 1e-9 for g in fracs))
+    verts, vfracs, k, corner_idx = [pts[0]], [0.0], 0, []
+    for i, (a, b) in enumerate(zip(pts, pts[1:])):
+        while k < len(cuts) and cuts[k] < fracs[i + 1]:
+            t = (cuts[k] - fracs[i]) / (fracs[i + 1] - fracs[i])
+            verts.append((a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])))
+            vfracs.append(cuts[k])
+            k += 1
+        if i + 1 < len(pts) - 1:
+            corner_idx.append(len(verts))
+        verts.append(b)
+        vfracs.append(fracs[i + 1])
+    return verts, vfracs, corner_idx
+
+
+def _new_segments(buf, new: np.ndarray, thickness: float, opacity: int, lift: float, sel: int) -> None:
+    """Fresh segments set up like a line's others (the layout writes the rest)."""
+    f = buf.f
+    f["radius"][new] = thickness / 2
+    f["flags"][new] = 0, opacity, 0, 0
+    f["lift"][new] = 1.0 if lift else 0.0
+    if sel:
+        f["sel"][new, 0] = sel
+    buf.mark_many(new)
+
+
+def _write_layout(buf, slots: np.ndarray, verts: list[Point], corner_idx: list[int]) -> None:
+    # round caps only at the real corners (pieces of one straight segment need none, and the
+    # line's own ends stay square: they sit under a pin or junction dot, or on the cursor)
+    v = np.array(verts, np.float64)
+    k = np.arange(len(slots))
+    f = buf.f
+    f["a"][slots] = v[:-1]
+    f["b"][slots] = v[1:]
+    f["flags"][slots, 2] = np.where(np.isin(k, corner_idx), 255, 0)
+    f["flags"][slots, 3] = np.where(np.isin(k + 1, corner_idx), 255, 0)
+    buf.mark_many(slots)
+
+
+def _gradient_colors(stops, vfracs: list[float]) -> tuple[np.ndarray, np.ndarray]:
+    """rgba per vertex, off and on, of a gradient laid out at these fractions."""
+    pairs = [sample(stops, f) for f in vfracs]
+    return (
+        np.array([_rgba(p[0]) for p in pairs], np.uint8),
+        np.array([_rgba(p[1]) for p in pairs], np.uint8),
+    )
+
+
+def _write_gradient(buf, slots: np.ndarray, offs: np.ndarray, ons: np.ndarray) -> None:
+    f = buf.f
+    f["ca"][slots], f["cb"][slots] = offs[:-1], offs[1:]
+    f["ca_on"][slots], f["cb_on"][slots] = ons[:-1], ons[1:]
+    buf.mark_many(slots)
+
+
+def _write_plain(buf, slots: np.ndarray, pair: Pair) -> None:
+    f = buf.f
+    off, on = _rgba(pair[0]), _rgba(pair[1])
+    f["ca"][slots] = f["cb"][slots] = off
+    f["ca_on"][slots] = f["cb_on"][slots] = on
+    buf.mark_many(slots)
+
+
+def _stops_key(stops) -> tuple | None:
+    """What a gradient's layout depends on: where the stops are and which neighbors
+    differ, not the colors themselves (see _layout)."""
+    if stops is None:
+        return None
+    return (
+        tuple(f for f, _ in stops),
+        tuple(c0 != c1 for (_, c0), (_, c1) in zip(stops, stops[1:])),
+    )
+
+
 # ---- shapes by slot -----------------------------------------------------------------
 # Views keep their shapes as slots in instance buffers (see canvas.py), not as
 # sdf_shapes objects: a part used to own a Rect, two Dots and two labels' worth of
@@ -468,9 +489,6 @@ def _set_wire_dot_pair(buf, slot: int, off, on) -> None:
     f["ca"][slot] = f["cb"][slot] = _rgba(off)
     f["ca_on"][slot] = f["cb_on"][slot] = _rgba(on)
     buf.mark(slot)
-
-
-_NO_DOTS: Mapping[str, int] = MappingProxyType({})  # a wire without junction ends
 
 
 def _segment_distance(px: float, py: float, a: Point, b: Point) -> float:
@@ -915,30 +933,232 @@ def _label_anchor(look) -> str:
     return {"left": "right", "right": "left"}.get(look.label, "center")
 
 
+SELECTED, LIFTED = 1, 2  # WireTable.flags
+
+
+class WireTable:
+    """Every wire view's data, as columns with a row per view: the ends, bends, colors,
+    flags, and the slots of its shapes (line segments, junction dots) in the canvas's
+    SEGMENT buffer. A WireView is just (wire, row, table). A big board has hundreds of
+    thousands of wires; as objects (a view, its line, tuples and lists of points, an
+    array of slots each) they were most of its memory, and moving many was a loop of
+    small Python edits instead of a few array ones.
+
+    Rows aren't reused (like circuit slots): a dead view's row stays dead, so a stale
+    handle can't show another wire."""
+
+    def __init__(self, canvas: Canvas, layers: Layers, index: SpatialIndex | None) -> None:
+        self.canvas, self.layers, self.index = canvas, layers, index
+        self._buf = None
+        self.n = 0  # rows handed out
+        cap = 1024
+        self.xy = np.zeros((cap, 4))  # src x, y, dst x, y
+        self.ints = np.zeros(cap, np.uint8)  # bits: which of those were given as ints
+        self.seg = np.full(cap, -1, np.int32)  # the line's segment, when it has one
+        self.dot = np.full((cap, 2), -1, np.int32)  # junction dot on src / dst end
+        self.flags = np.zeros(cap, np.uint8)  # SELECTED, LIFTED
+        self.opacity = np.full(cap, 255, np.uint8)
+        self.seq = np.zeros(cap, np.int64)  # see _seq
+        self.wslot = np.full(cap, -1, np.int32)  # the circuit wire's slot
+        # Objects, None meaning the usual: segments when not exactly one (else see seg),
+        # bend points (a tuple), color name, paint.py's stops, the line's own gradient
+        # (None: one color) and its one (off, on) color pair (None: neutral).
+        self.segs = np.full(cap, None, object)
+        self.bends = np.full(cap, None, object)
+        self.color = np.full(cap, None, object)
+        self.stops = np.full(cap, None, object)
+        self.lstops = np.full(cap, None, object)
+        self.pair = np.full(cap, None, object)
+        # row -> [layout key, fractions per vertex, colors per stops] (see _layout), for
+        # the lines laid out for a gradient; the rest are a segment per pair of points
+        self.grad: dict[int, list] = {}
+
+    _COLS = (
+        "xy", "ints", "seg", "dot", "flags", "opacity", "seq", "wslot",
+        "segs", "bends", "color", "stops", "lstops", "pair",
+    )  # fmt: skip
+
+    @property
+    def buf(self):
+        if self._buf is None:
+            self._buf = self.canvas.buffer(SEGMENT, self.layers.wires)
+        return self._buf
+
+    def new_rows(self, k: int) -> range:
+        while self.n + k > len(self.seg):
+            n = len(self.seg)
+            for name in self._COLS:
+                old = getattr(self, name)
+                fill = {"seg": -1, "dot": -1, "opacity": 255, "wslot": -1}.get(name, 0)
+                new = np.full((2 * n, *old.shape[1:]), None if old.dtype == object else fill, old.dtype)
+                new[:n] = old
+                setattr(self, name, new)
+        rows = range(self.n, self.n + k)
+        self.n += k
+        return rows
+
+    def forget(self, rows: np.ndarray) -> None:
+        """Dead views' rows (their shapes are freed already): let go of what they hold."""
+        self.seg[rows] = -1
+        self.dot[rows] = -1
+        self.flags[rows] = 0
+        for col in (self.segs, self.bends, self.color, self.stops, self.lstops, self.pair):
+            col[rows] = None
+        for r in rows.tolist():
+            self.grad.pop(r, None)
+
+    # ---- one row -----------------------------------------------------------------
+
+    def end(self, row: int, k: int) -> Point:
+        """The src (k = 0) or dst (1) end, as it was given (ints stay ints)."""
+        x, y = self.xy[row, 2 * k : 2 * k + 2].tolist()
+        bits = int(self.ints[row]) >> (2 * k)
+        if bits & 3:
+            x, y = (int(x) if bits & 1 else x), (int(y) if bits & 2 else y)
+        return x, y
+
+    def set_end(self, row: int, k: int, p: Point) -> None:
+        x, y = p
+        self.xy[row, 2 * k], self.xy[row, 2 * k + 1] = x, y
+        self.ints[row] = (int(self.ints[row]) & ~(3 << 2 * k)) | _int_bits(x, y, k)
+
+    def points(self, row: int) -> list[Point]:
+        b = self.bends[row]
+        return [self.end(row, 0), *b, self.end(row, 1)] if b else [self.end(row, 0), self.end(row, 1)]
+
+    def slots(self, row: int) -> np.ndarray:
+        """The line's segments, in order along it."""
+        s = int(self.seg[row])
+        if s >= 0:
+            return np.array([s], np.intp)
+        segs = self.segs[row]
+        return NO_SLOTS if segs is None else segs
+
+    def _set_slots(self, row: int, slots: np.ndarray) -> None:
+        if len(slots) == 1:
+            self.seg[row], self.segs[row] = slots[0], None
+        else:
+            self.seg[row], self.segs[row] = -1, (slots if len(slots) else None)
+
+    def segments(self, rows: np.ndarray) -> np.ndarray:
+        """The segments of many lines (a line's in order, the lines in no set order)."""
+        seg = self.seg[rows]
+        one = seg[seg >= 0]
+        more = [s for s in self.segs[rows[seg < 0]].tolist() if s is not None]
+        return np.concatenate((one, *more)).astype(np.intp) if more else one.astype(np.intp)
+
+    # ---- one row's line (what Polyline does for one line) ---------------------------
+
+    def redraw(self, row: int) -> None:
+        """Lay the line out again along its points, and color it."""
+        self._build(row, stale=True)
+
+    def _build(self, row: int, stale: bool = False) -> None:
+        stops = self.lstops[row]
+        key = _stops_key(stops)
+        g = self.grad.get(row)
+        if stale or key != (None if g is None else g[0]):
+            verts, vfracs, corner_idx = _layout(self.points(row), stops)
+            if key is None:
+                self.grad.pop(row, None)
+            else:
+                self.grad[row] = g = [key, vfracs, None]
+            self._place(row, verts, corner_idx)
+        slots = self.slots(row)
+        if not slots.size:
+            return
+        g = self.grad.get(row)
+        if g is None or g[1] is None:  # one color
+            _write_plain(self.buf, slots, self.pair[row] or _NEUTRAL)
+            return
+        if g[2] is None:
+            g[2] = {}
+        k = tuple(stops)
+        if k not in g[2]:
+            g[2][k] = _gradient_colors(stops, g[1])
+        _write_gradient(self.buf, slots, *g[2][k])
+
+    def _place(self, row: int, verts: list[Point], corner_idx: list[int]) -> None:
+        n_seg = max(len(verts) - 1, 0)
+        buf, slots = self.buf, self.slots(row)
+        if len(slots) < n_seg:  # new segments, set up like the others
+            new = buf.alloc_many(n_seg - len(slots))
+            flags = int(self.flags[row])
+            _new_segments(
+                buf,
+                new,
+                T.WIRE_THICKNESS,
+                int(self.opacity[row]),
+                flags & LIFTED,
+                255 if flags & SELECTED else 0,
+            )
+            buf.show_wires(new, int(self.wslot[row]))
+            slots = np.concatenate((slots, new))
+        elif len(slots) > n_seg:  # (the last ones go, last first)
+            for s in slots[n_seg:].tolist()[::-1]:
+                buf.free(s)
+            slots = slots[:n_seg] if n_seg else NO_SLOTS
+        self._set_slots(row, slots)
+        if n_seg:
+            _write_layout(buf, slots, verts, corner_idx)
+
+    def set_pair(self, row: int, pair: Pair) -> None:
+        """One (off, on) color pair for the whole line (drops any gradient)."""
+        self.pair[row] = None if pair == _NEUTRAL else pair
+        if self.lstops[row] is not None:
+            self.lstops[row] = None
+            self._build(row)
+            return
+        slots = self.slots(row)
+        if slots.size:
+            _write_plain(self.buf, slots, pair)
+
+    def set_gradient(self, row: int, stops: list[tuple[float, Pair]]) -> None:
+        """Color pairs at fractions of the length, ascending; the line blends between them."""
+        if all(c == stops[0][1] for _, c in stops):
+            self.set_pair(row, stops[0][1])  # one color after all: plain line
+            return
+        if stops != self.lstops[row]:
+            self.lstops[row] = list(stops)
+            self._build(row)
+
+
+def _int_bits(x, y, k: int) -> int:
+    return ((type(x) is int) | (type(y) is int) << 1) << 2 * k
+
+
+def _fill_rows(views: list[WireView], specs: list[tuple]) -> None:
+    """New views' rows (consecutive), from their (wire, src, bends, dst, color)."""
+    if not views:
+        return
+    t, n = views[0].table, len(views)
+    rows = slice(views[0].row, views[0].row + n)
+    t.seq[rows] = list(itertools.islice(_seq, n))
+    t.wslot[rows] = np.fromiter((w.slot for w, *_ in specs), np.int64, n)
+    ends = [(*src, *dst) for _, src, _, dst, _ in specs]
+    t.xy[rows] = np.fromiter(itertools.chain.from_iterable(ends), np.float64, 4 * n).reshape(n, 4)
+    t.ints[rows] = [
+        (type(a) is int) | (type(b) is int) << 1 | (type(c) is int) << 2 | (type(d) is int) << 3
+        for a, b, c, d in ends
+    ]
+    for i, (_, _, bends, _, color) in enumerate(specs):
+        if bends:
+            t.bends[rows.start + i] = tuple(bends)
+        if color is not None:  # a T.WIRE_COLORS name; None = Default (inherit from the ends)
+            t.color[rows.start + i] = color
+
+
 class WireView:
     """A wire drawn from its src pin, through user-placed bend points, to its dst pin.
 
     Bend points are layout data, so they live here and not in the sim. So is color:
     `color` is what the user picked (None: Default), `stops` the gradient that
     paint.py worked out from it and from what the wire connects to.
+
+    A handle: what it knows is a row of its WireTable.
     """
 
-    __slots__ = (
-        "wire",
-        "seq",
-        "index",
-        "src",
-        "dst",
-        "bends",
-        "_color",
-        "stops",
-        "canvas",
-        "layers",
-        "line",
-        "_selected",
-        "dots",
-        "lifted",
-    )
+    __slots__ = ("wire", "row", "table")
 
     def __init__(
         self,
@@ -946,97 +1166,106 @@ class WireView:
         src: Point,
         bends: list[Point],
         dst: Point,
-        canvas: Canvas,
-        layers: Layers,
+        table: WireTable,
         color: str | None = None,
-        index: SpatialIndex | None = None,
     ) -> None:
-        self._init(wire, src, bends, dst, canvas, layers, color, index)
-        _make_wire_shapes([self])
+        self.wire, self.table, self.row = wire, table, table.new_rows(1)[0]
+        spec = (wire, src, bends, dst, color)
+        _fill_rows([self], [spec])
+        _make_wire_shapes([self], [[src, *bends, dst]])
 
     @classmethod
-    def many(
-        cls,
-        specs: list[tuple],
-        canvas: Canvas,
-        layers: Layers,
-        index: SpatialIndex | None = None,
-    ) -> list[WireView]:
+    def many(cls, specs: list[tuple], table: WireTable) -> list[WireView]:
         """A view for each (wire, src, bends, dst, color): like making them one by one, in
         order, with the shapes made all at once."""
         views = []
-        for wire, src, bends, dst, color in specs:
+        for spec, row in zip(specs, table.new_rows(len(specs))):
             view = cls.__new__(cls)
-            view._init(wire, src, bends, dst, canvas, layers, color, index)
+            view.wire, view.table, view.row = spec[0], table, row
             views.append(view)
-        _make_wire_shapes(views)
+        _fill_rows(views, specs)
+        _make_wire_shapes(views, [[src, *bends, dst] for _, src, bends, dst, _ in specs])
         return views
 
-    def _init(
-        self,
-        wire: Wire,
-        src: Point,
-        bends: list[Point],
-        dst: Point,
-        canvas: Canvas,
-        layers: Layers,
-        color: str | None,
-        index: SpatialIndex | None,
-    ) -> None:
-        """Everything but the shapes (see _make_wire_shapes)."""
-        self.wire = wire
-        self.seq = next(_seq)
-        self.index = index
-        self.src, self.dst = src, dst
-        self.bends = list(bends)
-        self._color = (
-            color  # a T.WIRE_COLORS name; None = Default (inherit from the ends)
-        )
-        self.stops: list[tuple[float, Pair]] | tuple = (
-            ()
-        )  # empty: neutral, the classic grey / red
-        self.canvas, self.layers = canvas, layers
-        self.line = Polyline.__new__(Polyline)  # (its segments: _make_wire_shapes)
-        self.line._init(T.WIRE_OFF, canvas, layers.wires, T.WIRE_THICKNESS)
-        self.line.source = wire.slot
-        self._selected = False  # its segments' `sel` flags (see select_many)
-        # A dot on each end that attaches to another wire (a junction), like on schematics:
-        # end -> its slot in the line's buffer. (In the wires layer, right after the line:
-        # a wire crossing the junction covers it.)
-        self.dots: Mapping[str, int] = _NO_DOTS
-        self.lifted = False  # see set_lifted
+    @property
+    def seq(self) -> int:
+        return int(self.table.seq[self.row])
+
+    @property
+    def index(self) -> SpatialIndex | None:
+        return self.table.index
+
+    @property
+    def src(self) -> Point:
+        return self.table.end(self.row, 0)
+
+    @src.setter
+    def src(self, p: Point) -> None:
+        """(Just the number: set_bends or set_ends redraws.)"""
+        self.table.set_end(self.row, 0, p)
+
+    @property
+    def dst(self) -> Point:
+        return self.table.end(self.row, 1)
+
+    @dst.setter
+    def dst(self, p: Point) -> None:
+        self.table.set_end(self.row, 1, p)
+
+    @property
+    def bends(self) -> tuple[Point, ...]:
+        return self.table.bends[self.row] or ()
 
     @property
     def points(self) -> list[Point]:
         """Every vertex: src pin, bends..., dst pin. Segment k runs points[k] -> points[k+1]."""
-        return [self.src, *self.bends, self.dst]
+        return self.table.points(self.row)
 
     @property
     def color(self) -> str | None:
-        return self._color
+        return self.table.color[self.row]
 
     @color.setter
     def color(self, value: str | None) -> None:
-        if value != getattr(self, "_color", object()):
+        if value != self.color:
             Touched.wire(self.wire.uid)
-        self._color = value
+        self.table.color[self.row] = value
+
+    @property
+    def stops(self) -> list[tuple[float, Pair]] | tuple:
+        """Empty: neutral, the classic grey / red."""
+        stops = self.table.stops[self.row]
+        return () if stops is None else stops
+
+    @property
+    def lifted(self) -> bool:
+        return bool(self.table.flags[self.row] & LIFTED)
+
+    @property
+    def selected(self) -> bool:
+        return bool(self.table.flags[self.row] & SELECTED)
 
     def set_ends(self, src: Point, dst: Point) -> None:
-        if (src, dst) == (self.src, self.dst):
+        t = self.table
+        if t.xy[self.row].tolist() == [*src, *dst]:
             return  # (re-attaching after a move often lands exactly where it was)
-        self.src, self.dst = src, dst
+        t.set_end(self.row, 0, src)
+        t.set_end(self.row, 1, dst)
         self._redraw()
 
     def set_bends(self, bends: list[Point]) -> None:
-        self.bends = list(bends)
+        self.table.bends[self.row] = tuple(bends) or None
         self._redraw()
 
     def _redraw(self) -> None:
-        self.line.set_points(self.points)
-        for end, dot in self.dots.items():
-            _place_wire_dot(self.line.buf, dot, getattr(self, end))
-        if self.index is not None:
-            self.index.put_polyline(self, self.points)
+        t, row = self.table, self.row
+        t.redraw(row)
+        for k in (0, 1):
+            dot = int(t.dot[row, k])
+            if dot >= 0:
+                _place_wire_dot(t.buf, dot, t.end(row, k))
+        if t.index is not None:
+            t.index.put_polyline(self, self.points)
         Touched.wire(
             self.wire.uid
         )  # (its shape: colors of branches depend on where they attach)
@@ -1049,14 +1278,16 @@ class WireView:
 
     def set_ghost(self, ghost: bool) -> None:
         """Semi-transparent while being carried around before placement (paste)."""
+        t, row = self.table, self.row
         a = T.GHOST_OPACITY if ghost else 255
-        self.line.opacity = a
-        for dot in self.dots.values():
-            _set_opacity(self.line.buf, dot, a)
-
-    @property
-    def selected(self) -> bool:
-        return self._selected
+        t.opacity[row] = a
+        slots = t.slots(row)
+        if slots.size:
+            t.buf.f["flags"][slots, 1] = a
+            t.buf.mark_many(slots)
+        for dot in t.dot[row].tolist():
+            if dot >= 0:
+                _set_opacity(t.buf, dot, a)
 
     def set_selected(self, on: bool) -> None:
         select_many([], [self], on)
@@ -1068,20 +1299,24 @@ class WireView:
     def _recolor(self) -> None:
         """Both colors of the line and dots: the gradient, else the classic grey / red.
         (X, Z and conflicts are patterns the state picks, whatever these are.)"""
-        buf = self.line.buf
-        if not self.stops:
-            self.line.set_pair(_NEUTRAL)
-            for dot in self.dots.values():
-                _set_wire_dot_pair(buf, dot, *_NEUTRAL)
+        t, row = self.table, self.row
+        dots = t.dot[row].tolist()
+        stops = self.stops
+        if not stops:
+            t.set_pair(row, _NEUTRAL)
+            for dot in dots:
+                if dot >= 0:
+                    _set_wire_dot_pair(t.buf, dot, *_NEUTRAL)
             return
-        self.line.set_gradient(self.stops)
-        for end, dot in self.dots.items():
-            _set_wire_dot_pair(buf, dot, *sample(self.stops, 0.0 if end == "src" else 1.0))
+        t.set_gradient(row, stops)
+        for k, dot in enumerate(dots):
+            if dot >= 0:
+                _set_wire_dot_pair(t.buf, dot, *sample(stops, 1.0 if k else 0.0))
 
     def set_stops(self, stops: list[tuple[float, Pair]]) -> None:
         if stops == self.stops or not (stops or self.stops):
             return
-        self.stops = stops
+        self.table.stops[self.row] = stops
         self._recolor()
 
     def color_at(self, p: Point) -> Pair | None:
@@ -1093,7 +1328,11 @@ class WireView:
         return sample(self.stops, arc_length_at(pts, p) / total if total else 0.0)
 
     def distance_to(self, wx: float, wy: float) -> float:
-        return self.line.distance_to(wx, wy)
+        pts = self.points
+        return min(
+            (_segment_distance(wx, wy, a, b) for a, b in zip(pts, pts[1:])),
+            default=math.inf,
+        )
 
     def delete(self) -> None:
         delete_views([], [self])
@@ -1338,16 +1577,15 @@ def _make_pin_tags(made: list[tuple[PartView, list[SDFLabel]]]) -> None:
                 label.lifted = True
 
 
-def _make_wire_shapes(views: list[WireView]) -> None:
+def _make_wire_shapes(views: list[WireView], lines: list[list[Point]]) -> None:
     """The segments of a new wire's line (and its junction dots), placed and colored.
     Per wire, in order: its segments, then a dot on each end that's a junction (right
     after its line: a wire crossing the junction covers it)."""
     if not views:
         return
-    v0 = views[0]
-    buf = v0.line.buf
+    t = views[0].table
+    buf = t.buf
     n = len(views)
-    lines = [v.points for v in views]
     ends = [  # the ends that attach to another wire (junctions) get a dot
         tuple(end for end in ("src", "dst") if not isinstance(getattr(v.wire, end), Pin))
         for v in views
@@ -1398,21 +1636,15 @@ def _make_wire_shapes(views: list[WireView]) -> None:
         buf.show_wires(
             slots, np.repeat(np.fromiter((v.wire.slot for v in views), np.intp, n), rows)
         )
-    slot_list = slots.tolist()
-    for v, pts, k, c, e in zip(views, lines, first.tolist(), n_seg.tolist(), ends):
-        line = v.line
-        line._slots = slots[k : k + c] if c else NO_SLOTS
-        if e:
-            v.dots = {end: slot_list[k + c + i] for i, end in enumerate(e)}
-        line.points = pts
-        line._pair = _NEUTRAL
-        line._layout_key, line._plain, line._vfracs = None, True, None
-    by_index: dict[int, tuple] = {}
-    for v in views:
-        if v.index is not None:
-            by_index.setdefault(id(v.index), (v.index, []))[1].append((v, v.points))
-    for index, members in by_index.values():
-        index.put_polylines(members)
+    rows = np.fromiter((v.row for v in views), np.intp, n)
+    one = n_seg == 1
+    t.seg[rows[one]] = slots[first[one]]
+    for i in np.flatnonzero(n_seg > 1).tolist():
+        t.segs[rows[i]] = slots[first[i] : first[i] + n_seg[i]]
+    t.dot[rows[dot_src], 0] = slots[(first + n_seg)[dot_src]]
+    t.dot[rows[dot_dst], 1] = slots[(first + n_seg + dot_src)[dot_dst]]
+    if t.index is not None:
+        t.index.put_polylines(list(zip(views, lines)))
     Touched.wire_many(v.wire.uid for v in views)
 
 
@@ -1444,9 +1676,11 @@ class _Slots:
         if labels:
             self._add(labels[0].buf, np.concatenate([label.slots for label in labels]))
 
-    def lines(self, lines: list[Polyline]) -> None:
-        if lines:
-            self._add(lines[0].buf, np.concatenate([line._slots for line in lines]))
+    def lines(self, views: list[WireView]) -> None:
+        """Their lines' segments."""
+        if views:
+            t = views[0].table
+            self._add(t.buf, t.segments(_rows_of(views)))
 
     def parts(self, views: list[PartView]) -> _Slots:
         if not views:
@@ -1463,10 +1697,12 @@ class _Slots:
         return self
 
     def wires(self, views: list[WireView]) -> _Slots:
-        self.lines([v.line for v in views])
-        dots = [d for v in views for d in v.dots.values()]
-        if dots:
-            self._add(views[0].line.buf, np.array(dots, np.intp))
+        if views:
+            t = views[0].table
+            rows = _rows_of(views)
+            self._add(t.buf, t.segments(rows))
+            dots = t.dot[rows].ravel()
+            self._add(t.buf, dots[dots >= 0])
         return self
 
     def __iter__(self):
@@ -1513,6 +1749,8 @@ def delete_views(parts: list[PartView], wires: list[WireView]) -> None:
         index.remove_many(members)
     for buf, slots in _Slots().parts(parts).wires(wires):
         buf.free_many(slots)
+    if wires:
+        wires[0].table.forget(_rows_of(wires))
     # the views are dead: they hold no slots any more (a second delete is a no-op)
     for v in parts:
         v.body, v.dots = -1, ()
@@ -1520,10 +1758,6 @@ def delete_views(parts: list[PartView], wires: list[WireView]) -> None:
         if v._name is not None:
             v._name.slots = NO_SLOTS
         v.pin_tags = ()
-        v._selected = False
-    for v in wires:
-        v.line._slots = NO_SLOTS
-        v.dots = _NO_DOTS
         v._selected = False
 
 
@@ -1533,22 +1767,19 @@ def select_many(parts: list[PartView], wires: list[WireView], on: bool) -> None:
     outlines and halos (see canvas.Echo, sdf_shapes.RECT_OUTLINE / SEGMENT_HALO): one
     write per buffer, and nothing to keep in step when they move, lift or go away."""
     parts = [v for v in parts if v._selected != on]
-    wires = [v for v in wires if v._selected != on]
+    wires = _flag_wires(wires, SELECTED, on)
     if not (parts or wires):
         return
     value = 255 if on else 0
     for v in parts:
         v._selected = on
-    for v in wires:
-        v._selected = on
-        v.line._sel = value
-    v0 = parts[0] if parts else wires[0]
-    canvas, layers = v0.canvas, v0.layers
+    t = wires[0].table if wires else None
+    canvas, layers = (parts[0].canvas, parts[0].layers) if parts else (t.canvas, t.layers)
     canvas.echo(RECT_OUTLINE, layers.selection, RECT, layers.bodies)
     canvas.echo(SEGMENT_HALO, layers.wire_halo, SEGMENT, layers.wires)
     flagged = _Slots()
     flagged.slots(canvas, RECT, layers.bodies, [v.body for v in parts])
-    flagged.lines([v.line for v in wires])
+    flagged.lines(wires)
     for buf, slots in flagged:
         buf.f["sel"][slots, 0] = value
         buf.mark_many(slots)
@@ -1563,7 +1794,7 @@ def _lift_mirrors(
 ) -> tuple[list, list]:
     """Mark them (un)lifted; returns the ones that weren't already."""
     parts = [v for v in parts if v.lifted != on]
-    wires = [v for v in wires if v.lifted != on]
+    wires = _flag_wires(wires, LIFTED, on)
     value = 1.0 if on else 0.0
     for v in parts:
         v.lifted = on
@@ -1572,10 +1803,26 @@ def _lift_mirrors(
             v._name._lift = value
         for _, label in v.pin_tags:
             label._lift = value
-    for v in wires:
-        v.lifted = on
-        v.line._lift = value
     return parts, wires
+
+
+def _rows_of(views: list[WireView]) -> np.ndarray:
+    return np.fromiter((v.row for v in views), np.intp, len(views))
+
+
+def _flag_wires(views: list[WireView], flag: int, on: bool) -> list[WireView]:
+    """Set or clear a WireTable flag on these; returns the ones it changed."""
+    if not views:
+        return views
+    t = views[0].table
+    rows = _rows_of(views)
+    had = (t.flags[rows] & flag) != 0
+    if on:
+        t.flags[rows] |= flag
+    else:
+        t.flags[rows] &= ~flag & 0xFF
+    changed = had != on
+    return views if changed.all() else [v for v, c in zip(views, changed.tolist()) if c]
 
 
 def _exact(x, d: float) -> bool:
@@ -1606,21 +1853,37 @@ def _move_part_mirrors(views: list[PartView], dx: float, dy: float) -> list[int]
 def _move_wire_mirrors(views: list[WireView], dx: float, dy: float) -> list[int]:
     """_move_part_mirrors for wires. A wire whose data has no coordinates (pin to pin,
     no bends: see document.wire_data) is the same after a move: not reported at all."""
-    exact, other = [], []
-    for v in views:
-        w = v.wire
-        coords = [
-            *v.bends,
-            *(p for p, end in ((v.src, w.src), (v.dst, w.dst)) if not isinstance(end, Pin)),
-        ]
-        if coords:
-            ok = all(_exact(x, dx) and _exact(y, dy) for x, y in coords)
-            (exact if ok else other).append(w.uid)
-        v.src, v.dst = (v.src[0] + dx, v.src[1] + dy), (v.dst[0] + dx, v.dst[1] + dy)
-        v.bends = [(x + dx, y + dy) for x, y in v.bends]
-        v.line.points = [(x + dx, y + dy) for x, y in v.line.points]
-    _shift_indexed(views, dx, dy)
-    Touched.wires.update(other)
+    if not views:
+        return []
+    t = views[0].table
+    rows = _rows_of(views)
+    # which ends are in the data (junctions: see wire_data), and moved exactly
+    junction = np.array(
+        [(not isinstance(v.wire.src, Pin), not isinstance(v.wire.dst, Pin)) for v in views],
+        bool,
+    ).reshape(-1, 2)
+    xy, ints = t.xy[rows], t.ints[rows]
+    d = np.array([dx, dy, dx, dy])
+    ok = ((xy + d) - d == xy) & ((ints[:, None] >> np.arange(4)) & 1 == 0)
+    end_ok = ok[:, 0::2] & ok[:, 1::2]
+    has = junction.any(axis=1)
+    good = (end_ok | ~junction).all(axis=1)
+    t.xy[rows] = xy + d
+    lost = (0 if type(dx) is int else 0b0101) | (0 if type(dy) is int else 0b1010)
+    if lost:
+        t.ints[rows] = ints & (~lost & 0xFF)
+    for i, b in enumerate(t.bends[rows].tolist()):
+        if b is None:
+            continue
+        has[i] = True
+        good[i] &= all(_exact(x, dx) and _exact(y, dy) for x, y in b)
+        t.bends[rows[i]] = tuple((x + dx, y + dy) for x, y in b)
+    exact = [v.wire.uid for v, h, g in zip(views, has.tolist(), good.tolist()) if h and g]
+    Touched.wires.update(
+        v.wire.uid for v, h, g in zip(views, has.tolist(), good.tolist()) if h and not g
+    )
+    if t.index is not None:
+        t.index.shift(views, dx, dy)
     return exact
 
 
