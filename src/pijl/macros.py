@@ -74,10 +74,14 @@ class MacroBook:
         catalog: Catalog,
         load: Callable[[str], Snapshot],
         title_of: Callable[[str], str] | None = None,
+        uses_of: Callable[[str], frozenset[str]] | None = None,
     ) -> None:
         self.catalog = catalog
         self.load = load
         self.title_of = title_of or (lambda name: name)
+        # the macros a macro uses directly, read cheaply (see MacroStore.uses);
+        # without it, contains() loads every definition it walks through
+        self.uses_of = uses_of
         self._types: dict[str, MacroType] = {}
         self._loading: list[
             str
@@ -118,7 +122,7 @@ class MacroBook:
         while todo:
             name = todo.pop()
             try:
-                uses = self.get(name).uses
+                uses = self.uses_of(name) if self.uses_of else self.get(name).uses
             except KeyError:
                 continue
             if inner in uses:
@@ -136,9 +140,10 @@ class Catalog:
         registry: Registry,
         load: Callable[[str], Snapshot],
         title_of: Callable[[str], str] | None = None,
+        uses_of: Callable[[str], frozenset[str]] | None = None,
     ) -> None:
         self.registry = registry
-        self.book = MacroBook(self, load, title_of)
+        self.book = MacroBook(self, load, title_of, uses_of)
 
     def get(self, kind: str) -> PartType:
         if kind.startswith(MACRO):

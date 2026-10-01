@@ -240,6 +240,36 @@ def test_titles_live_in_the_file_and_default_to_the_id(tmp_path):
     assert store.title("adder") == "Half Adder"
 
 
+def test_titles_and_uses_are_read_without_decoding(tmp_path):
+    store = MacroStore(tmp_path)
+    store.save("adder", board(), title="Half Adder")
+    (tmp_path / "top.json").write_text(
+        json.dumps(
+            {
+                "pijl": 1,
+                "title": "tôp",  # (json.dumps writes it as ô)
+                "parts": [
+                    {"uid": 1, "macro": "adder", "pos": [0, 0]},
+                    {"uid": 2, "macro": "adder", "pos": [0, 80]},
+                    {"uid": 3, "macro": 'odd "name"', "pos": [0, 160]},
+                    {"uid": 4, "kind": "IN", "label": '"macro": "fake"', "pos": [0, 0]},
+                ],
+                "wires": [],
+            },
+            indent=1,
+        )
+    )
+    # a title below the parts (hand-edited) still counts; a part's "title" prop doesn't
+    (tmp_path / "late.json").write_text(
+        '{"pijl": 1, "parts": [{"uid": 1, "kind": "X", "props": {"title": "no"},'
+        ' "pos": [0, 0]}], "wires": [], "title": "Late"}'
+    )
+    assert store.title("adder") == "Half Adder" and store.uses("adder") == set()
+    assert store.uses("top") == {"adder", 'odd "name"'} and store.title("top") == "tôp"
+    assert store.title("late") == "Late"
+    assert store.uses("gone") == set() and store.title("gone") == "gone"
+
+
 def test_retitle_changes_only_the_title(tmp_path):
     store = MacroStore(tmp_path)
     store.save("adder", board())

@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -265,9 +266,9 @@ class MacroStore:
 
     def __init__(self, folder: Path) -> None:
         self.folder = Path(folder)
-        # id -> (the file's mtime, its title): titles are read once per change to the
-        # file, not every time the picker asks for one
-        self._titles: dict[str, tuple[int, str]] = {}
+        # id -> (the file's mtime, its title, the macros it uses directly): read once
+        # per change to the file, not every time the picker asks (see _peek)
+        self._titles: dict[str, tuple[int, str, frozenset[str]]] = {}
 
     def ids(self) -> list[str]:
         if not self.folder.is_dir():
@@ -276,16 +277,25 @@ class MacroStore:
 
     def title(self, id: str) -> str:
         """What the macro is called (its id if the file has no title, or can't be read)."""
+        return self._info(id)[0]
+
+    def uses(self, id: str) -> frozenset[str]:
+        """The macros (ids) placed directly on macro `id`'s board, without loading it:
+        enough to answer "does A contain B" (macros.MacroBook.contains). Empty if the
+        file can't be read."""
+        return self._info(id)[1]
+
+    def _info(self, id: str) -> tuple[str, frozenset[str]]:
         try:
             mtime = self.path(id).stat().st_mtime_ns
         except (OSError, ValueError):
-            return id
+            return id, frozenset()
         cached = self._titles.get(id)
         if cached is not None and cached[0] == mtime:
-            return cached[1]
-        title = _read_title(self.path(id)) or id
-        self._titles[id] = (mtime, title)
-        return title
+            return cached[1], cached[2]
+        title, uses = _peek(self.path(id))
+        self._titles[id] = (mtime, title or id, uses)
+        return title or id, uses
 
     def titles(self) -> dict[str, str]:
         """id -> title for every macro, in title order."""
@@ -389,6 +399,45 @@ def _read(path: Path) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         raise FormatError(f"not valid JSON ({e.msg}, line {e.lineno})") from None
+
+
+_TITLE = re.compile(r'"title"\s*:\s*("(?:[^"\\]|\\.)*")')
+_USES = re.compile(r'"macro"\s*:\s*("(?:[^"\\]|\\.)*")')
+
+
+def _peek(path: Path) -> tuple[str | None, frozenset[str]]:
+    """A file's title and the macros it uses, without decoding the whole board (a
+    big one is hundreds of MB as Python objects). Neither key can appear unescaped
+    inside a string, so a regex finds them; only "title" needs a check that it's
+    the file's own (written above "parts", see encode), else the file is parsed."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None, frozenset()
+    uses = frozenset(
+        u for m in {m.group(1) for m in _USES.finditer(text)} if (u := _string(m))
+    )
+    m = _TITLE.search(text)
+    if m is None:
+        return None, uses
+    parts = text.find('"parts"')
+    if parts == -1 or m.start() < parts:
+        try:
+            return check_name(_string(m.group(1))), uses
+        except (ValueError, TypeError):
+            return None, uses
+    try:  # a "title" further down (a hand-edited file, or a part's props)
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None, uses
+    return (_title(data) if isinstance(data, dict) else None), uses
+
+
+def _string(literal: str) -> str | None:
+    try:
+        return json.loads(literal)
+    except ValueError:  # (a bad escape)
+        return None
 
 
 def _read_title(path: Path) -> str | None:

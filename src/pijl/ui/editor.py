@@ -2868,6 +2868,7 @@ class Editor(pyglet.window.Window):
             self.parts,
             lambda name: self.store.load(name, self.catalog).snapshot,
             self.store.title,
+            self.store.uses,
         )
         self.circuit = Circuit(self.catalog, settle_ticks=SETTLE_TICKS)
 
