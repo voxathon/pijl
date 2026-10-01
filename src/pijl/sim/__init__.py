@@ -1,3 +1,3 @@
-from .circuit import Part, Circuit, Pin, Wire
+from .circuit import FREE, Part, Circuit, Pin, Wire
 
-__all__ = ["Part", "Circuit", "Pin", "Wire"]
+__all__ = ["FREE", "Part", "Circuit", "Pin", "Wire"]

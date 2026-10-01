@@ -467,3 +467,29 @@ def test_a_macro_inside_that_changed_is_built_anew():
     assert first.inner[2].type is cat.get("macro:inner")
     assert second.inner[2].type is Swapped.swap["macro:inner"]
     assert [q.kind for q in _tree(second)] == ["macro:outer", "IN", "macro:inner", "IN", "OUT", "OUT"]
+
+
+def test_free_ends_inside_a_macro_join_nothing():
+    """A body wire with a free end (it names its own uid), and one free at both ends:
+    the macro works as if they weren't there, and their handles come out free."""
+    body = Snapshot(
+        {1: ("IN", "a", 0, 0, {}), 2: ("NOT", "", 0, 0, {}), 3: ("OUT", "y", 0, 0, {})},
+        {
+            1: w(1, 0, 2, 0),
+            2: w(2, 0, 3, 0),
+            3: (("w", 2), ("w", 3), (), (5.0, 5.0), (9.0, 9.0)),  # a stub off wire 2
+            4: (("w", 4), ("w", 4), (), (0.0, 0.0), (1.0, 0.0)),  # attached to nothing
+        },
+    )
+    c = Circuit(catalog({"inv": body}))
+    a, m, out = c.add_part("IN"), c.add_part(MACRO + "inv"), c.add_part("OUT")
+    c.connect(a.outputs[0], m.inputs[0])
+    c.connect(m.outputs[0], out.inputs[0])
+    for v in (False, True):
+        a.outputs[0].state = v
+        for _ in range(10):
+            c.step()
+        assert out.inputs[0].state is level(not v)
+    stub, floating = sorted((x for x in m.inner_wires if x.uid in (3, 4)), key=lambda x: x.uid)
+    assert stub.dst is stub and stub.src.uid == 2
+    assert floating.src is floating.dst is floating

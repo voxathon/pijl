@@ -123,6 +123,7 @@ PART_WIDTH = 80
 IO_WIDTH = 40
 WIRE_THICKNESS = 3
 JUNCTION_RADIUS = 4.5  # dot where a wire attaches to another wire
+FREE_END_HALF = 3.5  # half the side of the square on a wire end attached to nothing
 PART_BORDER = 2
 LABEL_SIZE = 10  # pt at zoom 1
 LABEL_GAP = 6  # between a part and its label

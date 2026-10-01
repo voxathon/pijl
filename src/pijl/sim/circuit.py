@@ -203,11 +203,13 @@ class _WireSlots:
         self.set_ends(wire)
 
     def add_hidden(self, uid: int, ends: list[tuple[bool, int]]) -> int:
-        """A wire inside a macro, by its ends (is it a wire?, slot); no object. Its slot."""
+        """A wire inside a macro, by its ends (is it a wire?, slot; slot -1: a free end);
+        no object. Its slot."""
         slot = self._new_slot()
         self.board[slot], self.uid[slot] = False, uid
         for side, (is_wire, end) in enumerate(ends):
-            self.end_is_wire[slot, side], self.end_slot[slot, side] = is_wire, end
+            self.end_is_wire[slot, side] = is_wire
+            self.end_slot[slot, side] = slot if is_wire and end < 0 else end
         return slot
 
     def add_hidden_block(self, end_is_wire: np.ndarray, end_slot: np.ndarray, uid: np.ndarray) -> None:
@@ -230,10 +232,12 @@ class _WireSlots:
         wire = self.wires[slot]
         if wire is None:
             ends = [
-                self.handle(int(e)) if w else self.pins.handle(int(e))
+                (FREE if e == slot else self.handle(int(e))) if w else self.pins.handle(int(e))
                 for w, e in zip(self.end_is_wire[slot].tolist(), self.end_slot[slot].tolist())
             ]
-            wire = self.wires[slot] = Wire(ends[0], ends[1], int(self.uid[slot]), slot)
+            wire = Wire(ends[0], ends[1], int(self.uid[slot]), slot)
+            wire.src, wire.dst = (wire if e is FREE else e for e in ends)
+            self.wires[slot] = wire
         return wire
 
     def kill(self, slots: list[int]) -> None:
@@ -447,11 +451,26 @@ class _Handles(Sequence):
 Endpoint = Union[Pin, "Wire"]
 
 
+class _Free:
+    """Stands in for "nothing" as an end given to Circuit.connect: the new wire's end
+    becomes the wire itself (see Wire)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "FREE"
+
+
+FREE = _Free()
+
+
 @dataclass(eq=False, slots=True)
 class Wire:
     # Two ends, each a Pin or another Wire. Normalized by Circuit.connect: an
     # output pin is always `src`, an input pin always `dst` -- so a plain
     # pin-to-pin wire reads src=output, dst=input like before junctions existed.
+    # A free end (attached to nothing) is the wire itself: in the nets that's a
+    # wire touching only itself, which joins nothing (see is_free).
     src: Endpoint
     dst: Endpoint
     uid: int = 0  # stable identity, like Part.uid (wires can be endpoints of wires)
@@ -460,6 +479,10 @@ class Wire:
     @property
     def ends(self) -> tuple[Endpoint, Endpoint]:
         return self.src, self.dst
+
+    def is_free(self, end: Endpoint) -> bool:
+        """Is that end of this wire attached to nothing?"""
+        return end is self
 
 
 class Circuit:
@@ -783,7 +806,7 @@ class Circuit:
             ends = []
             for ref in body.wires[uid][:2]:
                 if ref[0] == "w":
-                    ends.append((True, wires[ref[1]]))
+                    ends.append((True, -1 if ref[1] == uid else wires[ref[1]]))
                 else:
                     _, puid, is_input, index = ref
                     p = inner[puid]
@@ -1055,6 +1078,9 @@ class Circuit:
             self._guard(t, "action", lambda: t.action(Ctx(live, self.tick), name))
 
     def can_connect(self, a: Endpoint, b: Endpoint) -> bool:
+        """`a` or `b` may be FREE (a free end: see Wire)."""
+        if a is FREE or b is FREE:
+            return True
         if a is b:
             return False
         if isinstance(a, Pin) and isinstance(b, Pin):
@@ -1077,6 +1103,7 @@ class Circuit:
         self, a: Endpoint, b: Endpoint, uid: int | None = None, check: bool = True
     ) -> tuple[Wire | None, list[Wire]]:
         """Connect two endpoints in either order. Returns (new_wire, replaced_wires).
+        Either may be FREE: that end of the new wire is attached to nothing.
 
         new_wire is None if the connection is invalid (see can_connect). An input
         pin takes one wire, so wiring into an already-wired input replaces the old
@@ -1102,6 +1129,7 @@ class Circuit:
             uid = self._next_wire_uid
         self._next_wire_uid = max(self._next_wire_uid, uid + 1)
         wire = Wire(a, b, uid)
+        wire.src, wire.dst = (wire if e is FREE else e for e in (a, b))
         self._wire_slots.add(wire, board=True)
         self._wires[wire] = None
         self.wire_by_uid[uid] = wire
@@ -1113,6 +1141,8 @@ class Circuit:
     def _link(self, wire: Wire) -> None:
         at = self._at
         for end in wire.ends:
+            if end is wire:
+                continue  # a free end: nothing to be found by
             had = at.get(end)
             if had is None:
                 at[end] = wire
@@ -1124,6 +1154,8 @@ class Circuit:
     def _unlink(self, wire: Wire) -> None:
         at = self._at
         for end in wire.ends:
+            if end is wire:
+                continue
             had = at[end]
             if type(had) is list:
                 had.remove(wire)
@@ -1165,7 +1197,7 @@ class Circuit:
         far = absorb.dst if absorb.src is keep else absorb.src
         slots = self._wire_slots
         self._unlink(keep)
-        keep.dst = far
+        keep.dst = keep if far is absorb else far  # (absorb's far end was free: so is keep's)
         for w in list(self.ends_on(absorb)):
             self._unlink(w)
             if w.src is absorb:
@@ -1180,6 +1212,26 @@ class Circuit:
         slots.kill([absorb.slot])
         self._link(keep)
         slots.set_ends(keep)
+        self._nets_dirty = True
+        self.revision += 1
+
+    def detach(self, wire: Wire, side: str) -> None:
+        """Free one end ("src" or "dst") of a wire: it stays where it is, attached to
+        nothing (see Wire). Its branches stay on it."""
+        self._unlink(wire)
+        setattr(wire, side, wire)
+        self._link(wire)
+        self._wire_slots.set_ends(wire)
+        self._nets_dirty = True
+        self.revision += 1
+
+    def attach(self, wire: Wire, side: str, end: Endpoint) -> None:
+        """Undo a detach: plug a free end back onto what it was on. (No checks: for
+        anything else, wire anew.)"""
+        self._unlink(wire)
+        setattr(wire, side, end)
+        self._link(wire)
+        self._wire_slots.set_ends(wire)
         self._nets_dirty = True
         self.revision += 1
 

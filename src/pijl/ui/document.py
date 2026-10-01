@@ -21,6 +21,7 @@ keeps that true: the surviving wire is the older one.)
 
 from __future__ import annotations
 
+import collections
 import copy
 import itertools
 from operator import eq, itemgetter
@@ -28,7 +29,7 @@ from typing import TYPE_CHECKING, Callable, Iterable
 
 import numpy as np
 
-from ..sim import Pin, Wire
+from ..sim import FREE, Pin, Wire
 from ..snapshot import EMPTY, EndRef, PartData, Snapshot, WireData
 from .views import PartView, Touched, WireView, paused_gc
 
@@ -47,6 +48,7 @@ __all__ = [
     "instantiate_keyed",
     "internal_wires",
     "restore",
+    "rewire",
 ]
 
 # Undo step ids, shared by every History (and the library's, see Editor._undo): so
@@ -76,23 +78,56 @@ MIN_MOVE_GROUP = 8  # fewer than this moved by one delta: kept as plain values
 NO_PROPS: dict = {}  # props of a part that has none (shared: never write to it)
 
 
-def capture(editor: Editor, views: Iterable[PartView] | None = None) -> Snapshot:
+def capture(
+    editor: Editor,
+    views: Iterable[PartView] | None = None,
+    wires: Iterable[WireView] = (),
+) -> Snapshot:
     """The whole board, or just `views` plus every wire fully inside that set
-    (both ends on those parts, or on wires that are themselves inside). Parts come in
-    board order (uid order for `views`, which may be a set: copies made from the
-    snapshot are made in its order, which decides their slots and draw order)."""
+    (both ends on those parts, or on wires that are themselves inside) plus `wires`.
+    Parts come in board order (uid order for `views`, which may be a set: copies made
+    from the snapshot are made in its order, which decides their slots and draw order).
+
+    An end of one of `wires` on something not in the snapshot is free in it, right
+    where it was: copying a wire on its own copies its shape."""
+    whole = views is None
+    picked = list(wires)
     views = (
         list(editor.part_views.values())
-        if views is None
+        if whole
         else sorted(views, key=lambda v: v.part.uid)
     )
     parts = {v.part.uid: part_data(v) for v in views}
-    wires, colors = {}, {}
-    for view in internal_wires(editor, views):
-        wires[view.wire.uid] = wire_data(view)
+    out, colors = {}, {}
+    # (the whole board: wires attached to nothing at all too)
+    if whole:
+        some = sorted(editor.wire_views.values(), key=lambda v: v.wire.uid)
+    else:
+        some = sorted(
+            set(internal_wires(editor, views)).union(picked),
+            key=lambda v: v.wire.uid,
+        )
+    kept = {v.part for v in views}
+    taken = {v.wire for v in some}
+    for view in some:
+        data = wire_data(view)
+        if not whole:
+            data = _cut_loose(view, data, kept, taken)
+        out[view.wire.uid] = data
         if view.color:
             colors[view.wire.uid] = view.color
-    return Snapshot(parts, wires, colors)
+    return Snapshot(parts, out, colors)
+
+
+def _cut_loose(view: WireView, data: WireData, parts: set, wires: set) -> WireData:
+    """`data` with the ends on anything but `parts` and `wires` made free, where they are."""
+    w = view.wire
+    data = list(data)
+    for k, (end, at) in enumerate(((w.src, view.src), (w.dst, view.dst))):
+        if end is w or ((end.part in parts) if isinstance(end, Pin) else (end in wires)):
+            continue
+        data[k], data[3 + k] = ("w", w.uid), at
+    return tuple(data)
 
 
 def changes(
@@ -123,8 +158,8 @@ def part_data(view: PartView) -> PartData:
 def wire_data(view: WireView) -> WireData:
     w = view.wire
     return (
-        _ref(w.src),
-        _ref(w.dst),
+        _ref(w.src, w),
+        _ref(w.dst, w),
         tuple(view.bends),
         None if isinstance(w.src, Pin) else view.src,
         None if isinstance(w.dst, Pin) else view.dst,
@@ -132,7 +167,8 @@ def wire_data(view: WireView) -> WireData:
 
 
 def internal_wires(editor: Editor, views: Iterable[PartView]) -> list[WireView]:
-    """Wire views whose every end lands on those parts or on other internal wires."""
+    """Wire views whose every end lands on those parts or on other internal wires --
+    or is free, as long as some end does land there."""
     c = editor.circuit
     parts = {v.part for v in views}
     if 2 * len(parts) > len(editor.part_views):
@@ -143,10 +179,53 @@ def internal_wires(editor: Editor, views: Iterable[PartView]) -> list[WireView]:
     inside: set[Wire] = set()
     result = []
     for w in candidates:  # creation order: parents first
-        if all(e.part in parts if isinstance(e, Pin) else e in inside for e in w.ends):
+        ends = [e for e in w.ends if e is not w]  # (free ends go wherever the rest goes)
+        if ends and all(e.part in parts if isinstance(e, Pin) else e in inside for e in ends):
             inside.add(w)
             result.append(editor.wire_views[w])
     return result
+
+
+def rewire(editor: Editor, view: WireView, side: str, target, at) -> Wire:
+    """Plug end `side` ("src" / "dst") of a wire onto `target` -- a pin, another wire
+    (`at`: the spot on it) or FREE (`at`: where the end is left) -- and return the
+    wire. Check it with Editor.can_rewire first.
+
+    The wire and everything hanging off it are made anew, with fresh uids: a wire
+    must be newer than the wires it attaches to (see snapshot.py), and `target` may
+    be newer than this one. Undo sees them go and come back, like any edit."""
+    c = editor.circuit
+    w = view.wire
+    family = [w, *c.descendants(w)]
+    datas = [
+        (x.uid, wire_data(editor.wire_views[x]), editor.wire_views[x].color)
+        for x in family
+    ]
+    src, dst, bends, src_pt, dst_pt = datas[0][1]
+    ref = ("w", w.uid) if target is FREE else _ref(target, w)
+    pt = None if isinstance(target, Pin) else at
+    if side == "src":
+        src, src_pt = ref, pt
+    else:
+        dst, dst_pt = ref, pt
+    datas[0] = (w.uid, (src, dst, bends, src_pt, dst_pt), datas[0][2])
+    editor.remove_wire(view)  # (the whole family)
+    made: dict[int, Wire] = {}
+    lookup = collections.ChainMap(made, c.wire_by_uid)
+    with editor.wire_batch():
+        for uid, (src, dst, bends, src_pt, dst_pt), color in datas:
+            made[uid] = editor.connect(
+                _resolve(src, c.part_by_uid, lookup, uid),
+                _resolve(dst, c.part_by_uid, lookup, uid),
+                list(bends),
+                src_pt,
+                dst_pt,
+                color=color,
+                check=False,
+            )
+    new = made[w.uid]
+    editor.refresh_wires([editor.wire_views[new]])
+    return new
 
 
 def restore(
@@ -190,7 +269,7 @@ def _restore(
         if wire is None:
             continue  # gone already (or never here)
         data = target.wires.get(uid)
-        if data is None or (_ref(wire.src), _ref(wire.dst)) != data[:2]:
+        if data is None or (_ref(wire.src, wire), _ref(wire.dst, wire)) != data[:2]:
             wire_uids.update(w.uid for w in editor.remove_wire(editor.wire_views[wire]))
     # 3. parts: add missing (all at once), update moved/relabeled/re-propped
     moved = set()
@@ -230,8 +309,8 @@ def _restore(
             src_ref, dst_ref, bends, src_pt, dst_pt = target.wires[uid]
             wire = c.wire_by_uid.get(uid)
             if wire is None:
-                src = _resolve(src_ref, c.part_by_uid, c.wire_by_uid)
-                dst = _resolve(dst_ref, c.part_by_uid, c.wire_by_uid)
+                src = _resolve(src_ref, c.part_by_uid, c.wire_by_uid, uid)
+                dst = _resolve(dst_ref, c.part_by_uid, c.wire_by_uid, uid)
                 editor.connect(
                     src,
                     dst,
@@ -292,8 +371,8 @@ def _instantiate(
     with editor.wire_batch():
         for uid in sorted(clip.wires):
             src_ref, dst_ref, bends, src_pt, dst_pt = clip.wires[uid]
-            src = _resolve(src_ref, new_parts, new_wires)
-            dst = _resolve(dst_ref, new_parts, new_wires)
+            src = _resolve(src_ref, new_parts, new_wires, uid)
+            dst = _resolve(dst_ref, new_parts, new_wires, uid)
             new_wires[uid] = editor.connect(
                 src,
                 dst,
@@ -665,16 +744,19 @@ def change_uids(change: Change) -> tuple[set[int], set[int]]:
     return section_uids(parts), section_uids(wires) | section_uids(colors)
 
 
-def _ref(end) -> EndRef:
+def _ref(end, wire: Wire) -> EndRef:
+    """`end` of `wire`, as data. A free end is the wire itself, so its ref names the
+    wire's own uid (see snapshot.py)."""
     if isinstance(end, Pin):
         return "p", end.part.uid, end.is_input, end.index
     return "w", end.uid
 
 
-def _resolve(ref: EndRef, parts: dict, wires: dict[int, Wire]):
-    """`parts`: uid -> Part."""
+def _resolve(ref: EndRef, parts: dict, wires: dict[int, Wire], own: int):
+    """`parts`: uid -> Part; `own`: the uid of the wire whose end this is (a ref to it
+    is a free end: FREE)."""
     if ref[0] == "p":
         _, part_uid, is_input, index = ref
         part = parts[part_uid]
         return (part.inputs if is_input else part.outputs)[index]
-    return wires[ref[1]]
+    return FREE if ref[1] == own else wires[ref[1]]

@@ -30,7 +30,8 @@ nicely in git:
   - A wire end is a pin ({"part", "in"/"out": index}), a macro's pin
     ({"part", "pin": uid of the IN/OUT inside the macro that it comes from}, so
     it survives the macro's ports being moved around), or a point along another
-    wire ({"wire", "at"}). A wire only attaches to wires with a smaller uid.
+    wire ({"wire", "at"}). A wire only attaches to wires with a smaller uid --
+    or to itself: that end is free (attached to nothing), and "at" is where it is.
 
 Both directions need to know the part types (pin counts, macro pins): `types`
 is a Registry or a macros.Catalog.
@@ -480,8 +481,10 @@ def _decode_end(
         raise TypeError("a wire end isn't an object")
     if "wire" in d:
         target = _int(d["wire"])
-        if target >= wire_uid:
+        if target > wire_uid:
             raise ValueError("attaches to a newer wire")
+        if target == wire_uid:  # itself: a free end
+            return ("w", target), _pair(d["at"])
         if target not in snap.wires:
             return None, None
         return ("w", target), _pair(d["at"])

@@ -13,6 +13,10 @@ axis) and every cell slides into place.
 
 Changing the selection, or moving it, ends the pattern: the next Ctrl+D starts
 over with whatever is selected then as the unit.
+
+A unit of wires alone (no parts) doesn't alternate: it's laid side by side, across
+the way its wires run (start to end) -- running left-right, the copies stack
+downward, running up-down they go to the right. A bus, one wire a grid cell apart.
 """
 
 from __future__ import annotations
@@ -47,13 +51,16 @@ class Tiling:
     ) -> None:
         # (unit None: a column still being carried, see Editor._stack; set once placed)
         self.unit = unit
+        # wires alone: one axis only, across them (see the module docstring)
+        self.axis: int | None = None if parts or not wires else _across(wires)
         xs = [x for v in parts for x in (v.x, v.x + v.w)] + [
             p[0] for w in wires for p in w.points
         ]
         ys = [y for v in parts for y in (v.y, v.y + v.h)] + [
             p[1] for w in wires for p in w.points
         ]
-        self.size = (_cells(max(xs) - min(xs)), _cells(max(ys) - min(ys)))
+        cells = _cells if parts else _wire_cells  # (a straight wire is 0 thick)
+        self.size = (cells(max(xs) - min(xs)), cells(max(ys) - min(ys)))
         self.gap = [max(MIN_GAP, s) for s in self.size]  # default: the unit's own size
         self.cells: dict[tuple[int, int], Cell] = {(0, 0): Cell(parts, wires)}
         self.cols = self.rows = 1
@@ -64,6 +71,8 @@ class Tiling:
         )
 
     def next_axis(self) -> int:
+        if self.axis is not None:
+            return self.axis
         return RIGHT if self.last != RIGHT else DOWN
 
     def grow(self, axis: int, make_cells: Callable[[list[Point]], list[Cell]]) -> None:
@@ -152,6 +161,19 @@ def tiled(unit: Snapshot, offsets: list[Point]) -> tuple[Snapshot, int]:
         for uid, color in unit.wire_colors.items():
             colors[base + uid] = color
     return Snapshot(parts, wires, colors), stride
+
+
+def _across(wires: list[WireView]) -> int:
+    """The axis to lay copies of these wires along: across the way they run."""
+    dx = dy = 0.0
+    for w in wires:
+        (x0, y0), (x1, y1) = w.points[0], w.points[-1]
+        dx, dy = dx + abs(x1 - x0), dy + abs(y1 - y0)
+    return DOWN if dx >= dy else RIGHT
+
+
+def _wire_cells(length: float) -> int:
+    return max(0, math.ceil(length / T.GRID - 1e-6))
 
 
 def _cells(length: float) -> int:

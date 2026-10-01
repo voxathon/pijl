@@ -477,12 +477,20 @@ def _set_dot_colors(buf, slot: int, off, on) -> None:
     buf.mark(slot)
 
 
-def _place_wire_dot(buf, slot: int, xy: Point) -> None:
-    """A junction dot (a zero-length segment, both ends capped) at xy."""
+def _place_wire_dot(buf, slot: int, xy: Point, free: bool = False) -> None:
+    """A junction dot (a zero-length segment, both ends capped) at xy -- or, for a
+    free end, a small square (a segment as long as it is thick, uncapped)."""
     f = buf.f
-    f["a"][slot] = xy
-    f["b"][slot] = xy
-    f["flags"][slot, 2:] = (255, 255)
+    if free:
+        x, y = xy
+        h = T.FREE_END_HALF
+        f["a"][slot], f["b"][slot] = (x - h, y), (x + h, y)
+        f["radius"][slot] = h
+        f["flags"][slot, 2:] = (0, 0)
+    else:
+        f["a"][slot] = xy
+        f["b"][slot] = xy
+        f["flags"][slot, 2:] = (255, 255)
     buf.mark(slot)
 
 
@@ -1580,10 +1588,11 @@ class WireView:
     def _redraw(self) -> None:
         t, row = self.table, self.row
         t.redraw(row)
-        for k in (0, 1):
+        w = self.wire
+        for k, end in enumerate(w.ends):
             dot = int(t.dot[row, k])
             if dot >= 0:
-                _place_wire_dot(t.buf, dot, t.end(row, k))
+                _place_wire_dot(t.buf, dot, t.end(row, k), end is w)
         if t.index is not None:
             t.index.put_polyline(self, self.points)
         Touched.wire(
@@ -1951,7 +1960,8 @@ def _drop_tags(views: list[PartView]) -> None:
 def _make_wire_shapes(views: list[WireView], lines: list[list[Point]]) -> None:
     """The segments of a new wire's line (and its junction dots), placed and colored.
     Per wire, in order: its segments, then a dot on each end that's a junction (right
-    after its line: a wire crossing the junction covers it)."""
+    after its line: a wire crossing the junction covers it), or a square on each end
+    that's free."""
     if not views:
         return
     t = views[0].table
@@ -1965,6 +1975,8 @@ def _make_wire_shapes(views: list[WireView], lines: list[list[Point]]) -> None:
     n_seg = np.maximum(n_pts - 1, 0)
     dot_src = np.fromiter(("src" in e for e in ends), bool, n)
     dot_dst = np.fromiter(("dst" in e for e in ends), bool, n)
+    free_src = np.fromiter((v.wire.src is v.wire for v in views), bool, n)
+    free_dst = np.fromiter((v.wire.dst is v.wire for v in views), bool, n)
     rows = n_seg + dot_src + dot_dst
     first = np.cumsum(rows) - rows  # each wire's first row
     total = int(rows.sum())
@@ -1985,13 +1997,21 @@ def _make_wire_shapes(views: list[WireView], lines: list[list[Point]]) -> None:
         caps[at, 0] = np.where(k >= 1, 255, 0)
         caps[at, 1] = np.where(k + 1 <= n_seg[wire] - 1, 255, 0)
         # junction dots: zero-length, capped both ends
-        for has, row, point in (
-            (dot_src, n_seg, first_pt),
-            (dot_dst, n_seg + dot_src, first_pt + n_pts - 1),
+        for has, free, row, point in (
+            (dot_src, free_src, n_seg, first_pt),
+            (dot_dst, free_dst, n_seg + dot_src, first_pt + n_pts - 1),
         ):
             w = np.flatnonzero(has)
             a[first[w] + row[w]] = b[first[w] + row[w]] = p[point[w]]
             radius[first[w] + row[w]] = T.JUNCTION_RADIUS
+            # free ends: squares, a segment as long as it's thick and uncapped
+            sq = first[w] + row[w]
+            sq = sq[free[w]]
+            h = T.FREE_END_HALF
+            a[sq, 0] -= h
+            b[sq, 0] += h
+            radius[sq] = h
+            caps[sq] = 0
         f = buf.f
         f["a"][slots] = a
         f["b"][slots] = b

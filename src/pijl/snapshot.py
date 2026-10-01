@@ -19,10 +19,12 @@ MACRO = "macro:"  # kind prefix of a placed macro ("macro:half adder"); part typ
 
 Point = tuple[float, float]
 PartData = tuple[str, str, float, float, dict[str, Any]]  # kind, label, x, y, props
-# ("p", part uid, is_input, pin index) or ("w", wire uid)
+# ("p", part uid, is_input, pin index) or ("w", wire uid). A wire end naming the
+# wire's own uid is a free end (attached to nothing: see sim.Wire).
 EndRef = tuple
 # src ref, dst ref, bends (src to dst), src junction point, dst junction point
-# (junction points are None for pin ends: those follow from the part's position)
+# (junction points are None for pin ends: those follow from the part's position;
+# a free end's point is where it is)
 WireData = tuple[EndRef, EndRef, tuple[Point, ...], Point | None, Point | None]
 
 

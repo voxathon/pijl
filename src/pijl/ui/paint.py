@@ -84,8 +84,8 @@ def paint(
         view = wire_views.get(wire)
         if view is None:
             continue
-        src = _end_color(wire.src, view.src, wire_views)
-        dst = _end_color(wire.dst, view.dst, wire_views)
+        src = _end_color(wire, wire.src, view.src, wire_views)
+        dst = _end_color(wire, wire.dst, view.dst, wire_views)
         if src is None and dst is None and not view.color:
             if view.stops:  # (the usual case, nothing colored nearby: no gradient)
                 view.set_stops([])
@@ -104,11 +104,13 @@ def paint(
         view.set_tints(pins, own[1] if own else next((t for t in pins if t), None))
 
 
-def _end_color(end, at: Point, wire_views: dict) -> Pair | None:
+def _end_color(wire, end, at: Point, wire_views: dict) -> Pair | None:
     """A wire end's color: its part's (pin ends), or the parent wire's gradient where
-    the end sits on it (junction ends)."""
+    the end sits on it (junction ends). Free ends have none."""
     if isinstance(end, Pin):
         return color_pair(part_color(end.part))
+    if end is wire:
+        return None
     parent = wire_views.get(end)
     return parent.color_at(at) if parent is not None and parent.stops else None
 

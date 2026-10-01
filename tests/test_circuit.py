@@ -397,3 +397,47 @@ def test_removed_parts_and_wires_are_let_go():
     assert all(c._pins.pins[s] is None for s in pin_slots)
     assert c._wire_slots.wires[w.slot] is None
     assert not c._at and c.pin_count == 3
+
+
+# ---- free ends: a wire end attached to nothing is the wire itself -----------------
+
+
+def test_free_end_is_the_wire_itself_and_joins_nothing():
+    from pijl.sim import FREE
+
+    c = Circuit()
+    a, g = c.add_part("IN"), c.add_part("NOT")
+    stub, _ = c.connect(FREE, a.outputs[0])
+    assert stub.src is a.outputs[0] and stub.dst is stub and stub.is_free(stub.dst)
+    assert c.ends_on(stub) == ()  # (not its own branch)
+    c.connect(stub, g.inputs[0])  # a branch off the stub carries a's value
+    a.outputs[0].state = True
+    settle(c)
+    assert g.inputs[0].state is Level(ONE)
+    floating, _ = c.connect(FREE, FREE)
+    assert floating.src is floating.dst is floating
+    settle(c)  # (nets with no pins at all)
+
+
+def test_detach_keeps_branches_and_frees_the_end():
+    c = Circuit()
+    a, g, h = c.add_part("IN"), c.add_part("NOT"), c.add_part("NOT")
+    w, _ = c.connect(a.outputs[0], g.inputs[0])
+    branch, _ = c.connect(w, h.inputs[0])
+    c.detach(w, "src")
+    assert w.src is w and c.wires_at(a.outputs[0]) == [] and c.attachments(w) == [branch]
+    settle(c)
+    assert g.inputs[0].state is h.inputs[0].state is Level(Z)  # no driver left
+    c.remove_part(a)  # nothing of it was attached any more
+    assert c.wires == [w, branch]
+
+
+def test_merge_onto_a_free_end_leaves_a_free_end():
+    from pijl.sim import FREE
+
+    c = Circuit()
+    a, g = c.add_part("IN"), c.add_part("NOT")
+    trunk, _ = c.connect(a.outputs[0], g.inputs[0])
+    stub, _ = c.connect(trunk, FREE)
+    c.merge(trunk, stub)
+    assert trunk.dst is trunk and c.wires == [trunk]

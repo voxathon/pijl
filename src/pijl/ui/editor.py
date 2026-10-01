@@ -122,7 +122,7 @@ from ..project import (
     write_atomic,
 )
 from ..storage import NAME_MAX, FormatError, MacroStore, check_name
-from ..sim import Part, Circuit, Pin, Wire
+from ..sim import FREE, Part, Circuit, Pin, Wire
 from ..snapshot import (
     MACRO,
 )  # library entries (and part kinds) of saved macros: "macro:<name>"
@@ -143,6 +143,7 @@ from .document import (
     instantiate_keyed,
     internal_wires,
     restore,
+    rewire,
 )
 from .duplicate import DOWN, RIGHT, Cell, Tiling, tiled
 from .grid import Grid
@@ -213,6 +214,7 @@ class Mode(Enum):
     MENU = auto()  # context menu open; the next click picks an item or closes it
     EDITING_LABEL = auto()  # typing a part's label in place
     EDITING_WIRE = auto()  # moving / adding / removing one wire's bend points
+    DRAGGING_END = auto()  # carrying a wire's free end: dropped on a pin / wire, it plugs in
     PICKER_PRESS = (
         auto()
     )  # mouse down on a picker row: a click picks / toggles it, a drag moves it
@@ -363,6 +365,22 @@ class Editor(pyglet.window.Window):
         self.wire_start_pos: Point = (0.0, 0.0)
         self.wire_bends: list[Point] = []
         self.preview: Polyline | None = None
+        # a free end being carried (DRAGGING_END): its wire's view and "src" / "dst",
+        # what it would plug into where it is (or None), and whether a click drops it
+        # (picked up from a menu) rather than letting go of the button
+        self.end_drag: tuple[WireView, str] | None = None
+        self.end_target: tuple[Pin | Wire, Point] | None = None
+        self.end_drag_click = False
+        self.end_from: tuple[Point, Pin | Wire | None] | None = None  # (spot, unplugged from)
+        self.end_moved = False
+        self.end_skip: set[Wire] = set()  # the carried wire and its branches: no targets
+        self.end_hover = False  # the cursor is a hand over a free end
+        # the last left press on empty board (time, screen point): a second one there
+        # soon after is a double-click, which starts a wire from nothing
+        self.empty_click: tuple[float, Point] = (0.0, (0.0, 0.0))
+        # a right press on empty board (screen point, world point): let go without
+        # dragging (that pans) and it opens the board menu
+        self.empty_right: tuple[Point, Point] | None = None
         # label editing
         self.edit_view: PartView | None = None
         self.edit: LineEdit | None = None
@@ -458,16 +476,58 @@ class Editor(pyglet.window.Window):
         """Returns the wires that went with it."""
         return self.remove_parts([view])
 
-    def remove_parts(self, views: list[PartView]) -> list[Wire]:
+    def remove_parts(self, views: list[PartView], unplug: bool = False) -> list[Wire]:
         """Remove many parts at once (a big selection: one by one was seconds).
-        Returns the wires that went with them."""
+        Returns the wires that went with them.
+
+        `unplug`: wires that still lead somewhere else stay, with the ends that were on
+        these parts (or on wires going with them) left free where they were. Only wires
+        attached to nothing else go."""
         if self.hover_view in views:
             self.hover_view = None
+        if unplug:
+            self._unplug_from({v.part for v in views})
         removed = self.circuit.remove_parts([v.part for v in views])
         for v in views:
             del self.part_views[v.part]
         self._drop_views(views, removed)
         return removed
+
+    def _unplug_from(self, parts: set[Part]) -> None:
+        """Free the ends of wires on `parts` (see remove_parts) that lead elsewhere too."""
+        c = self.circuit
+        on = {w for part in parts for pin in part.pins for w in c.ends_on(pin)}
+        dead: set[Wire] = set()
+        freed = []
+        for w in sorted(on.union(c.descendants(*on)), key=lambda w: w.uid):  # parents first
+            gone, stays = [], False
+            for side, e in (("src", w.src), ("dst", w.dst)):
+                if e is w:
+                    continue
+                if (e.part in parts) if isinstance(e, Pin) else (e in dead):
+                    gone.append(side)
+                else:
+                    stays = True
+            if not stays:
+                dead.add(w)  # (removed with the parts, or as a branch of a wire that is)
+            elif gone:
+                for side in gone:
+                    c.detach(w, side)
+                freed.append(w)
+        for w in freed:
+            self._remake_wire_view(w)
+
+    def _remake_wire_view(self, wire: Wire) -> WireView:
+        """A new view for a wire whose ends changed kind (pin / junction / free: their
+        shapes differ), drawn where the old one was."""
+        old = self.wire_views[wire]
+        spec = (wire, old.src, list(old.bends), old.dst)
+        color, selected = old.color, old in self.selection.wires
+        self._drop_views([], [wire])
+        view = self.wire_views[wire] = WireView(*spec, self.wire_table, color)
+        if selected:
+            self.selection.add(view)
+        return view
 
     def _drop_wire_view(self, wire: Wire) -> None:
         if self._wire_batch is not None and wire in self._wire_batch:
@@ -515,15 +575,16 @@ class Editor(pyglet.window.Window):
         color: str | None = None,
         check: bool = True,
     ) -> Wire | None:
-        """Connect two endpoints (pins or wires); `bends` are ordered from a to b.
-        `a_pos` / `b_pos` say where on a wire endpoint the junction sits.
+        """Connect two endpoints (pins, wires or FREE); `bends` are ordered from a to b.
+        `a_pos` / `b_pos` say where on a wire endpoint the junction sits (or where a
+        free end is).
         `check=False`: rebuilding wiring that existed before (see Circuit.connect)."""
         wire, replaced = self.circuit.connect(a, b, uid, check)
         for old in replaced:
             self._drop_wire_view(old)
         if wire is not None:
-            if (
-                wire.src is not a
+            if not (
+                wire.src is a or (a is FREE and wire.src is wire)
             ):  # the circuit put the output side first; flip our layout too
                 bends, a_pos, b_pos = list(reversed(bends)), b_pos, a_pos
             src = self.pin_pos(wire.src) if isinstance(wire.src, Pin) else a_pos
@@ -599,9 +660,8 @@ class Editor(pyglet.window.Window):
             Touched.wire(x.uid)
         for gone in (w, splice):
             self._drop_wire_view(gone)
-        self.wire_views[w] = WireView(
-            w, src_pos, bends, self.end_pos(w.dst, far_pos), self.wire_table, color
-        )
+        dst_pos = far_pos if w.dst is w else self.end_pos(w.dst, far_pos)
+        self.wire_views[w] = WireView(w, src_pos, bends, dst_pos, self.wire_table, color)
         self.refresh_wires([self.wire_views[w]])
 
     def _attach_point(self, x: Wire, parent: Wire) -> Point:
@@ -616,7 +676,9 @@ class Editor(pyglet.window.Window):
     def delete_selection(self) -> None:
         # (in uid order, not the sets': what's freed first is reused last, see spatial.py)
         self.remove_wires(sorted(self.selection.wires, key=lambda v: v.wire.uid))
-        self.remove_parts(sorted(self.selection.parts, key=lambda v: v.part.uid))
+        self.remove_parts(
+            sorted(self.selection.parts, key=lambda v: v.part.uid), unplug=True
+        )
         self.selection.clear()
 
     def pin_pos(self, pin: Pin) -> Point:
@@ -662,6 +724,8 @@ class Editor(pyglet.window.Window):
             )
 
     def end_pos(self, end: Pin | Wire, near: Point) -> Point:
+        """Where an end on `end` goes, from `near`: the pin, or the nearest point on the
+        wire. (A free end is on its own wire: it stays at `near`.)"""
         if isinstance(end, Pin):
             return self.pin_pos(end)
         return project_onto(self.wire_views[end].points, near)
@@ -725,24 +789,67 @@ class Editor(pyglet.window.Window):
             hit = hit if d <= self.slop else None
         return hit
 
-    def wire_at(self, wx: float, wy: float) -> WireView | None:
-        """The nearest wire within reach (the older one on a tie, e.g. right on a junction)."""
+    def wire_at(self, wx: float, wy: float, skip=()) -> WireView | None:
+        """The nearest wire within reach (the older one on a tie, e.g. right on a junction),
+        other than the wires in `skip`."""
         limit = T.WIRE_THICKNESS / 2 + self.slop
         near = (
             (v.distance_to(wx, wy), v.seq, v)
             for v in self.wire_index.near(wx, wy, limit)
+            if v.wire not in skip
         )
         d, _, best = min(near, default=(math.inf, 0, None))
         return best if d <= limit else None
 
-    def wire_target(self, wx: float, wy: float) -> tuple[Pin | Wire, Point] | None:
+    def wire_target(
+        self, wx: float, wy: float, skip=()
+    ) -> tuple[Pin | Wire, Point] | None:
         """What a wire being drawn would connect to here: a pin (preferred) or a
-        point on another wire."""
+        point on another wire (not one in `skip`)."""
         if pin := self.pin_at(wx, wy):
             return pin, self.pin_pos(pin)
-        if view := self.wire_at(wx, wy):
+        if view := self.wire_at(wx, wy, skip):
             return view.wire, project_onto(view.points, self.snapped(wx, wy))
         return None
+
+    def free_end_at(self, wx: float, wy: float) -> tuple[WireView, str] | None:
+        """The free wire end (its view, "src" / "dst") whose square is here, if any:
+        the nearest within reach (the newer wire on a tie)."""
+        reach = max(T.FREE_END_HALF, self.slop)
+        best, best_key = None, None
+        for v in self.wire_index.near(wx, wy, reach):
+            w = v.wire
+            for side, p in (("src", v.src), ("dst", v.dst)):
+                if getattr(w, side) is w:
+                    d = max(abs(p[0] - wx), abs(p[1] - wy))  # (a square's distance)
+                    if d <= reach and (best_key is None or (d, -v.seq) < best_key):
+                        best, best_key = (v, side), (d, -v.seq)
+        return best
+
+    def can_rewire(self, wire: Wire, side: str, target: Pin | Wire) -> bool:
+        """Can end `side` of `wire` (a free one) be plugged onto `target`?"""
+        c = self.circuit
+        other = wire.dst if side == "src" else wire.src
+        family = {wire, *c.descendants(wire)}
+        if target in family:
+            return False  # onto itself or its own branch: a loop
+        if other is not wire and not c.can_connect(other, target):
+            return False  # two inputs, two outputs, one part to itself, ...
+        if isinstance(target, Pin) and target.is_input:
+            # Plugging into an input replaces its wire, and that wire's branches: not
+            # one this wire hangs off (it would go too), nor one of this wire's own.
+            on = c.wires_at(target)
+            doomed = set(on).union(c.descendants(*on))
+            up: set[Wire] = set()
+            todo = [e for e in wire.ends if isinstance(e, Wire) and e is not wire]
+            while todo:
+                x = todo.pop()
+                if x not in up:
+                    up.add(x)
+                    todo += [e for e in x.ends if isinstance(e, Wire) and e is not x]
+            if doomed & (family | up):
+                return False
+        return True
 
     def can_wire_to(self, end: Pin | Wire | None) -> bool:
         return (
@@ -826,6 +933,11 @@ class Editor(pyglet.window.Window):
             return
         if self.mode is Mode.EDITING_WIRE:
             view = self.wire_edit.view
+            hit = self.free_end_at(wx, wy) if button == mouse.LEFT else None
+            if hit is not None and hit[0] is view:
+                self._finish_wire_edit(commit=True)
+                self._start_end_drag(*hit)
+                return
             self._wire_edit_press(x, y, wx, wy, button)
             self.refresh_wires([view])  # branches slide along the edited wire
             return
@@ -884,11 +996,28 @@ class Editor(pyglet.window.Window):
                     )
                     self._cancel()  # clears the preview; the wire now exists
                 elif end is None:
-                    self.wire_bends.append(self.snapped(wx, wy))
-                    self._update_preview()
+                    p = self.snapped(wx, wy)
+                    if self.wire_bends and math.dist(p, self.wire_bends[-1]) <= self.slop:
+                        self._end_wire_free()  # the same spot again: end it there
+                    elif (
+                        self.wire_start is FREE
+                        and not self.wire_bends
+                        and math.dist(p, self.wire_start_pos) <= self.slop
+                    ):
+                        pass  # (a third click of the double-click that started it)
+                    else:
+                        self.wire_bends.append(p)
+                        self._update_preview()
                 # clicking an invalid target (in->in pin, same part, ...) does nothing
             elif button == mouse.RIGHT:
                 self._pop_bend_or_cancel()
+            return
+
+        if self.mode is Mode.DRAGGING_END:
+            if button == mouse.LEFT and self.end_drag_click:
+                self._drop_end()
+            elif button == mouse.RIGHT:
+                self._cancel()
             return
 
         if self.mode in (
@@ -909,7 +1038,9 @@ class Editor(pyglet.window.Window):
                 self._picker_menu(in_picker, x, y)
             return
         if button == mouse.LEFT:
-            if pin := self.pin_at(wx, wy):
+            if hit := self.free_end_at(wx, wy):
+                self._start_end_drag(*hit)
+            elif pin := self.pin_at(wx, wy):
                 self._start_wiring(pin, self.pin_pos(pin))
             elif modifiers & key.MOD_ALT and (view := self.wire_at(wx, wy)):
                 self._start_wiring(
@@ -935,7 +1066,12 @@ class Editor(pyglet.window.Window):
                         (x, y),
                     )
                     self.mode = Mode.PRESSING_WIRE
+            elif self._double_click_empty(x, y) and not (
+                modifiers & key.MOD_SHIFT and not modifiers & key.MOD_CTRL
+            ):  # (Shift alone adds to the selection; Ctrl snaps, Ctrl+Shift to the subgrid)
+                self._start_wiring(FREE, self.snapped(wx, wy))
             else:
+                self.empty_click = (time.monotonic(), (x, y))
                 shift = modifiers & key.MOD_SHIFT
                 self.box_base = (
                     (set(self.selection.parts), set(self.selection.wires))
@@ -950,6 +1086,27 @@ class Editor(pyglet.window.Window):
 
         elif button == mouse.RIGHT and not self._item_menu(x, y, wx, wy, modifiers):
             self.panning = True
+            self.empty_right = ((x, y), (wx, wy))  # a click, not a drag: the board menu
+
+    def _double_click_empty(self, x: float, y: float) -> bool:
+        """Is a left press on empty board here the second half of a double-click?"""
+        t, (px, py) = self.empty_click
+        double = (
+            time.monotonic() - t < DOUBLE_CLICK
+            and abs(x - px) + abs(y - py) < T.DRAG_THRESHOLD_PX
+        )
+        if double:
+            self.empty_click = (0.0, (0.0, 0.0))  # (a third click starts afresh)
+        return double
+
+    def _board_menu(self, x: float, y: float, wx: float, wy: float) -> None:
+        """The context menu for empty board."""
+        at = self.snapped(wx, wy)  # Ctrl held when it opens, or when the item is picked: snapped
+
+        def new_wire() -> None:
+            self._start_wiring(FREE, self.snapped(wx, wy) if self.snapping else at)
+
+        self._open_menu(x, y, [MenuItem("New wire", new_wire)])
 
     def _item_menu(
         self, x: float, y: float, wx: float, wy: float, modifiers: int
@@ -995,18 +1152,32 @@ class Editor(pyglet.window.Window):
                 )
             items += self._settings_items(group)
             items.append(
-                MenuItem("Delete", lambda: self.remove_parts(group), danger=True)
+                MenuItem(
+                    "Delete", lambda: self.remove_parts(group, unplug=True), danger=True
+                )
             )
             self._open_menu(x, y, items)
         elif wire := self.wire_at(wx, wy):
             self.selection.set(wires=[wire])
             at = project_onto(wire.points, (wx, wy))
+            w = wire.wire
+            plugged = [  # the end nearest the click that's on something
+                (math.dist(p, (wx, wy)), side)
+                for side, p in (("src", wire.src), ("dst", wire.dst))
+                if getattr(w, side) is not w
+            ]
+            unplug = (
+                [MenuItem("Unplug end", lambda: self._unplug(wire, min(plugged)[1]))]
+                if plugged
+                else []
+            )
             self._open_menu(
                 x,
                 y,
                 [
                     MenuItem("Edit", lambda: self._start_wire_edit(wire)),
                     MenuItem("Branch", lambda: self._start_wiring(wire.wire, at)),
+                    *unplug,
                     MenuItem(
                         "Recolor",
                         submenu=self._recolor_items(
@@ -1167,6 +1338,13 @@ class Editor(pyglet.window.Window):
         if self.mode is Mode.PROMPT:
             self.prompt.hover(x, y)
             return
+        if self.mode is Mode.IDLE and not self.inside:
+            over = self.free_end_at(*self.camera.screen_to_world(x, y)) is not None
+            if over != self.end_hover:
+                self.end_hover = over
+                self.set_mouse_cursor(
+                    self.get_system_mouse_cursor(self.CURSOR_HAND) if over else None
+                )
         hover_ok = self.mode in (Mode.IDLE, Mode.PLACING_PART, Mode.WIRING)
         self.picker.set_hover(self.picker.hit(x, y) if hover_ok else None)
         if self.mode is Mode.MENU:
@@ -1194,6 +1372,11 @@ class Editor(pyglet.window.Window):
         # That is what makes press-and-hold on a picker part or pin harmless.
         if button in (mouse.MIDDLE, mouse.RIGHT) and self.panning:
             self.panning = False
+            right, self.empty_right = self.empty_right, None
+            if button == mouse.RIGHT and right is not None and self.mode is Mode.IDLE:
+                (px, py), (wx, wy) = right
+                if abs(x - px) + abs(y - py) < T.DRAG_THRESHOLD_PX:
+                    self._board_menu(x, y, wx, wy)  # (wx, wy: where it was pressed)
         elif button == mouse.LEFT and self.mode is Mode.PRESSING_PART:
             # A click without movement: clickable parts (switches) get the click,
             # everything else gets selected.
@@ -1210,6 +1393,12 @@ class Editor(pyglet.window.Window):
             self.mode, self.active = Mode.IDLE, None
         elif button == mouse.LEFT and self.mode is Mode.EDITING_WIRE:
             self.wire_edit.end_drag()
+        elif (
+            button == mouse.LEFT
+            and self.mode is Mode.DRAGGING_END
+            and not self.end_drag_click
+        ):
+            self._drop_end()
         elif button == mouse.LEFT and self.mode is Mode.PICKER_PRESS:
             row, self.picker_row, self.mode = self.picker_row, None, Mode.IDLE
             self.last_picker_click = (row.key, time.monotonic())
@@ -1345,8 +1534,8 @@ class Editor(pyglet.window.Window):
             and symbol in (key.C, key.X)
             and self.mode is Mode.IDLE
         ):
-            if self.selection.parts:
-                self.clipboard = capture(self, self.selection.parts)
+            if self.selection.parts or self.selection.wires:
+                self.clipboard = capture(self, self.selection.parts, self.selection.wires)
                 if symbol == key.X:
                     self.delete_selection()
         elif (
@@ -1638,7 +1827,7 @@ class Editor(pyglet.window.Window):
         parents = {
             end: self.wire_views[e]
             for end, e in zip(("src", "dst"), view.wire.ends)
-            if isinstance(e, Wire)
+            if isinstance(e, Wire) and e is not view.wire
         }
         branches = [
             (self.wire_views[w], end)
@@ -2206,12 +2395,14 @@ class Editor(pyglet.window.Window):
         )
 
     def _duplicate(self) -> None:
-        if not self.selection.parts:
+        if not (self.selection.parts or self.selection.wires):
             return
         if not self._tiling_active():
             unit = sorted(self.selection.parts, key=lambda v: v.part.uid)
-            wires = internal_wires(self, unit)
-            self.tiling = Tiling(capture(self, unit), unit, wires)
+            snap = capture(self, unit, self.selection.wires)
+            by_uid = self.circuit.wire_by_uid
+            wires = [self.wire_views[by_uid[uid]] for uid in sorted(snap.wires)]
+            self.tiling = Tiling(snap, unit, wires)
         t = self.tiling
         t.grow(t.next_axis(), self._tile_cells)
         t.adjusting = (
@@ -2265,15 +2456,15 @@ class Editor(pyglet.window.Window):
             v.set_ghost(True)
         for w in wires:
             w.set_ghost(True)
-        x0 = min(v.x for v in views)
-        y0 = min(v.y for v in views)
-        x1 = max(v.x + v.w for v in views)
-        y1 = max(v.y + v.h for v in views)
-        # The first part is the anchor: Ctrl snaps *its* origin, so a pasted layout
-        # that was on the grid lands on the grid again.
-        anchor = views[0]
-        self.grab = (anchor.x - (x0 + x1) / 2, anchor.y - (y0 + y1) / 2)
-        self.drag_origin = (anchor.x, anchor.y)
+        pts = [p for w in wires for p in w.points]
+        xs = [x for v in views for x in (v.x, v.x + v.w)] + [p[0] for p in pts]
+        ys = [y for v in views for y in (v.y, v.y + v.h)] + [p[1] for p in pts]
+        x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+        # The first part is the anchor (wires alone: the first wire's start): Ctrl snaps
+        # *its* origin, so a pasted layout that was on the grid lands on the grid again.
+        ax, ay = (views[0].x, views[0].y) if views else wires[0].points[0]
+        self.grab = (ax - (x0 + x1) / 2, ay - (y0 + y1) / 2)
+        self.drag_origin = (ax, ay)
         self._begin_move(views, wires)
         self.placing_views, self.placing_wires, self.place_again = views, wires, again
         self.mode = Mode.PLACING_PART
@@ -2495,6 +2686,8 @@ class Editor(pyglet.window.Window):
             self._update_box()
         elif self.mode is Mode.WIRING:
             self._update_preview()
+        elif self.mode is Mode.DRAGGING_END:
+            self._carry_end()
         elif self.mode is Mode.EDITING_WIRE:
             if self.wire_edit.dragging is not None:
                 self.wire_edit.drag_to(
@@ -2504,7 +2697,8 @@ class Editor(pyglet.window.Window):
             else:
                 self.wire_edit.refresh()  # zoom changes handle sizes
 
-    def _start_wiring(self, start: Pin | Wire, start_pos: Point) -> None:
+    def _start_wiring(self, start: Pin | Wire | object, start_pos: Point) -> None:
+        """`start`: a pin, a wire (a branch) or FREE (a wire from nothing)."""
         self.selection.clear()
         self.mode = Mode.WIRING
         self.wire_start, self.wire_start_pos = start, start_pos
@@ -2527,6 +2721,98 @@ class Editor(pyglet.window.Window):
         else:
             self._cancel()
 
+    def _end_wire_free(self) -> None:
+        """Finish the wire being drawn at its last bend point, attached to nothing."""
+        *bends, last = self.wire_bends
+        start = self.wire_start
+        color = self.wire_views[start].color if isinstance(start, Wire) else None
+        start_pos = None if isinstance(start, Pin) else self.wire_start_pos
+        self.connect(start, FREE, bends, start_pos, last, color=color)
+        self._cancel()  # clears the preview; the wire now exists
+
+    # ---- carrying a free wire end -------------------------------------------------
+
+    def _unplug(self, view: WireView, side: str) -> None:
+        """Free that end of the wire and pick it up (a click puts it down)."""
+        w = view.wire
+        was = getattr(w, side)
+        self.circuit.detach(w, side)
+        view = self._remake_wire_view(w)
+        self._start_end_drag(view, side, click=True, was=was)
+
+    def _start_end_drag(
+        self, view: WireView, side: str, click: bool = False, was=None
+    ) -> None:
+        """Carry a free end of `view`'s wire. `click`: it's dropped by a click, not by
+        letting go of the button; `was`: what it was just unplugged from (Esc puts it
+        back there)."""
+        self.selection.clear()
+        self.mode = Mode.DRAGGING_END
+        self.end_drag, self.end_target, self.end_drag_click = (view, side), None, click
+        self.end_from = (view.src if side == "src" else view.dst, was)
+        self.end_moved = click  # (a press must move a little first: a click selects)
+        self.end_skip = {view.wire, *self.circuit.descendants(view.wire)}
+        self.press_at = self.mouse
+        self.preview = Polyline([], T.WIRE_PREVIEW_SNAP, self.world, self.layers.overlay)
+        self._carry_end()
+
+    def _carry_end(self) -> None:
+        """Move the carried end to the cursor -- or onto what it would plug into there."""
+        view, side = self.end_drag
+        if not self.end_moved:
+            px, py = self.press_at
+            x, y = self.mouse
+            if abs(x - px) + abs(y - py) < T.DRAG_THRESHOLD_PX:
+                return
+            self.end_moved = True
+        wx, wy = self.camera.screen_to_world(*self.mouse)
+        target = self.wire_target(wx, wy, self.end_skip)
+        if target is not None and not self.can_rewire(view.wire, side, target[0]):
+            target = None
+        self.end_target = target
+        p = target[1] if target else self.snapped(wx, wy)
+        self._set_end(view, side, p)
+        pts = view.points
+        self.preview.set_points(
+            (pts[:2] if side == "src" else pts[-2:]) if target else []
+        )
+
+    def _set_end(self, view: WireView, side: str, p: Point) -> None:
+        if side == "src":
+            view.set_ends(p, view.dst)
+        else:
+            view.set_ends(view.src, p)
+        self.refresh_wires([view])  # (its branches follow)
+
+    def _drop_end(self) -> None:
+        """Put the carried end down: plugged into what it's over, else free right there."""
+        (view, side), target = self.end_drag, self.end_target
+        moved = self.end_moved
+        self._stop_carrying()
+        if target is not None:
+            rewire(self, view, side, *target)
+        elif not moved:
+            self.selection.set(wires=[view])  # just a click on it
+
+    def _put_end_back(self) -> None:
+        """Never mind: the carried end goes back where it was (onto what it was
+        unplugged from, if it was)."""
+        view, side = self.end_drag
+        p, was = self.end_from
+        self._set_end(view, side, p)
+        if was is not None:
+            self.circuit.attach(view.wire, side, was)
+            self._remake_wire_view(view.wire)
+        self._stop_carrying()
+
+    def _stop_carrying(self) -> None:
+        if self.preview is not None:
+            self.preview.delete()
+            self.preview = None
+        self.end_drag = self.end_target = self.end_from = None
+        self.end_skip = set()
+        self.mode = Mode.IDLE
+
     def _cancel(self) -> None:
         """Abort whatever is in progress and return to IDLE."""
         if self.mode is Mode.MENU:
@@ -2547,11 +2833,16 @@ class Editor(pyglet.window.Window):
             self._close_popover()
         self.pressed_wire = None
         self.picker_row = None
+        if self.mode is Mode.DRAGGING_END:
+            self._put_end_back()
         if self.mode in (Mode.DRAGGING_PART, Mode.PLACING_PART):
             self._end_move()  # a drag stays where it got to (a paste is removed next)
         if self.mode is Mode.PLACING_PART:
             for view in self.placing_views:
-                self.remove_part(view)  # takes the ghost wires with it
+                self.remove_part(view)  # takes the ghost wires with it ...
+            left = [w for w in self.placing_wires if self.wire_views.get(w.wire) is w]
+            if left:
+                self.remove_wires(left)  # ... but not the ones on no part
             self.placing_views, self.placing_wires, self.place_again = [], [], None
             self.placing_kind, self.column = None, None
         if self.preview is not None:
