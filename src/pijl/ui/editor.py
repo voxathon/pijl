@@ -82,8 +82,8 @@ Controls
   Home                     reset the camera
   Ctrl+Home                fit the camera to the parts (with a margin)
   G                        miniview (top right): the board around the cursor again, at its
-                           own zoom (see miniview.py). Press (any button) or drag in it to go
-                           there; works mid-action too, like panning.
+                           own zoom (see miniview.py). Press (any button) or drag in it to
+                           move its crosshair; the view stays put.
     scroll on it, G+scroll its zoom (closer than the view, or further out: a map)
     arrow keys             move it instead: it parks there (stops following the cursor)
     hold G + move mouse    same, finer: the cursor stays put (theme: MINI_MOUSE_SENSITIVITY)
@@ -336,7 +336,7 @@ class Editor(pyglet.window.Window):
         self.mode = Mode.IDLE
         self.panning = False  # orthogonal to mode: you can pan while carrying things
         self.map_button: int | None = (
-            None  # same for steering with the miniview: the button held in it
+            None  # same for pointing in the miniview: the button held in it
         )
         self.mouse = (0, 0)  # last known cursor position, screen space
         self.mouse_in = False  # is it over the window at all?
@@ -807,10 +807,12 @@ class Editor(pyglet.window.Window):
             return
 
         if self.mini.contains(x, y):
-            # Steer from it (with any button, in any mode that isn't holding a button already).
+            # Point in it (with any button, in any mode that isn't holding a button already):
+            # its crosshair goes there; the view stays put.
             if self.map_button is None and not self.panning and self.mode in STEERABLE:
                 self.map_button = button
-                self._look_at(*self.mini.to_world(x, y))
+                self.mini.grabbed = True
+                self.mini.point(x, y)
             return
         if button == mouse.MIDDLE:
             self.panning = True
@@ -1016,7 +1018,7 @@ class Editor(pyglet.window.Window):
             self._popover_drag(x)
             return
         if self.map_button is not None:
-            self._look_at(*self.mini.to_world(x, y))
+            self.mini.point(x, y)  # (never pans the view, even dragged off it)
             return
         if self.panning:
             self.camera.pan(dx, dy)
@@ -1079,6 +1081,7 @@ class Editor(pyglet.window.Window):
     def on_mouse_release(self, x, y, button, modifiers):
         if button == self.map_button:
             self.map_button = None
+            self.mini.grabbed = False
             return
         if self.mode is Mode.POPOVER:
             if button == mouse.LEFT:
@@ -2493,13 +2496,6 @@ class Editor(pyglet.window.Window):
             self.camera.screen_to_world(self.width, self.height),
         )
         return x0, y0, x1, y1
-
-    def _look_at(self, wx: float, wy: float) -> None:
-        """Move the camera so (wx, wy) is in the middle of the visible board."""
-        sx, sy = self._board_center()
-        z = self.camera.zoom
-        self.camera.x, self.camera.y = wx - sx / z, wy - sy / z
-        self._follow_cursor()
 
     def _board_bounds(self) -> tuple[float, float, float, float] | None:
         """The box around every part and wire, or None for an empty board."""

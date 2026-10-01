@@ -8,7 +8,8 @@ for the board to fit in it twice over (so all of it shows wherever on it you poi
 It looks at the *pointer*: the world point under the cursor on the board, with the
 crosshair through it. On the board, a yellow frame shows what it covers; in it, a blue
 outline shows what the view does. Over the miniview itself, it holds still (so you can
-point at things in it); pressing or dragging in it (any button) takes the view there.
+point at things in it); pressing or dragging in it (any button) moves its crosshair
+there (kept on the panel's edge if you drag off it) -- the view doesn't move.
 
 Parked (the editor drives this; see its docstring for the keys): it stops following
 the pointer and stays on its own world point, moved only by nudge() (arrows, G+mouse)
@@ -121,11 +122,19 @@ class Miniview:
         self.level = T.MINI_LEVEL  # its zoom level (like Camera.level)
         self._accum = 0.0
         self.floor = MIN_LEVEL  # as far out as it goes (see the module docstring)
-        self.reach: Rect | None = None  # where parked it may go: the board and the view, padded
+        self.reach: Rect | None = (
+            None  # where parked it may go: the board and the view, padded
+        )
         self.pointer: tuple[float, float] | None = None  # world point it looks at
-        self.at = (0.5, 0.5)  # where that is in it (fractions of its size; menus move it)
+        self.at = (
+            0.5,
+            0.5,
+        )  # where that is in it (fractions of its size; menus move it)
         self.hovered = False  # the cursor is on it: it holds still
-        self.parked = False  # on its own spot, not following the pointer (see the docstring)
+        self.grabbed = False  # a button pressed in it is held: it holds still too
+        self.parked = (
+            False  # on its own spot, not following the pointer (see the docstring)
+        )
         # While a menu is open it holds still: (the cursor, screen px, if it's on the
         # menu or the board; else None,)
         self.menu: tuple | None = None
@@ -146,7 +155,9 @@ class Miniview:
 
     def adjust(self, notches: float) -> None:
         """Closer (or further out): scroll notches, one zoom level each."""
-        self._accum += notches  # (trackpads send fractions: they add up to whole levels)
+        self._accum += (
+            notches  # (trackpads send fractions: they add up to whole levels)
+        )
         whole = int(self._accum)
         self._accum -= whole
         self.level = max(self.floor, min(MAX_LEVEL, self.level + whole))
@@ -174,6 +185,13 @@ class Miniview:
             ((x0 + x1) / 2, (y0 + y1) / 2), Camera.fit_level(x1 - x0, y1 - y0, W, H)
         )
 
+    def point(self, sx: float, sy: float) -> None:
+        """Put the crosshair at screen point (sx, sy), clamped to it; it holds still."""
+        sx = min(max(sx, self.x), self.x + W - 1)
+        sy = min(max(sy, self.y), self.y + H - 1)
+        self.pointer = self.to_world(sx, sy)
+        self.at = ((sx - self.x) / W, (sy - self.y) / H)
+
     def nudge(self, dx: float, dy: float) -> None:
         """Move what it looks at by (dx, dy) of its px (parked), within reach."""
         px, py = self.pointer
@@ -196,15 +214,17 @@ class Miniview:
 
     def to_screen(self, wx: float, wy: float) -> tuple[float, float]:
         cx, cy = self.center
-        return self.x + W / 2 + (wx - cx) * self.scale, self.y + H / 2 + (
-            wy - cy
-        ) * self.scale
+        return (
+            self.x + W / 2 + (wx - cx) * self.scale,
+            self.y + H / 2 + (wy - cy) * self.scale,
+        )
 
     def to_world(self, sx: float, sy: float) -> tuple[float, float]:
         cx, cy = self.center
-        return cx + (sx - self.x - W / 2) / self.scale, cy + (
-            sy - self.y - H / 2
-        ) / self.scale
+        return (
+            cx + (sx - self.x - W / 2) / self.scale,
+            cy + (sy - self.y - H / 2) / self.scale,
+        )
 
     def covers(self) -> Rect | None:
         """The world rect it shows, if shown."""
@@ -258,7 +278,9 @@ class Miniview:
             self.scale *= (target / self.scale) ** k
         cross = self._place(dt, camera, was_shown)
 
-        self.label.text = f"{100 * self.scale:.0f}%" + (" parked" if self.parked else "")
+        self.label.text = f"{100 * self.scale:.0f}%" + (
+            " parked" if self.parked else ""
+        )
         pad = 3 * S
         self.label.position = (self.x + W - 5 * S, self.y + 4 * S, 0)
         self.tag.position = (
@@ -295,7 +317,7 @@ class Miniview:
     ) -> None:
         """Work out the pointer (see the module docstring)."""
         self.menu = None
-        self.hovered = cursor is not None and self.contains(*cursor)
+        self.hovered = self.grabbed or cursor is not None and self.contains(*cursor)
         context = self.context
         if context is not None and context.visible:  # it holds still (see _push)
             if cursor is not None and (
@@ -350,7 +372,8 @@ class Miniview:
         The menu is drawn at 1x with its anchor a where the board puts that point (panel
         point L(A)), so cursor c shows up at L(A) + (c - a). Off the menu too: mapping the
         board around it at k instead would put the crosshair (c - a) * (k - 1) away the
-        moment the cursor leaves the menu. (Closing the menu eases it back to the true spot.)"""
+        moment the cursor leaves the menu. (Closing the menu eases it back to the true spot.)
+        """
         cx, cy = cursor
         ax, ay = self.context.anchor
         sx = self.x + W / 2 + self.hold[0] + cx - ax
@@ -451,14 +474,18 @@ class Miniview:
 
 class _Hint:
     """Its keys, top left: a G key cap with an arrow on each side. Each lights up
-    (brighter, with a halo behind) while its key is held -- the arrows also for G+mouse,
+    (brighter, with a soft glow behind) while its key is held -- the arrows also for G+mouse,
     in the directions you move -- and fades back when let go."""
 
-    CAP, GAP, ARROW = 17, 25, 7  # cap size, cap middle to arrow tip, arrow size (px, before UI_SCALE)
+    CAP, GAP, ARROW = (
+        17,
+        25,
+        7,
+    )  # cap size, cap middle to arrow tip, arrow size (px, before UI_SCALE)
     DIRS = ((-1, 0), (1, 0), (0, 1), (0, -1))  # left, right, up, down
 
     def __init__(self, batch: pyglet.graphics.Batch) -> None:
-        halos = pyglet.graphics.Group(order=2)
+        glows = pyglet.graphics.Group(order=2)
         marks = pyglet.graphics.Group(order=3)
         text = pyglet.graphics.Group(order=4)
         c, a, g = self.CAP * S, self.ARROW * S, self.GAP * S
@@ -475,10 +502,15 @@ class _Hint:
             batch=batch,
             group=text,
         )
-        self.halos = [
-            shapes.Circle(0, 0, r, batch=batch, group=halos)
-            for r in [c * 0.85] + [a * 1.2] * 4
-        ]
+        # additive, so it brightens what's behind rather than painting a disc over it
+        glow = _glow_image()
+        self.glows = []
+        for r in [c * 1.3] + [a * 2.0] * 4:
+            sprite = pyglet.sprite.Sprite(
+                glow, blend_dest=gl.GL_ONE, batch=batch, group=glows
+            )
+            sprite.scale = 2 * r / glow.width
+            self.glows.append(sprite)
         # arrows pointing out, tip `g` from the middle (a triangle's position is its tip)
         self.arrows, self.tips = [], []
         for dx, dy in self.DIRS:
@@ -512,9 +544,9 @@ class _Hint:
             l + (w - l) * (up if w > l else down) for l, w in zip(self.lit, self.want)
         ]
         x, y = round(x), round(y)
-        for halo, (cx, cy), l in zip(self.halos, self.centers, self.lit):
-            halo.position = (x + cx, y + cy)
-            halo.color = (*T.MINI_HINT_GLOW[:3], round(T.MINI_HINT_GLOW[3] * l))
+        for glow, (cx, cy), l in zip(self.glows, self.centers, self.lit):
+            glow.position = (x + cx, y + cy, 0)
+            glow.color = (*T.MINI_HINT_GLOW[:3], round(T.MINI_HINT_GLOW[3] * l))
         for arrow, (tx, ty), l in zip(self.arrows, self.tips, self.lit[1:]):
             arrow.position = (x + tx, y + ty)
             arrow.color = _mix(T.MINI_HINT, T.MINI_HINT_LIT, l)
@@ -524,6 +556,28 @@ class _Hint:
         self.cap.color = (*T.MINI_BG, 170)
         self.letter.position = (x, y + 1, 0)
         self.letter.color = _mix(T.MINI_HINT, T.MINI_HINT_LIT, g)
+
+
+_glow = None
+
+
+def _glow_image() -> pyglet.image.AbstractImage:
+    """A white disc whose alpha falls off smoothly from the middle to nothing at the
+    rim, centre-anchored; tinted and scaled per use."""
+    global _glow
+    if _glow is None:
+        n = 64
+        data = bytearray()
+        for j in range(n):
+            for i in range(n):
+                d = min(
+                    1.0,
+                    ((i + 0.5 - n / 2) ** 2 + (j + 0.5 - n / 2) ** 2) ** 0.5 / (n / 2),
+                )
+                data += bytes((255, 255, 255, round(255 * (1 - d) ** 2.2)))
+        _glow = pyglet.image.ImageData(n, n, "RGBA", bytes(data)).get_texture()
+        _glow.anchor_x = _glow.anchor_y = n // 2
+    return _glow
 
 
 def _mix(a, b, t: float) -> tuple[int, int, int, int]:
