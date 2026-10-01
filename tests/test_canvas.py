@@ -64,7 +64,7 @@ def test_sources_are_forgotten_when_freed_and_kept_when_growing(monkeypatch):
     assert (
         buf.pin_src[b] == 11
         and (buf.pin_src[2:] == -1).all()
-        and (buf.wire_src == -1).all()
+        and buf.wire_src is None  # (never asked for: not made)
     )
 
 

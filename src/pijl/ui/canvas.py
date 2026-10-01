@@ -91,9 +91,10 @@ class InstanceBuffer:
         self.used = np.zeros(capacity, bool)
         self.dirty = np.zeros(capacity, bool)
         # What each slot shows the state of (see ui/sync.py): a pin slot or a wire
-        # slot in the circuit, or -1. Freeing a slot forgets it.
-        self.pin_src = np.full(capacity, -1, np.intp)
-        self.wire_src = np.full(capacity, -1, np.intp)
+        # slot in the circuit, or -1. Freeing a slot forgets it. None until the first
+        # show_pins / show_wires: most buffers (text, tags, overlays) never need them.
+        self.pin_src: np.ndarray | None = None
+        self.wire_src: np.ndarray | None = None
         self.f = {name: self.data[name] for name in kind.dtype.names}
         self.any_dirty = False
         self.realloc = True  # upload everything (new, or grown)
@@ -184,9 +185,10 @@ class InstanceBuffer:
             self.state[slot] = 0
             self.state_dirty = True
         self.used[slot] = False
-        if self.pin_src[slot] >= 0 or self.wire_src[slot] >= 0:
-            self.pin_src[slot] = self.wire_src[slot] = -1
-            self.gen += 1
+        for src in (self.pin_src, self.wire_src):
+            if src is not None and src[slot] >= 0:
+                src[slot] = -1
+                self.gen += 1
         self.mark(slot)
         heapq.heappush(self.free_slots, slot)
         while self.top and not self.used[self.top - 1]:
@@ -200,7 +202,9 @@ class InstanceBuffer:
         self.state[slots] = 0
         self.state_dirty = True
         self.used[slots] = False
-        self.pin_src[slots] = self.wire_src[slots] = -1
+        for src in (self.pin_src, self.wire_src):
+            if src is not None:
+                src[slots] = -1
         self.gen += 1
         self.mark_many(slots)
         self.free_slots.extend(slots.tolist())
@@ -219,6 +223,8 @@ class InstanceBuffer:
             ("wire_src", -1),
         ):
             old = getattr(self, name)
+            if old is None:
+                continue
             new = np.full(2 * n, fill, old.dtype)
             new[:n] = old
             setattr(self, name, new)
@@ -227,11 +233,15 @@ class InstanceBuffer:
 
     def show_pins(self, slots, pins) -> None:
         """These slots show these pins' states (pin slots in the circuit)."""
+        if self.pin_src is None:
+            self.pin_src = np.full(len(self.data), -1, np.int32)
         self.pin_src[slots] = pins
         self.gen += 1
 
     def show_wires(self, slots, wires) -> None:
         """These slots show these wires' states (wire slots in the circuit)."""
+        if self.wire_src is None:
+            self.wire_src = np.full(len(self.data), -1, np.int32)
         self.wire_src[slots] = wires
         self.gen += 1
 

@@ -22,6 +22,8 @@ import numpy as np
 from .canvas import Canvas, InstanceBuffer
 from .sdf_shapes import SHOW_BY_CODE, SHOW_FIGHT
 
+_NONE = np.empty(0, np.int32)  # a buffer that shows no pins / wires
+
 # by logic code, and by code + 4 when the net's drivers fight
 _WIRE_SHOW = np.concatenate((SHOW_BY_CODE, np.full(4, SHOW_FIGHT, np.uint8)))
 
@@ -47,18 +49,21 @@ class ViewSync:
         key = (buf.gen, id(circuit), circuit.pin_count)
         cached = self._pins.get(id(buf))
         if cached is None or cached[0] != key:
-            shapes = np.flatnonzero(buf.pin_src[: buf.end] >= 0)
-            pins = buf.pin_src[shapes]
+            src = buf.pin_src if buf.pin_src is not None else _NONE
+            shapes = np.flatnonzero(src[: buf.end] >= 0)
+            pins = src[shapes]
             ok = pins < circuit.pin_count  # (a stale view of a previous circuit: skip it)
-            cached = self._pins[id(buf)] = (key, shapes[ok], pins[ok])
+            # (native ints: indexing with int32 would convert them every frame)
+            cached = self._pins[id(buf)] = (key, shapes[ok], pins[ok].astype(np.intp))
         return cached[1], cached[2]
 
     def _wire_slots(self, buf: InstanceBuffer, circuit) -> tuple[np.ndarray, np.ndarray]:
         key = (buf.gen, id(circuit), circuit.nets_version)
         cached = self._wires.get(id(buf))
         if cached is None or cached[0] != key:
-            shapes = np.flatnonzero(buf.wire_src[: buf.end] >= 0)
-            nets = circuit.wire_nets(buf.wire_src[shapes])
+            src = buf.wire_src if buf.wire_src is not None else _NONE
+            shapes = np.flatnonzero(src[: buf.end] >= 0)
+            nets = circuit.wire_nets(src[shapes])
             has = nets >= 0  # (no net: left as it is)
             if not len(circuit.net_value):
                 has[:] = False

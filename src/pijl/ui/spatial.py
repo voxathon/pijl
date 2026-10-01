@@ -31,7 +31,9 @@ class SpatialIndex:
         self._owner = np.full(capacity, None, object)  # per row: whose box it is
         self._free: list[int] = []
         self._end = 0  # rows below this were handed out at some point
-        self.where: dict[Hashable, list[int]] = {}  # object -> its boxes' rows
+        # object -> its boxes' rows: the row itself when it has one box (a part, a
+        # straight wire), else a list (see rows_of)
+        self.where: dict[Hashable, int | list[int]] = {}
         self._bounds: tuple | None = None  # bounds() until a box changes (the editor asks every frame)
         self._bounds_ok = False
 
@@ -95,17 +97,16 @@ class SpatialIndex:
         row_list = rows.tolist()
         k, where = 0, self.where
         for obj, c in zip(objs, counts.tolist()):
-            where[obj] = row_list[k : k + c]
+            where[obj] = row_list[k] if c == 1 else row_list[k : k + c]
             k += c
 
     def _put(self, obj: Hashable, boxes: list[tuple]) -> None:
-        rows = self.where.get(obj)
-        if rows is None:
-            rows = self.where[obj] = []
+        rows = rows_of(self.where.get(obj, ()))
         while len(rows) < len(boxes):
             rows.append(self._alloc(obj))
         while len(rows) > len(boxes):
             self._release(rows.pop())
+        self.where[obj] = rows[0] if len(rows) == 1 else rows
         cols = self._cols
         self._bounds_ok = False
         for row, (x0, y0, x1, y1) in zip(rows, boxes):
@@ -139,12 +140,11 @@ class SpatialIndex:
         self._bounds_ok = False
 
     def remove(self, obj: Hashable) -> None:
-        for row in self.where.pop(obj, ()):
+        for row in rows_of(self.where.pop(obj, ())):
             self._release(row)
 
     def remove_many(self, objs: Iterable[Hashable]) -> None:
-        pop = self.where.pop
-        rows = [r for obj in objs for r in pop(obj, ())]
+        rows = self._rows([self.where.pop(obj, ()) for obj in objs])
         if rows:
             self._free.extend(rows)
             rows = np.array(rows, np.intp)
@@ -155,12 +155,23 @@ class SpatialIndex:
     def shift(self, objs: Iterable[Hashable], dx: float, dy: float) -> None:
         """Move these objects' boxes by (dx, dy), all at once."""
         where = self.where
-        rows = [r for obj in objs for r in where.get(obj, ())]
+        rows = self._rows([where.get(obj, ()) for obj in objs])
         if rows:
             rows = np.array(rows, np.intp)
             self._cols[0::2, rows] += dx
             self._cols[1::2, rows] += dy
             self._bounds_ok = False
+
+    @staticmethod
+    def _rows(entries: list) -> list[int]:
+        """The rows of many `where` entries, flattened."""
+        out = []
+        for e in entries:
+            if type(e) is int:
+                out.append(e)
+            else:
+                out.extend(e)
+        return out
 
     def clear(self) -> None:
         self.__init__()
@@ -236,6 +247,11 @@ def polylines_boxes(lines: list[list[Point]]) -> tuple[np.ndarray, np.ndarray]:
     boxes = np.hstack((np.minimum(lo, hi), np.maximum(lo, hi)))
     counts = np.bincount(line_of[seg], weights=pieces, minlength=len(lines))
     return boxes, counts.astype(np.intp)
+
+
+def rows_of(entry: int | list[int] | tuple) -> list[int]:
+    """A `where` entry as a (new) list of rows."""
+    return [entry] if type(entry) is int else list(entry)
 
 
 def ordered(views: Iterable, newest_first: bool = False) -> list:
