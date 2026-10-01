@@ -2511,7 +2511,7 @@ class Editor(pyglet.window.Window):
         if st["time"] < STATS_EVERY:
             return
         n, c = st["frames"], self.circuit
-        hidden = len(c.hidden_parts)
+        hidden = c.hidden_count
         self.bar.set_stats(
             [  # (rank, text): the bar leaves out the highest ranks first when short on room
                 (0, f"{n / st['time']:.0f} fps"),

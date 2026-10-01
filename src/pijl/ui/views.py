@@ -1187,10 +1187,11 @@ def _fill_part_rows(views: list[PartView], placed: list[tuple]) -> None:
     ).reshape(n, 2)
     t.ints[rows] = [(type(x) is int) | (type(y) is int) << 1 for _, x, y in placed]
     by_type: dict[tuple, tuple] = {}  # (type, pins a side) -> (w, h, title)
-    wh, titles, pins = [], [], []
+    wh, titles = [], []
     for part, _, _ in placed:
-        ins, outs = part.inputs, part.outputs
-        key = (id(part.type), part.kind, len(ins), len(outs))
+        t_ = part.type
+        ins, outs = t_.ins, t_.outs
+        key = (id(t_), t_.kind, len(ins), len(outs))
         made = by_type.get(key)
         if made is None:
             look = part.type.look
@@ -1203,13 +1204,11 @@ def _fill_part_rows(views: list[PartView], placed: list[tuple]) -> None:
             made = by_type[key] = (w, (n_pins + 1) * T.PIN_SPACING, title)  # (see theme.py)
         wh.append(made[:2])
         titles.append(made[2])
-        pins.append(part.pins)
     t.wh[rows] = wh
     t.title[rows] = titles
     # pins: a run of slots each, as plain parts' are made (pin0, npin); else listed
     # (macros' pins can be made apart)
-    counts = np.fromiter(map(len, pins), np.intp, n)
-    slots = np.fromiter((p.slot for ps in pins for p in ps), np.intp, int(counts.sum()))
+    slots, counts = placed[0][0].circuit.pin_slots_of([part for part, _, _ in placed])
     t._set_runs(np.arange(rows.start, rows.stop), slots, counts, t.pin0, t.npin, t.pinslots)
     t.pin_room(int(slots.max()) + 1 if len(slots) else 0)
 
@@ -1709,12 +1708,10 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
     xs, ys = t.xy[rows, 0], t.xy[rows, 1]
     ws, hs = t.wh[rows, 0].astype(np.float64), t.wh[rows, 1].astype(np.float64)
     # pins: per view, how many and where they start in the flat list
-    pins = [v.part.pins for v in views]
-    flat = [p for ps in pins for p in ps]
-    counts = np.fromiter((len(ps) for ps in pins), np.intp, n)
+    circuit = views[0].part.circuit
+    pin_slots, counts = circuit.pin_slots_of([v.part for v in views])
     starts = np.cumsum(counts) - counts
-    pin_slots = np.fromiter((p.slot for p in flat), np.intp, len(flat))
-    codes = flat[0]._store.states[pin_slots] if flat else np.empty(0, np.intp)
+    codes = circuit.pin_codes(pin_slots)
     # what each view's look decides, and the pin layout of each (look, pins, size)
     looks: dict[int, tuple] = {}
     group_of: dict[tuple, list[int]] = {}
@@ -1722,10 +1719,10 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
         look = v.look
         if id(look) not in looks:
             looks[id(look)] = _look_data(look)
-        part = v.part
-        group_of.setdefault((id(look), len(part.inputs), len(part.outputs), w, h), []).append(i)
-    is_out = np.zeros(len(flat), bool)
-    pin_dy = np.zeros(len(flat))  # from the body's middle (see pin_pos)
+        pt = v.part.type
+        group_of.setdefault((id(look), len(pt.ins), len(pt.outs), w, h), []).append(i)
+    is_out = np.zeros(len(pin_slots), bool)
+    pin_dy = np.zeros(len(pin_slots))  # from the body's middle (see pin_pos)
     lit = np.zeros(n, bool)
     label_side = np.zeros(n, np.int8)  # the user label: -1 left, 1 right, 0 below
     for (look_id, n_in, n_out, _w, _h), members in group_of.items():
@@ -1771,7 +1768,7 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
     first = np.cumsum(per_spec) - per_spec  # where each spec's glyphs start in `glyphs`
     titles, tag_specs = [], []  # spec indices
     i = 0
-    for v, ps in zip(views, pins):
+    for v, k in zip(views, counts.tolist()):
         titles.append(i)
         i += 1
         if v.part.label:
@@ -1780,8 +1777,8 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
             i += 1
         if pin_labels and v.look.pin_labels:
             tagged.append(v)
-            tag_specs += range(i, i + len(ps))
-            i += len(ps)
+            tag_specs += range(i, i + k)
+            i += k
     t._set_runs(rows, *_pick(glyphs, first, per_spec, titles), t.glyph0, t.nglyph, t.glyphs)
     if tagged:
         _store_tags(tagged, [specs[i] for i in tag_specs], *_pick(glyphs, first, per_spec, tag_specs))
@@ -1808,8 +1805,8 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
     t.body[rows] = slots
     # pin dots
     buf = canvas.buffer(DOT, layers.pins)
-    slots = buf.alloc_many(len(flat))
-    if len(flat):
+    slots = buf.alloc_many(len(pin_slots))
+    if len(pin_slots):
         owner = np.repeat(np.arange(n), counts)
         f = buf.f
         f["center"][slots] = np.column_stack(

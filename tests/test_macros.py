@@ -389,3 +389,81 @@ def test_wrapping_parts_in_macros_never_changes_behavior(seed):
             assert [p.state for p in p_flat[u].pins] == [
                 p.state for p in where(u).pins
             ], (seed, tick, u)
+
+
+def _tree(p):
+    yield p
+    for q in p.inner.values():
+        yield from _tree(q)
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_later_instances_of_a_macro_are_built_like_the_first(seed):
+    # The first instance of a macro type is built part by part; later ones are stamped
+    # from it (Circuit._stamp). They must be the same parts, wiring and behavior.
+    rng = random.Random(seed)
+    flat = random_board(rng, n_in=3, n_gates=14)
+    gates = [u for u, d in flat.parts.items() if d[0] != "IN"]
+    outer_set = set(rng.sample(gates, 8))
+    inner_set = set(rng.sample(sorted(outer_set), 3))
+    _outer, body, _inst = wrap(flat, outer_set, "outer")
+    body2, body_inner, _inst2 = wrap(body, inner_set, "inner")
+    c = Circuit(catalog({"outer": body2, "inner": body_inner}))
+    a, b = c.add_part("macro:outer"), c.add_part("macro:outer")
+
+    def shape(p):
+        return [
+            (q.kind, q.uid, q.label, q.props, [x.passive for x in q.pins],
+             [(w.uid, [type(e).__name__ for e in w.ends]) for w in q.inner_wires],
+             [(x.index, x.is_input, y.index, y.is_input) for x, y in q.links])
+            for q in _tree(p)
+        ]  # fmt: skip
+
+    assert shape(a)[1:] == shape(b)[1:] and len(list(_tree(a))) > 10
+    feeds = [[c.add_part("IN") for _ in m.inputs] for m in (a, b)]
+    for m, ins in zip((a, b), feeds):
+        for i, src in enumerate(ins):
+            c.connect(src.outputs[0], m.inputs[i])
+    for tick in range(60):
+        if rng.random() < 0.3:
+            i = rng.randrange(len(a.inputs))
+            v = not feeds[0][i].outputs[0].state
+            feeds[0][i].outputs[0].state = feeds[1][i].outputs[0].state = v
+        c.step()
+        for pa, pb in zip(_tree(a), _tree(b)):
+            assert [x.state for x in pa.pins] == [x.state for x in pb.pins], (seed, tick)
+
+
+def test_a_macro_inside_that_changed_is_built_anew():
+    from pijl.macros import MacroType
+
+    outer = Snapshot(
+        {1: ("IN", "", 0.0, 0.0, {}), 2: ("macro:inner", "", 100.0, 0.0, {}), 3: ("OUT", "", 200.0, 0.0, {})},
+        {1: w(1, 0, 2, 0), 2: w(2, 0, 3, 0)},
+    )
+    inv = Snapshot(
+        {1: ("IN", "", 0.0, 0.0, {}), 2: ("NOT", "", 100.0, 0.0, {}), 3: ("OUT", "", 200.0, 0.0, {})},
+        {1: w(1, 0, 2, 0), 2: w(2, 0, 3, 0)},
+    )
+    buf = Snapshot(
+        {1: ("IN", "", 0.0, 0.0, {}), 3: ("OUT", "", 200.0, 0.0, {})}, {1: w(1, 0, 3, 0)}
+    )
+    cat = catalog({"outer": outer, "inner": inv})
+
+    class Swapped:  # the same outer type, but "inner" is now something else
+        swap = {}
+
+        def get(self, kind):
+            return self.swap.get(kind) or cat.get(kind)
+
+        def __contains__(self, kind):
+            return kind in cat
+
+    reg = Swapped()
+    c = Circuit(reg)
+    first = c.add_part("macro:outer")
+    Swapped.swap["macro:inner"] = MacroType("inner", buf, cat)
+    second = c.add_part("macro:outer")
+    assert first.inner[2].type is cat.get("macro:inner")
+    assert second.inner[2].type is Swapped.swap["macro:inner"]
+    assert [q.kind for q in _tree(second)] == ["macro:outer", "IN", "macro:inner", "IN", "OUT", "OUT"]
