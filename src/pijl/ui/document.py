@@ -23,7 +23,10 @@ from __future__ import annotations
 
 import copy
 import itertools
-from typing import TYPE_CHECKING, Iterable
+from operator import eq, itemgetter
+from typing import TYPE_CHECKING, Callable, Iterable
+
+import numpy as np
 
 from ..sim import Pin, Wire
 from ..snapshot import EMPTY, EndRef, PartData, Snapshot, WireData
@@ -54,8 +57,15 @@ STAMPS = itertools.count(1)
 # before and after, as two dicts (uid -> value). A uid missing from one of them was
 # absent then. (Two dicts instead of uid -> (before, after) pairs: a step that adds or
 # removes a big batch is one dict of the values, not a pair per uid as well.)
-Section = tuple[dict[int, object], dict[int, object]]
+#
+# Plus `moves`: groups of uids that only moved, all by the same (dx, dy), stored as
+# (uids, dx, dy) instead of their values -- dragging a whole board is one delta, not
+# a copy of every part twice (see _compress). Undo takes the delta off again.
+Move = tuple[np.ndarray, float, float]
+Section = tuple[dict[int, object], dict[int, object], tuple[Move, ...]]
 Change = tuple[Section, Section, Section]
+
+MIN_MOVE_GROUP = 8  # fewer than this moved by one delta: kept as plain values
 
 NO_PROPS: dict = {}  # props of a part that has none (shared: never write to it)
 
@@ -323,7 +333,8 @@ class History:
         return self.current.parts, self.current.wires, self.current.wire_colors
 
     def _diff(self, parts: dict, wires: dict, colors: dict) -> Change:
-        """The entries that differ from `current`: (before, after) per section."""
+        """The entries that differ from `current`: (before, after) per section (no
+        moves yet: see _compress)."""
         out = []
         for now, cur in zip((parts, wires, colors), self._sections()):
             before, after = {}, {}
@@ -334,16 +345,25 @@ class History:
                         before[uid] = old
                     if new is not None:
                         after[uid] = new
-            out.append((before, after))
+            out.append((before, after, ()))
         return tuple(out)
 
-    def record(self, parts: dict, wires: dict, colors: dict) -> bool:
+    def record(
+        self, parts: dict, wires: dict, colors: dict, moves: tuple = ((), ())
+    ) -> bool:
         """A new step: what these uids look like now (see changes()); None = gone.
-        No-op (returns False) if that's what they looked like already."""
+        No-op (returns False) if that's what they looked like already.
+
+        `moves`: (part moves, wire moves), each a list of (uids, dx, dy): uids that
+        only moved, exactly (see views.Touched.moved), and aren't in parts / wires.
+        They're shifted here, without their data being taken again."""
         change = self._diff(parts, wires, colors)
-        if _empty(change):
+        if _empty(change) and not any(moves):
             return False
         _apply(self._sections(), change, 1)
+        change = _compress(change)
+        if any(moves):
+            change = _add_moves(change, moves, self._sections())
         after = next(STAMPS)
         self.undo_stack.append((change, self.state, after))
         del self.undo_stack[: -self.limit]
@@ -370,10 +390,11 @@ class History:
         change = self._diff(parts, wires, colors)
         if _empty(change):
             return False
-        _apply(self._sections(), change, 1)
         top, before, _ = self.undo_stack[-1]
-        merged = tuple((dict(b), dict(a)) for b, a in top)
-        for (into_b, into_a), (b, a) in zip(merged, change):
+        # (its moves spelled out as values, while `current` is still where it left off)
+        merged = _expand(top, self._sections())
+        _apply(self._sections(), change, 1)
+        for (into_b, into_a, _), (b, a, _) in zip(merged, change):
             for uid in b.keys() | a.keys():
                 # what it was before the merged step: the older step's, if it had it
                 had = uid in into_b or uid in into_a
@@ -387,7 +408,7 @@ class History:
                     if new is not None:
                         into_a[uid] = new
         self.state = next(STAMPS)
-        self.undo_stack[-1] = (merged, before, self.state)
+        self.undo_stack[-1] = (_compress(merged), before, self.state)
         self.redo_stack.clear()
         return True
 
@@ -413,19 +434,200 @@ class History:
 
 def _apply(sections: tuple[dict, dict, dict], change: Change, side: int) -> None:
     """Set every entry of `change` to its before (side 0) or after (side 1) value."""
-    for d, section in zip(sections, change):
+    sign = 1 if side else -1
+    for d, section, shift in zip(sections, change, _SHIFTS):
         to, other = section[side], section[1 - side]
         for uid in other.keys() - to.keys():  # absent on that side
             d.pop(uid, None)
         d.update(to)
+        for uids, dx, dy in section[2]:
+            for uid in uids.tolist():
+                d[uid] = shift(d[uid], sign * dx, sign * dy)
+
+
+def _add_moves(change: Change, moves: tuple, sections: tuple[dict, dict, dict]) -> Change:
+    """Shift `sections` (the board) by these moves, and add them to the step."""
+    out = list(change)
+    for i, (section_moves, d, shift) in enumerate(zip(moves, sections, _SHIFTS)):
+        groups = []
+        for uids, dx, dy in section_moves:
+            for uid in uids:
+                d[uid] = shift(d[uid], dx, dy)
+            groups.append((np.array(uids, np.int64), dx, dy))
+        if groups:
+            before, after, old = out[i]
+            out[i] = (before, after, (*old, *groups))
+    return tuple(out)
 
 
 def _empty(change: Change) -> bool:
-    return not any(b or a for b, a in change)
+    return not any(b or a or m for b, a, m in change)
 
 
 def section_uids(section: Section) -> set[int]:
-    return section[0].keys() | section[1].keys()
+    uids = section[0].keys() | section[1].keys()
+    for moved, _, _ in section[2]:
+        uids.update(moved.tolist())
+    return uids
+
+
+# ---- moves -----------------------------------------------------------------------
+# What moving by (dx, dy) does to a part's / wire's data, and the delta between two
+# values that differ only by a move (None: they differ otherwise). A delta is only
+# used if it takes before to after AND back bit for bit: float addition isn't always
+# undone by subtraction, and undo must restore exactly what was there.
+
+
+def _shift_part(d: tuple, dx: float, dy: float) -> tuple:
+    kind, label, x, y, props = d
+    return kind, label, x + dx, y + dy, props
+
+
+def _shift_point(p, dx: float, dy: float):
+    return None if p is None else (p[0] + dx, p[1] + dy)
+
+
+def _shift_wire(d: tuple, dx: float, dy: float) -> tuple:
+    src, dst, bends, src_pt, dst_pt = d
+    return (
+        src,
+        dst,
+        tuple((x + dx, y + dy) for x, y in bends),
+        _shift_point(src_pt, dx, dy),
+        _shift_point(dst_pt, dx, dy),
+    )
+
+
+def _part_delta(a: tuple, b: tuple) -> tuple[float, float] | None:
+    if a[0] != b[0] or a[1] != b[1] or not (a[4] is b[4] or a[4] == b[4]):
+        return None
+    return b[2] - a[2], b[3] - a[3]
+
+
+def _wire_delta(a: tuple, b: tuple) -> tuple[float, float] | None:
+    if a[:2] != b[:2] or len(a[2]) != len(b[2]) or (a[3] is None) != (b[3] is None):
+        return None
+    if (a[4] is None) != (b[4] is None):
+        return None
+    pa = [*a[2], *(p for p in a[3:] if p is not None)]
+    pb = [*b[2], *(p for p in b[3:] if p is not None)]
+    if not pa:
+        return None
+    return pb[0][0] - pa[0][0], pb[0][1] - pa[0][1]
+
+
+_SHIFTS: tuple[Callable, ...] = (_shift_part, _shift_wire, None)
+_DELTAS: tuple[Callable | None, ...] = (_part_delta, _wire_delta, None)
+
+
+def _compress(change: Change) -> Change:
+    """Pull entries that only moved, by a delta shared by at least MIN_MOVE_GROUP of
+    them, out of a step's values and into its moves."""
+    out = []
+    for (before, after, moves), shift, delta in zip(change, _SHIFTS, _DELTAS):
+        if delta is None or len(after) < MIN_MOVE_GROUP:
+            out.append((before, after, moves))
+            continue
+        groups = (_part_groups if delta is _part_delta else _groups)(before, after, shift, delta)
+        big = [(d, uids) for d, uids in groups.items() if len(uids) >= MIN_MOVE_GROUP]
+        if not big:
+            out.append((before, after, moves))
+            continue
+        # (made anew, not copied and deleted from: dicts don't shrink, and a step
+        # that kept an emptied 100k-entry table would defeat the point)
+        gone = {uid for _, uids in big for uid in uids}
+        if len(gone) == len(before) == len(after):  # (everything moved: a plain drag)
+            before, after = {}, {}
+        else:
+            before = {u: v for u, v in before.items() if u not in gone}
+            after = {u: v for u, v in after.items() if u not in gone}
+        moves = (*moves, *((np.array(uids, np.int64), dx, dy) for (dx, dy), uids in big))
+        out.append((before, after, moves))
+    return tuple(out)
+
+
+def _groups(before: dict, after: dict, shift, delta) -> dict[tuple, list[int]]:
+    """The entries in both that differ only by an exact move, by delta."""
+    groups: dict[tuple[float, float], list[int]] = {}
+    for uid, new in after.items():
+        old = before.get(uid)
+        if old is None:
+            continue
+        d = delta(old, new)
+        if (
+            d is not None
+            and _all_floats(old)
+            and _all_floats(new)
+            and shift(old, *d) == new
+            and shift(new, -d[0], -d[1]) == old
+        ):
+            groups.setdefault(d, []).append(uid)
+    return groups
+
+
+def _all_floats(wire: tuple) -> bool:
+    """Every coordinate in a wire's data is a float (see _part_groups)."""
+    return all(
+        type(p[0]) is float and type(p[1]) is float
+        for p in (*wire[2], *(q for q in wire[3:] if q is not None))
+    )
+
+
+def _part_groups(before: dict, after: dict, shift, delta) -> dict[tuple, list[int]]:
+    """_groups for parts, with the work done by C-level maps and arrays (a dragged
+    board is all of them)."""
+    uids = [u for u in after if u in before]
+    n = len(uids)
+    if not n:
+        return {}
+    olds, news = list(map(before.__getitem__, uids)), list(map(after.__getitem__, uids))
+    get_x, get_y = itemgetter(2), itemgetter(3)
+    x0, y0 = list(map(get_x, olds)), list(map(get_y, olds))
+    x1, y1 = list(map(get_x, news)), list(map(get_y, news))
+    # Floats only: undo must give back an int as an int, not as 200.0. (So the first
+    # move of parts placed at whole numbers is kept as plain values; later ones aren't.)
+    same = np.ones(n, bool)
+    for col in (x0, x1, y0, y1):
+        types = set(map(type, col))
+        if float not in types:
+            return {}
+        if types != {float}:
+            same &= np.fromiter((type(v) is float for v in col), bool, n)
+    for get in (itemgetter(0), itemgetter(1), itemgetter(4)):  # kind, label, props
+        same &= np.fromiter(map(eq, map(get, olds), map(get, news)), bool, n)
+    a = np.column_stack((np.array(x0, np.float64), np.array(y0, np.float64)))
+    b = np.column_stack((np.array(x1, np.float64), np.array(y1, np.float64)))
+    d = b - a
+    ok = same & ((a + d) == b).all(1) & ((b - d) == a).all(1)  # exact both ways
+    if not ok.any():
+        return {}
+    idx = np.flatnonzero(ok)
+    d, uid_arr = d[idx], np.array(uids, np.int64)[idx]
+    if (d == d[0]).all():  # (the usual case: one drag, one delta)
+        return {(float(d[0, 0]), float(d[0, 1])): uid_arr.tolist()}
+    # several: group by delta (as complex numbers: an exact 1-D sort, unlike axis=0)
+    keys, inverse = np.unique(d[:, 0] + 1j * d[:, 1], return_inverse=True)
+    order = np.argsort(inverse, kind="stable")
+    bounds = np.searchsorted(inverse[order], np.arange(len(keys) + 1))
+    uid_arr = uid_arr[order]
+    return {
+        (float(keys[k].real), float(keys[k].imag)): uid_arr[bounds[k] : bounds[k + 1]].tolist()
+        for k in range(len(keys))
+    }
+
+
+def _expand(change: Change, sections: tuple[dict, dict, dict]) -> Change:
+    """A step's moves spelled out as before / after values again; `sections` must be
+    the board right after the step (its after side)."""
+    out = []
+    for (before, after, moves), d, shift in zip(change, sections, _SHIFTS):
+        before, after = dict(before), dict(after)
+        for uids, dx, dy in moves:
+            for uid in uids.tolist():
+                after[uid] = now = d[uid]
+                before[uid] = shift(now, -dx, -dy)
+        out.append((before, after, ()))
+    return tuple(out)
 
 
 def change_uids(change: Change) -> tuple[set[int], set[int]]:

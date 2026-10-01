@@ -2120,7 +2120,8 @@ class Editor(pyglet.window.Window):
         self.selection.clear()
         restore(self, self.history.current, change_uids(change))
         # parts at the ends of wires that came or went: their pins' colors may change
-        for uid in _pin_part_uids((d,) for side in change[1] for d in side.values()):
+        # (wires that only moved, change[1][2], went nowhere: their colors stay)
+        for uid in _pin_part_uids((d,) for side in change[1][:2] for d in side.values()):
             Touched.part(uid)
 
     def _begin_group_drag(self, grabbed: PartView) -> None:
@@ -2388,7 +2389,7 @@ class Editor(pyglet.window.Window):
             event_type in self._EDIT_EVENTS
             and self.history is not None
             and self.mode is Mode.IDLE
-            and (Touched.parts or Touched.wires)
+            and (Touched.parts or Touched.wires or Touched.moved)
         ):
             self._record()
         if event_type in self._EDIT_EVENTS and self.history is not None:
@@ -2594,18 +2595,52 @@ class Editor(pyglet.window.Window):
             return self._record_touched(amend)
 
     def _record_touched(self, amend: bool) -> bool:
+        moves = Touched.take_moves()
         parts, wires, paint_parts, paint_wires = Touched.take()
+        moves = self._move_steps(moves, parts, wires, amend)
         now = changes(self, parts, wires)
         # parts at the ends of a changed wire, before and after: their pins' colors may change
         # (before: from the history, so ask before recording updates it)
         before = self.history.current.wires
         ends = _pin_part_uids((before.get(uid), now[1][uid]) for uid in paint_wires)
-        recorded = (self.history.amend if amend else self.history.record)(*now)
+        if amend:
+            recorded = self.history.amend(*now)
+        else:
+            recorded = self.history.record(*now, moves=moves)
         if recorded:  # one timeline: something new done means nothing left to redo
             self.lib_history.redo_stack.clear()
         if paint_parts or paint_wires:
             paint(self, paint_parts | ends, paint_wires)
         return recorded
+
+    def _move_steps(self, moves: list, parts: set[int], wires: set[int], amend: bool):
+        """Rigid moves (Touched.moved) as History.record takes them. A uid that changed
+        some other way too, moved twice, or that the history doesn't have yet goes into
+        `parts` / `wires` instead: recorded from its data, like any change. (So does
+        everything when amending, which folds values.)"""
+        cur = self.history.current
+        out: tuple[list, list] = ([], [])
+        seen: tuple[set, set] = (set(), set())
+        twice: tuple[set, set] = (set(), set())
+        for *uids, _, _ in moves:
+            for k in (0, 1):
+                twice[k].update(seen[k].intersection(uids[k]))
+                seen[k].update(uids[k])
+        for p_uids, w_uids, dx, dy in moves:
+            for k, uids, touched, have in (
+                (0, p_uids, parts, cur.parts),
+                (1, w_uids, wires, cur.wires),
+            ):
+                if amend:
+                    touched.update(uids)
+                    continue
+                keep = [
+                    u for u in uids if u not in touched and u not in twice[k] and u in have
+                ]
+                touched.update(u for u in uids if u in twice[k] or u not in have)
+                if keep:
+                    out[k].append((keep, dx, dy))
+        return out
 
     def _reset_history(self, doc: str | None) -> None:
         """A fresh undo timeline for what's on the board now, which counts as saved."""

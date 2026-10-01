@@ -29,10 +29,10 @@ def test_undo_redo_roundtrip():
     for n in (1, 2, 3):
         h.commit(snap(n))
     assert h.undo() == (
-        ({}, {2: ("NOT", "", 2.0, 0.0, {})}),
-        ({}, {}),
-        ({}, {}),
-    )  # the step, per section: (before, after); uid 2 wasn't there before
+        ({}, {2: ("NOT", "", 2.0, 0.0, {})}, ()),
+        ({}, {}, ()),
+        ({}, {}, ()),
+    )  # the step, per section: (before, after, moves); uid 2 wasn't there before
     assert h.current == snap(2)
     h.undo()
     assert h.current == snap(1)
@@ -71,9 +71,9 @@ def test_record_takes_only_what_changed():
     moved = ("NOT", "", 9.0, 9.0, {})
     assert h.record({1: moved, 7: None}, {}, {})  # 7 was never there: not a change
     assert h.undo_stack[0][0] == (
-        ({1: ("NOT", "", 1.0, 0.0, {})}, {1: moved}),
-        ({}, {}),
-        ({}, {}),
+        ({1: ("NOT", "", 1.0, 0.0, {})}, {1: moved}, ()),
+        ({}, {}, ()),
+        ({}, {}, ()),
     )
     assert h.current.parts[1] == moved
     assert not h.record({1: moved}, {}, {})
@@ -113,8 +113,96 @@ def test_amend_drops_what_ends_up_as_it_started():
     h.amend({0: snap(2).parts[0], 1: moved}, {}, {})  # 0 back where it was, move 1
     h.amend({5: None}, {}, {})  # and 5 gone again
     (step, _, _), = h.undo_stack
-    assert step[0] == ({1: snap(2).parts[1]}, {1: moved})  # only 1 is left in it
+    assert step[0] == ({1: snap(2).parts[1]}, {1: moved}, ())  # only 1 is left in it
     h.undo()
     assert h.current == snap(2)
     h.redo()
     assert h.current.parts == {0: snap(2).parts[0], 1: moved}
+
+
+def moved_by(base: Snapshot, dx: float, dy: float, uids=None) -> dict:
+    return {
+        u: (k, label, x + dx, y + dy, props)
+        for u, (k, label, x, y, props) in base.parts.items()
+        if uids is None or u in uids
+    }
+
+
+def test_a_big_move_is_stored_as_one_delta_and_undone_exactly():
+    base = snap(50)
+    h = History(base)
+    h.record(moved_by(base, 40.0, -20.0), {}, {})
+    (step, _, _), = h.undo_stack
+    before, after, moves = step[0]
+    assert not before and not after  # no copies of the parts...
+    ((uids, dx, dy),) = moves  # ...just which ones and by how much
+    assert sorted(uids.tolist()) == list(range(50)) and (dx, dy) == (40.0, -20.0)
+    assert h.current.parts == moved_by(base, 40.0, -20.0)
+    h.undo()
+    assert h.current == base
+    h.redo()
+    assert h.current.parts == moved_by(base, 40.0, -20.0)
+
+
+def test_moves_that_floats_cant_undo_exactly_keep_their_values():
+    # Off-grid floats: x + d - d isn't always x. Only entries whose move is exact both
+    # ways may be stored as a delta; the rest keep their values, so undo stays exact.
+    base = Snapshot({i: ("NOT", "", 0.1 * i + 1e-3, 0.7 * i, {}) for i in range(400)}, {})
+    h = History(base)
+    after = moved_by(base, 0.3, 0.1)
+    h.record(after, {}, {})
+    before_vals, _, moves = h.undo_stack[0][0][0]
+    assert moves and before_vals  # some of each
+    for uids, dx, dy in moves:
+        for u in uids.tolist():
+            x0, y0 = base.parts[u][2:4]
+            x1, y1 = after[u][2:4]
+            assert (x0 + dx, y0 + dy) == (x1, y1) and (x1 - dx, y1 - dy) == (x0, y0)
+    for _ in range(3):
+        h.undo()
+        assert h.current == base  # bit for bit
+        h.redo()
+        assert h.current.parts == after
+
+
+def test_wires_with_bends_and_junctions_move_as_deltas():
+    wires = {
+        i: (("p", 1, False, 0), ("w", 99), ((10.0 * i, 5.0), (10.0 * i, 9.0)), None, (3.0, 4.0))
+        for i in range(10)
+    }
+    base = Snapshot({}, wires)
+    h = History(base)
+    shifted = {
+        u: (s, d, tuple((x + 20.0, y) for x, y in b), sp, (dp[0] + 20.0, dp[1]))
+        for u, (s, d, b, sp, dp) in wires.items()
+    }
+    h.record({}, shifted, {})
+    before, after, moves = h.undo_stack[0][0][1]
+    assert not before and not after and len(moves) == 1
+    h.undo()
+    assert h.current == base
+    h.redo()
+    assert h.current.wires == shifted
+
+
+def test_amend_merges_into_a_step_that_moved():
+    base = snap(30)
+    h = History(base)
+    h.record(moved_by(base, 20.0, 0.0), {}, {})  # a Ctrl+scroll notch...
+    h.amend(moved_by(base, 40.0, 0.0), {}, {})  # ...and another: one step
+    assert len(h.undo_stack) == 1
+    ((uids, dx, dy),) = h.undo_stack[0][0][0][2]
+    assert (dx, dy) == (40.0, 0.0)  # (from where the step started)
+    h.amend(moved_by(base, 40.0, 0.0, uids={0}) | {1: base.parts[1]}, {}, {})
+    h.undo()
+    assert h.current == base
+    h.redo()
+    assert h.current.parts == moved_by(base, 40.0, 0.0) | {1: base.parts[1]}
+
+
+def test_int_positions_come_back_as_ints():
+    base = Snapshot({i: ("NOT", "", 20 * i, 40, {}) for i in range(20)}, {})  # ints
+    h = History(base)
+    h.record(moved_by(base, 20.0, 0.0), {}, {})
+    h.undo()
+    assert all(type(d[2]) is int for d in h.current.parts.values())

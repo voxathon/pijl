@@ -58,6 +58,10 @@ class Touched:
     wires: set[int] = set()
     paint_parts: set[int] = set()
     paint_wires: set[int] = set()
+    # Rigid moves (put_down): (part uids, wire uids, dx, dy), where every one of them
+    # only moved, exactly: what the undo history stores as a delta (see document.py)
+    # instead of their data. take() drops them too; take_moves() first to keep them.
+    moved: list[tuple[list[int], list[int], float, float]] = []
 
     @classmethod
     def part(cls, uid: int) -> None:
@@ -83,8 +87,14 @@ class Touched:
         cls.paint_wires |= uids
 
     @classmethod
+    def take_moves(cls) -> list[tuple[list[int], list[int], float, float]]:
+        out, cls.moved = cls.moved, []
+        return out
+
+    @classmethod
     def take(cls) -> tuple[set[int], set[int], set[int], set[int]]:
         """(parts, wires, paint_parts, paint_wires), and start over."""
+        cls.moved = []
         out = cls.parts, cls.wires, cls.paint_parts, cls.paint_wires
         cls.parts, cls.wires, cls.paint_parts, cls.paint_wires = (
             set(),
@@ -1480,8 +1490,9 @@ def put_down(
     paint.py. The caller re-attaches wires stretched between these and the rest.)"""
     _lift_mirrors(parts, wires, False)
     if dx or dy:
-        _move_part_mirrors(parts, dx, dy)
-        _move_wire_mirrors(wires, dx, dy)
+        moved = (_move_part_mirrors(parts, dx, dy), _move_wire_mirrors(wires, dx, dy))
+        if moved[0] or moved[1]:
+            Touched.moved.append((*moved, dx, dy))
     for buf, slots in _Slots().parts(parts).wires(wires):
         buf.set_lift(slots, False)
         if dx or dy:
@@ -1567,10 +1578,20 @@ def _lift_mirrors(
     return parts, wires
 
 
-def _move_part_mirrors(views: list[PartView], dx: float, dy: float) -> None:
+def _exact(x, d: float) -> bool:
+    """Does moving `x` by d and back give x again, bit for bit? (And is it a float: an
+    int would come back from the undo history as a float. See document._compress.)"""
+    return type(x) is float and (x + d) - d == x
+
+
+def _move_part_mirrors(views: list[PartView], dx: float, dy: float) -> list[int]:
+    """Move these views' coordinates by (dx, dy). Returns the uids of the ones that
+    moved exactly (see _exact); the others are reported as changed (Touched)."""
+    exact, other = [], []
     for v in views:
-        v.x += dx
-        v.y += dy
+        x, y = v.x, v.y
+        v.x, v.y = x + dx, y + dy
+        (exact if _exact(x, dx) and _exact(y, dy) else other).append(v.part.uid)
         for label in (v.kind_text, v._name) if v._name is not None else (v.kind_text,):
             label.x += dx
             label.y += dy
@@ -1578,16 +1599,29 @@ def _move_part_mirrors(views: list[PartView], dx: float, dy: float) -> None:
             label.x += dx
             label.y += dy
     _shift_indexed(views, dx, dy)
-    Touched.parts.update(v.part.uid for v in views)
+    Touched.parts.update(other)
+    return exact
 
 
-def _move_wire_mirrors(views: list[WireView], dx: float, dy: float) -> None:
+def _move_wire_mirrors(views: list[WireView], dx: float, dy: float) -> list[int]:
+    """_move_part_mirrors for wires. A wire whose data has no coordinates (pin to pin,
+    no bends: see document.wire_data) is the same after a move: not reported at all."""
+    exact, other = [], []
     for v in views:
+        w = v.wire
+        coords = [
+            *v.bends,
+            *(p for p, end in ((v.src, w.src), (v.dst, w.dst)) if not isinstance(end, Pin)),
+        ]
+        if coords:
+            ok = all(_exact(x, dx) and _exact(y, dy) for x, y in coords)
+            (exact if ok else other).append(w.uid)
         v.src, v.dst = (v.src[0] + dx, v.src[1] + dy), (v.dst[0] + dx, v.dst[1] + dy)
         v.bends = [(x + dx, y + dy) for x, y in v.bends]
         v.line.points = [(x + dx, y + dy) for x, y in v.line.points]
     _shift_indexed(views, dx, dy)
-    Touched.wires.update(v.wire.uid for v in views)
+    Touched.wires.update(other)
+    return exact
 
 
 def _shift_indexed(views: list, dx: float, dy: float) -> None:
