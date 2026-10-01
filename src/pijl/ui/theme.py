@@ -73,6 +73,7 @@ HELP_TEXT = (150, 150, 165, 255)
 MENU_PANEL = ((36, 36, 44), (84, 84, 100))  # (fill, border)
 MENU_HOVER = (60, 60, 76)
 MENU_DANGER = (240, 110, 110, 255)
+PROMPT_SHADE = (0, 0, 0, 110)  # the board dimmed behind a prompt (other windows too)
 CARET = (235, 235, 245)
 
 # Selection

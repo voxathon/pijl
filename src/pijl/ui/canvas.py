@@ -26,6 +26,7 @@ from __future__ import annotations
 import ctypes
 import heapq
 import time
+import weakref
 
 import numpy as np
 import pyglet
@@ -94,12 +95,24 @@ class InstanceBuffer:
         self._make_gl()
 
     def _make_gl(self) -> None:
-        vao, vbo = gl.GLuint(), gl.GLuint()
-        gl.glGenVertexArrays(1, ctypes.byref(vao))
+        vbo = gl.GLuint()
         gl.glGenBuffers(1, ctypes.byref(vbo))
-        self.vao, self.vbo = vao, vbo
+        self.vbo = vbo
+        # One vertex array per GL context (window): the buffer is shared between
+        # windows, vertex arrays aren't. Made on first draw in each (see _vao); a
+        # closed window's goes with its context.
+        self._vaos: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+    def _vao(self) -> gl.GLuint:
+        """This context's vertex array over the buffer. (Growing the buffer re-specifies
+        it under the same name, so these stay valid.)"""
+        vao = self._vaos.get(gl.current_context)
+        if vao is not None:
+            return vao
+        vao = self._vaos[gl.current_context] = gl.GLuint()
+        gl.glGenVertexArrays(1, ctypes.byref(vao))
         gl.glBindVertexArray(vao)
-        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
         stride = self.dtype.itemsize
         for name in self.dtype.names:
             loc = gl.glGetAttribLocation(self.program.id, name.encode())
@@ -121,6 +134,7 @@ class InstanceBuffer:
             )
             gl.glVertexAttribDivisor(loc, 1)
         gl.glBindVertexArray(0)
+        return vao
 
     # ---- slots ---------------------------------------------------------------
 
@@ -243,7 +257,7 @@ class InstanceBuffer:
             tex = self.kind.texture()
             gl.glActiveTexture(gl.GL_TEXTURE0)
             gl.glBindTexture(tex.target, tex.id)
-        gl.glBindVertexArray(self.vao)
+        gl.glBindVertexArray(self._vao())
         gl.glDrawArraysInstanced(gl.GL_TRIANGLE_STRIP, 0, 4, self.top)
         gl.glBindVertexArray(0)
         self.program.stop()
@@ -269,9 +283,12 @@ class Canvas:
             buf = self._buffers[key] = InstanceBuffer(kind)
         return buf
 
-    def draw(self) -> None:
+    def draw(self, top: bool = True) -> None:
+        """`top`: the pyglet batch too (only the window something is being edited in
+        shows its handles and caret)."""
         self.draw_instances()
-        self.batch.draw()
+        if top:
+            self.batch.draw()
 
     def draw_instances(self) -> None:
         """Just the instance buffers (what the miniview draws again, at its own zoom)."""

@@ -100,10 +100,11 @@ CONTROLS: list[tuple[str, list[tuple[str, str]]]] = [
         [
             ("scroll", "zoom"),
             ("right-drag / middle-drag", "pan"),
+            ("right-click empty board", "Open new viewport: another window onto it"),
             ("W A S D", "pan, slower"),
             ("Home", "reset the camera"),
             ("Ctrl+Home", "fit the camera to the parts"),
-            ("G", "miniview: the board around the cursor (press in it to go there)"),
+            ("G", "miniview: the board around the cursor (click / right-click in it)"),
             ("  scroll on it / G+scroll", "its zoom (zoomed out, it's a map)"),
             ("  arrows / G+mouse", "move it: it parks there"),
             ("  Ctrl+G", "park / unpark it"),

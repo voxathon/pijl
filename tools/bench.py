@@ -38,7 +38,8 @@ def main() -> None:
     )
 
     ed = Editor()
-    ed._enable_event_queue = (
+    win = ed.main  # the main window (events go to it, it hands them to the editor)
+    win._enable_event_queue = (
         False  # dispatch synthetic events right away (the event loop does this)
     )
     t0 = time.perf_counter()
@@ -55,12 +56,12 @@ def main() -> None:
     report("build the board", 1000 * (time.perf_counter() - t0))
 
     def scr(wx, wy):
-        return ed.camera.world_to_screen(wx, wy)
+        return win.camera.world_to_screen(wx, wy)
 
     def ev(name, *args):
-        ed.dispatch_event(name, *args)
+        win.dispatch_event(name, *args)
 
-    ed.camera.center_on(600, 400, ed.width, ed.height)
+    win.camera.center_on(600, 400, win.width, win.height)
     target, switch = views[62], views[60]
     tx, ty = scr(target.x + 40, target.y + 20)
     sx, sy = scr(switch.x + 10, switch.y + 10)
@@ -82,7 +83,7 @@ def main() -> None:
         "step": ("sim step", ed.circuit.step, 20),
         "rewire": ("rewire an input + step (net rebuild)", rewire, 5),
         "frame": ("frame update (sim + sync)", lambda: ed.update(1 / 60), 20),
-        "draw": ("draw a frame", lambda: (ed.switch_to(), ed.on_draw()), 20),
+        "draw": ("draw a frame", lambda: (win.switch_to(), win.on_draw()), 20),
         "hover": (
             "mouse move over a part",
             lambda: ev("on_mouse_motion", tx, ty, 0, 0),
@@ -159,7 +160,7 @@ def main() -> None:
             f"delete all {n} parts", timed(lambda: ev("on_key_press", key.DELETE, 0))
         )
         report("... and undo that", timed(undo))
-    ed.close()
+    win.close()
 
 
 def timed(fn, reps: int = 1) -> float:
