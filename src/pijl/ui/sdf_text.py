@@ -324,11 +324,32 @@ def _layout(
     return hit
 
 
+_colors: dict[tuple, tuple] = {}  # one tuple per distinct label color (see SDFLabel._init)
+NO_SLOTS = np.empty(0, np.intp)  # what a label without glyphs holds (shared, never written)
+NO_SLOTS.flags.writeable = False
+
+
 class SDFLabel:
     """One line of text anchored at (x, y): vertically centered on the capitals,
     horizontally per `anchor_x` ("left", "center", "right"). `size` is in points
     at zoom 1, like pyglet's font_size. Characters outside the atlas are dropped.
-    Each visible character is one glyph instance."""
+    Each visible character is one glyph instance. (Slotted: a big board has one or
+    two per part.)"""
+
+    __slots__ = (
+        "owner",
+        "atlas",
+        "buf",
+        "scale",
+        "anchor_x",
+        "x",
+        "y",
+        "_color",
+        "_lift",
+        "slots",
+        "_rel",
+        "text",
+    )
 
     def __init__(
         self,
@@ -359,9 +380,10 @@ class SDFLabel:
         self.scale = size * 96 / 72 / EM_PX  # atlas px -> world units
         self.anchor_x = anchor_x
         self.x, self.y = x, y
-        self._color = tuple(color)
+        color = tuple(color)
+        self._color = _colors.setdefault(color, color)
         self._lift = 0.0
-        self.slots = np.empty(0, np.intp)
+        self.slots = NO_SLOTS
         # per glyph: its quad relative to (left edge, capitals' center), world units; moving is one add
         self._rel = np.empty((0, 4), np.float32)
         self.text = ""
@@ -422,7 +444,8 @@ class SDFLabel:
 
     @opacity.setter
     def opacity(self, value: int) -> None:
-        self._color = (*self._color[:3], value)
+        color = (*self._color[:3], value)
+        self._color = _colors.setdefault(color, color)
         if self.slots.size:
             self.buf.f["color"][self.slots, 3] = value
             self.buf.mark_many(self.slots)
@@ -430,7 +453,7 @@ class SDFLabel:
     def _free(self) -> None:
         for slot in self.slots.tolist():
             self.buf.free(slot)
-        self.slots = np.empty(0, np.intp)
+        self.slots = NO_SLOTS
 
     def delete(self) -> None:
         self._free()
