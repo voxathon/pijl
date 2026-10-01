@@ -92,20 +92,6 @@ ADD_HANDLE_BORDER = (200, 200, 215)
 JUNCTION_HANDLE_FILL = (120, 170, 255)  # junctions: slide along the wire they sit on
 GHOST_OPACITY = 150
 
-# The miniview (miniview.py), top right: the board around the cursor again, at its own zoom.
-MINI_LEVEL = 16  # its zoom when first opened (8 levels per doubling: 400%)
-MINI_SIZE = (240, 170)  # before UI_SCALE
-MINI_MARGIN = 10
-MINI_BG = (22, 22, 27)
-MINI_CROSS = (235, 200, 90, 110)  # crosshair: what it looks at
-MINI_FRAME = (235, 200, 90, 210)  # on the board, around what it shows
-MINI_VIEW = (*SELECT, 220)  # in it, around what the view shows
-MINI_HINT = (235, 200, 90, 90)  # its key hint (G and arrows), idle
-MINI_HINT_LIT = (255, 228, 130, 255)  # ... while its key is held
-MINI_HINT_GLOW = (255, 200, 80, 150)  # the soft glow behind a lit one (additive; alpha is its peak)
-MINI_HINT_FADE_S = 0.18  # a let-go key fades back with this time constant
-MINI_ARROW_SPEED = 260  # arrows move it this many of its px per second
-MINI_MOUSE_SENSITIVITY = 1.0  # G+mouse: its px per (raw, unaccelerated) mouse count
 VIEW_KEY_SPEED = 420  # WASD move the view this many screen px per second
 
 # Grid: (minor line, major line) colors. Brighter while Ctrl-snapping.
