@@ -1,7 +1,7 @@
 """The set of selected parts and wires, kept in sync with their highlight visuals.
 
-Views own their highlight (PartView.outline, WireView.highlight); this class
-only decides which views are selected and flips them on and off.
+Views show it themselves (a flag on their shapes, see views.select_many); this
+class only decides which views are selected and flips them on and off.
 """
 
 from __future__ import annotations

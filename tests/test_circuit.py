@@ -1,3 +1,5 @@
+import numpy as np
+
 from pijl.logic import ONE, X, Z, ZERO, Level
 from pijl.sim import Circuit
 
@@ -310,3 +312,58 @@ def test_known_values_match_a_plain_bool_simulation():
                 seed,
                 tick,
             )
+
+
+def _pin_rows(c: Circuit) -> list[tuple]:
+    """Every part's pins as plain data: what the arrays hold for them."""
+    s = c._pins
+    return [
+        (
+            p.kind,
+            p.uid,
+            p.slot,
+            [
+                (
+                    q.slot,
+                    q.is_input,
+                    q.index,
+                    int(s.states[q.slot]),
+                    bool(s.reader[q.slot]),
+                    bool(s.weak[q.slot]),
+                )
+                for q in p.inputs + p.outputs + p.drives
+            ],
+        )
+        for p in c.parts
+    ]
+
+
+def test_add_parts_matches_adding_one_by_one():
+    kinds = ["IN", "NAND", "NOT", "PULLUP", "OUT", "NAND", "PULLDOWN", "IN", "XOR"]
+    one = Circuit()
+    for k in kinds:
+        one.add_part(k)
+    many = Circuit()
+    parts = many.add_parts([many.registry.get(k) for k in kinds], [None] * len(kinds))
+    assert [p.kind for p in parts] == kinds  # in order, whatever the grouping by type
+    assert _pin_rows(many) == _pin_rows(one)
+    assert all(p.live for p in parts)
+
+
+def test_add_parts_gives_every_part_its_own_props():
+    c = Circuit()
+    t = c.registry.get("PULLUP")
+    a, b = c.add_parts([t, t], [None, None])
+    a.props["priority"] = 5
+    assert (
+        b.props["priority"] == 0 and a.props is not b.props and a.state is not b.state
+    )
+
+
+def test_wire_states_of_slots_it_never_had():
+    c = Circuit()
+    a, g = c.add_part("IN"), c.add_part("NOT")
+    w, _ = c.connect(a.outputs[0], g.inputs[0])
+    value, conflict, has = c.wire_states(np.array([w.slot, 99], np.intp))
+    assert has.tolist() == [True, False]
+    assert value[0] == ZERO and not conflict[0]

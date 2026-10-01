@@ -24,7 +24,9 @@ from .paint import Pair, Rgb, sample, with_hue
 from .sdf_shapes import (
     DOT,
     RECT,
+    RECT_OUTLINE,
     SEGMENT,
+    SEGMENT_HALO,
     SHOW_BY_CODE,
     SHOW_OFF,
     Dot,
@@ -35,7 +37,7 @@ from .sdf_shapes import (
     show,
 )
 from .sdf_text import SDFLabel, SDFText
-from .spatial import SpatialIndex, polyline_boxes
+from .spatial import SpatialIndex
 
 Point = tuple[float, float]
 
@@ -183,6 +185,7 @@ class Polyline:
         self.source = -1  # the circuit wire whose state the segments show, if any
         self._opacity = 255
         self._lift = 0.0
+        self._sel = 0  # the segments' `sel` byte (see select_many)
         self.segments: list[Segment] = []
         self._slots = np.empty(
             0, np.intp
@@ -288,6 +291,8 @@ class Polyline:
                     self._opacity,
                     self._lift,
                 )  # match the others
+                if self._sel:
+                    self.buf.f["sel"][seg.slot, 0] = self._sel
                 if self.source >= 0:
                     self.buf.show_wires(seg.slot, self.source)
                 self.segments.append(seg)
@@ -563,8 +568,8 @@ class PartView:
         self.lifted = (
             False  # being dragged: drawn at the canvas's offset (see set_lifted)
         )
-        # Selection outline: a ring just outside the body, drawn under it and the pins.
-        self.outline: Rect | None = None  # only while selected (see set_selected)
+        # Selected: the body's `sel` flag, drawn as a ring around it (see select_many).
+        self._selected = False
         self.pin_tints: list[Rgb | None] = [None] * len(
             part.pins
         )  # hue for each lit pin (paint.py)
@@ -622,26 +627,10 @@ class PartView:
 
     @property
     def selected(self) -> bool:
-        return self.outline is not None
+        return self._selected
 
     def set_selected(self, on: bool) -> None:
-        if on and self.outline is None:
-            o = T.SELECT_OUTSET
-            self.outline = Rect(
-                self.x - o,
-                self.y - o,
-                self.w + 2 * o,
-                self.h + 2 * o,
-                T.SELECT_THICKNESS,
-                (*T.SELECT, 0),
-                T.SELECT,
-                self.canvas,
-                self.layers.selection,
-            )
-            self.outline.lifted = self.lifted
-        elif not on and self.outline is not None:
-            self.outline.delete()
-            self.outline = None
+        select_many([self], [], on)
 
     def intersects(self, x0: float, y0: float, x1: float, y1: float) -> bool:
         """Does the body overlap the world-space rectangle (x0, y0)-(x1, y1)?"""
@@ -666,8 +655,6 @@ class PartView:
         self.x, self.y = x, y
         Touched.parts.add(self.part.uid)
         self.body.position = (x, y)
-        if self.outline is not None:
-            self.outline.position = (x - T.SELECT_OUTSET, y - T.SELECT_OUTSET)
         self.kind_text.move_to(x + self.w / 2, y + self.h / 2)
         self.name.move_to(*self.name_pos())
         for dot, pin in zip(self.pin_dots, self.part.pins):
@@ -821,7 +808,7 @@ class WireView:
         self.line = Polyline.__new__(Polyline)  # (its segments: _make_wire_shapes)
         self.line._init(T.WIRE_OFF, canvas, layers.wires, T.WIRE_THICKNESS)
         self.line.source = wire.slot
-        self.highlight: Polyline | None = None  # selection glow, only while selected
+        self._selected = False  # its segments' `sel` flags (see select_many)
         # A dot on each end that attaches to another wire (a junction), like on schematics.
         # (In the wires layer, right after the line: a wire crossing the junction covers it.)
         self.dots: dict[str, WireDot] = {}
@@ -854,8 +841,6 @@ class WireView:
 
     def _redraw(self) -> None:
         self.line.set_points(self.points)
-        if self.highlight is not None:
-            self.highlight.set_points(self.points)
         for end, dot in self.dots.items():
             dot.position = getattr(self, end)
         if self.index is not None:
@@ -879,21 +864,10 @@ class WireView:
 
     @property
     def selected(self) -> bool:
-        return self.highlight is not None
+        return self._selected
 
     def set_selected(self, on: bool) -> None:
-        if on and self.highlight is None:
-            self.highlight = Polyline(
-                self.points,
-                T.SELECT_WIRE,
-                self.canvas,
-                self.layers.wire_halo,
-                thickness=T.WIRE_THICKNESS + 6,
-            )
-            self.highlight.lifted = self.lifted
-        elif not on and self.highlight is not None:
-            self.highlight.delete()
-            self.highlight = None
+        select_many([], [self], on)
 
     def inside(self, x0: float, y0: float, x1: float, y1: float) -> bool:
         """Is the whole wire within the world-space rectangle (x0, y0)-(x1, y1)?"""
@@ -939,50 +913,101 @@ class WireView:
 # Loading or undoing thousands of parts one constructor at a time was seconds.
 
 
+FREEZE_AT = 50_000  # objects a batch must add for paused_gc to freeze them
+
+
 @contextmanager
 def paused_gc():
     """No cycle collection meanwhile: a big batch makes hundreds of thousands of objects,
     and Python's collector would walk the whole heap again and again as it did (half the
-    time of undoing a 20k-part delete). Whatever became garbage is collected after."""
+    time of undoing a 20k-part delete).
+
+    A batch that grew the heap by FREEZE_AT objects or more ends with gc.freeze(): what
+    it made (a whole board, a big paste) is moved where the collector never looks
+    again. Otherwise every later collection would still walk it all, hundreds of ms at
+    a million objects, landing on whatever runs next. The editor makes next to no
+    cyclic garbage that grows with the board (deleted views are acyclic, freed by
+    reference counting even when frozen), so what a freeze can strand for good is a
+    few hundred objects at most: pyglet's per-call ctypes leftovers."""
     was = gc.isenabled()
     gc.disable()
+    before = gc.get_count()[0]
     try:
         yield
     finally:
+        if gc.get_count()[0] - before >= FREEZE_AT:
+            gc.freeze()
         if was:
             gc.enable()
 
 
 def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
-    """Bodies, titles, user labels, pin dots, colors, placement: a new view's shapes."""
+    """Bodies, titles, user labels, pin dots, colors, placement: a new view's shapes.
+    Positions are worked out with arrays, per pin layout (views of one type share
+    theirs), in the same arithmetic as pin_pos / name_pos."""
     if not views:
         return
     v0 = views[0]
     canvas, layers, text = v0.canvas, v0.layers, v0.text
+    n = len(views)
+    xs = np.fromiter((v.x for v in views), np.float64, n)
+    ys = np.fromiter((v.y for v in views), np.float64, n)
+    ws = np.fromiter((v.w for v in views), np.float64, n)
+    hs = np.fromiter((v.h for v in views), np.float64, n)
+    # pins: per view, how many and where they start in the flat list
     pins = [v.part.pins for v in views]
-    # the pins' states, in one gather
     flat = [p for ps in pins for p in ps]
-    on_flat = (
-        v0.part.pins[0]._store.states[[p.slot for p in flat]].tolist() if flat else []
-    )
-    states, k = [], 0
-    for ps in pins:
-        states.append(tuple(on_flat[k : k + len(ps)]))
-        k += len(ps)
-    looks: dict[
-        int, tuple
-    ] = {}  # what a look decides (anchor, body colors), worked out once per look
+    counts = np.fromiter((len(ps) for ps in pins), np.intp, n)
+    starts = np.cumsum(counts) - counts
+    pin_slots = np.fromiter((p.slot for p in flat), np.intp, len(flat))
+    codes = flat[0]._store.states[pin_slots] if flat else np.empty(0, np.intp)
+    # what each view's look decides, and the pin layout of each (look, pins, size)
+    looks: dict[int, tuple] = {}
+    group_of: dict[tuple, list[int]] = {}
+    for i, v in enumerate(views):
+        look = v.look
+        if id(look) not in looks:
+            looks[id(look)] = _look_data(look)
+        part = v.part
+        group_of.setdefault(
+            (id(look), len(part.inputs), len(part.outputs), v.w, v.h), []
+        ).append(i)
+    is_out = np.zeros(len(flat), bool)
+    pin_dy = np.zeros(len(flat))  # from the body's middle (see pin_pos)
+    lit = np.zeros(n, bool)
+    label_side = np.zeros(n, np.int8)  # the user label: -1 left, 1 right, 0 below
+    for (look_id, n_in, n_out, _w, _h), members in group_of.items():
+        idx = np.array(members, np.intp)
+        anchor, _row, lit[idx] = looks[look_id]
+        label_side[idx] = {"right": -1, "left": 1}.get(anchor, 0)
+        if n_in + n_out:
+            out = np.array([False] * n_in + [True] * n_out)
+            dy = np.array(
+                [((n_in - 1) / 2 - i) * T.PIN_SPACING for i in range(n_in)]
+                + [((n_out - 1) / 2 - i) * T.PIN_SPACING for i in range(n_out)]
+            )
+            at = (starts[idx][:, None] + np.arange(n_in + n_out)).ravel()
+            is_out[at] = np.tile(out, len(idx))
+            pin_dy[at] = np.tile(dy, len(idx))
     # titles and user labels (a view's title, then its label: the one-at-a-time order),
     # and pin name tags if shown
+    mid_x, mid_y = xs + ws / 2, ys + hs / 2
+    name_x = np.where(
+        label_side < 0,
+        xs - T.LABEL_GAP,
+        np.where(label_side > 0, (xs + ws) + T.LABEL_GAP, mid_x),
+    )
+    name_y = np.where(
+        label_side == 0, (ys - T.LABEL_GAP) - text.cap_height(T.LABEL_SIZE) / 2, mid_y
+    )
     specs, tagged = [], []
-    for v in views:
-        look = looks.get(id(v.look))
-        if look is None:
-            look = looks[id(v.look)] = _look_data(v.look)
+    for v, tx, ty, nx, ny in zip(
+        views, mid_x.tolist(), mid_y.tolist(), name_x.tolist(), name_y.tolist()
+    ):
+        specs.append((v.title, tx, ty, v.title_size, T.PART_TEXT, "center"))
         specs.append(
-            (v.title, v.x + v.w / 2, v.y + v.h / 2, v.title_size, T.PART_TEXT, "center")
+            (v.part.label, nx, ny, T.LABEL_SIZE, T.LABEL_TEXT, looks[id(v.look)][0])
         )
-        specs.append((v.part.label, *v.name_pos(), T.LABEL_SIZE, T.LABEL_TEXT, look[0]))
         if pin_labels and v.look.pin_labels:
             specs += v._tag_specs()
     labels = iter(text.labels(specs))
@@ -992,19 +1017,18 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
             tagged.append((v, [next(labels) for _ in ps]))
     _make_pin_tags(tagged)
     # bodies: the look's colors; lit ones (switches, LEDs) also on-colors, on per the first pin
-    rows, colors, on, first_pin = [], [], [], []
-    for v, state in zip(views, states):
-        _, row, lit = looks[id(v.look)]
-        rows.append((v.x, v.y, v.w, v.h))
-        colors.append(row)
-        on.append(SHOW_BY_CODE[state[0]] if lit and state else SHOW_OFF)
-        first_pin.append(v.part.pins[0].slot if lit and state else -1)
+    has_pins = counts > 0
+    on = np.full(n, SHOW_OFF, np.uint8)
+    first_pin = np.full(n, -1, np.intp)
+    shows = lit & has_pins
+    on[shows] = SHOW_BY_CODE[codes[starts[shows]]]
+    first_pin[shows] = pin_slots[starts[shows]]
     buf = canvas.buffer(RECT, layers.bodies)
-    slots = buf.alloc_many(len(views))
+    slots = buf.alloc_many(n)
     f = buf.f
-    f["rect"][slots] = rows
+    f["rect"][slots] = np.column_stack((xs, ys, ws, hs))
     f["border"][slots] = T.PART_BORDER
-    colors = np.array(colors, np.uint8)
+    colors = np.array([looks[id(v.look)][1] for v in views], np.uint8)
     for k, name in enumerate(("fill", "fill_on", "edge", "edge_on")):
         f[name][slots] = colors[:, k]
     f["flags"][slots] = 0, 255, 0, 0
@@ -1015,26 +1039,37 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
     for v, body in zip(views, Rect.adopt(buf, slots.tolist())):
         v.body = body
     # pin dots
-    centers = [v.pin_pos(pin) for v, ps in zip(views, pins) for pin in ps]
     buf = canvas.buffer(DOT, layers.pins)
-    slots = buf.alloc_many(len(centers))
-    if len(centers):
+    slots = buf.alloc_many(len(flat))
+    if len(flat):
+        owner = np.repeat(np.arange(n), counts)
         f = buf.f
-        f["center"][slots] = centers
+        f["center"][slots] = np.column_stack(
+            (
+                np.where(is_out, xs[owner] + ws[owner], xs[owner]),
+                mid_y[owner] + pin_dy,
+            )
+        )
         f["radius"][slots] = T.PIN_RADIUS
         f["color"][slots] = _rgba(T.PIN_OFF)
         f["color_on"][slots] = _rgba(with_hue(T.PIN_ON, None))
         f["flags"][slots] = 0, 255, 0, 0
-        f["flags"][slots, 0] = SHOW_BY_CODE[np.array(on_flat, np.intp)]
+        f["flags"][slots, 0] = SHOW_BY_CODE[codes]
         f["lift"][slots] = 0.0
         buf.mark_many(slots)
-        buf.show_pins(slots, [p.slot for p in flat])
+        buf.show_pins(slots, pin_slots)
     dots = Dot.adopt(buf, slots.tolist())
-    k = 0
-    for v, ps in zip(views, pins):
-        v.pin_dots = dots[k : k + len(ps)]
-        k += len(ps)
-    _index_many([(v, [v._index_box()]) for v in views])
+    for v, k, c in zip(views, starts.tolist(), counts.tolist()):
+        v.pin_dots = dots[k : k + c]
+    # the spatial index: the body, and the pins sticking out of its sides (_index_box)
+    r = T.PIN_RADIUS
+    boxes = np.column_stack((xs - r, ys, (xs + ws) + r, ys + hs))
+    by_index: dict[int, tuple] = {}
+    for i, v in enumerate(views):
+        if v.index is not None:
+            by_index.setdefault(id(v.index), (v.index, []))[1].append(i)
+    for index, members in by_index.values():
+        index.put_boxes([views[i] for i in members], boxes[members])
     Touched.part_many(
         v.part.uid for v in views
     )  # new: its own color (props) needs painting
@@ -1106,38 +1141,52 @@ def _make_pin_tags(made: list[tuple[PartView, list[SDFLabel]]]) -> None:
 
 
 def _make_wire_shapes(views: list[WireView]) -> None:
-    """The segments of a new wire's line (and its junction dots), placed and colored."""
+    """The segments of a new wire's line (and its junction dots), placed and colored.
+    Per wire, in order: its segments, then a dot on each end that's a junction (right
+    after its line: a wire crossing the junction covers it)."""
     if not views:
         return
     v0 = views[0]
     buf = v0.line.buf
-    a, b, radius, caps, kinds, shows = [], [], [], [], [], []
+    n = len(views)
+    lines = [v.points for v in views]
     for v in views:
         v.dots = {
             end: None
             for end in ("src", "dst")
             if not isinstance(getattr(v.wire, end), Pin)
         }
-        pts = v.points
-        last = len(pts) - 2  # corners (round caps): the points between the ends
-        for k in range(len(pts) - 1):
-            a.append(pts[k])
-            b.append(pts[k + 1])
-            caps.append((255 if k >= 1 else 0, 255 if k + 1 <= last else 0))
-        radius += [T.WIRE_THICKNESS / 2] * (len(pts) - 1)
-        kinds += [Segment] * (len(pts) - 1)
-        shows += [v.wire.slot] * (len(pts) - 1 + len(v.dots))
-        for (
-            end
-        ) in v.dots:  # right after its line: a wire crossing the junction covers it
-            p = getattr(v, end)
-            a.append(p)
-            b.append(p)
-            caps.append((255, 255))
-            radius.append(T.JUNCTION_RADIUS)
-            kinds.append(WireDot)
-    slots = buf.alloc_many(len(a))
-    if len(a):
+    n_pts = np.fromiter((len(pts) for pts in lines), np.intp, n)
+    n_seg = np.maximum(n_pts - 1, 0)
+    dot_src = np.fromiter(("src" in v.dots for v in views), bool, n)
+    dot_dst = np.fromiter(("dst" in v.dots for v in views), bool, n)
+    rows = n_seg + dot_src + dot_dst
+    first = np.cumsum(rows) - rows  # each wire's first row
+    total = int(rows.sum())
+    slots = buf.alloc_many(total)
+    if total:
+        p = np.array([xy for pts in lines for xy in pts], np.float64).reshape(-1, 2)
+        first_pt = np.cumsum(n_pts) - n_pts
+        a, b = np.empty((total, 2)), np.empty((total, 2))
+        radius = np.empty(total)
+        caps = np.full((total, 2), 255, np.uint8)
+        # segments: point k -> k + 1, round caps at the corners (the points between the ends)
+        wire = np.repeat(np.arange(n), n_seg)
+        k = np.arange(len(wire)) - np.repeat(np.cumsum(n_seg) - n_seg, n_seg)
+        at = first[wire] + k
+        a[at] = p[first_pt[wire] + k]
+        b[at] = p[first_pt[wire] + k + 1]
+        radius[at] = T.WIRE_THICKNESS / 2
+        caps[at, 0] = np.where(k >= 1, 255, 0)
+        caps[at, 1] = np.where(k + 1 <= n_seg[wire] - 1, 255, 0)
+        # junction dots: zero-length, capped both ends
+        for has, row, point in (
+            (dot_src, n_seg, first_pt),
+            (dot_dst, n_seg + dot_src, first_pt + n_pts - 1),
+        ):
+            w = np.flatnonzero(has)
+            a[first[w] + row[w]] = b[first[w] + row[w]] = p[point[w]]
+            radius[first[w] + row[w]] = T.JUNCTION_RADIUS
         f = buf.f
         f["a"][slots] = a
         f["b"][slots] = b
@@ -1150,22 +1199,27 @@ def _make_wire_shapes(views: list[WireView]) -> None:
         f["flags"][slots, 2:] = caps
         f["lift"][slots] = 0.0
         buf.mark_many(slots)
-        buf.show_wires(slots, shows)
-    k = 0
+        buf.show_wires(
+            slots, np.repeat(np.fromiter((v.wire.slot for v in views), np.intp, n), rows)
+        )
     slot_list = slots.tolist()
-    for v in views:
-        line, pts = v.line, v.points
-        n = max(len(pts) - 1, 0)
-        line.segments = Segment.adopt(buf, slot_list[k : k + n])
-        line._slots = slots[k : k + n]
-        k += n
+    for v, pts, k, c in zip(views, lines, first.tolist(), n_seg.tolist()):
+        line = v.line
+        line.segments = Segment.adopt(buf, slot_list[k : k + c])
+        line._slots = slots[k : k + c]
+        k += c
         for end in v.dots:
             (v.dots[end],) = WireDot.adopt(buf, slot_list[k : k + 1])
             k += 1
-        line.points = list(pts)
+        line.points = pts
         line._pair = (T.WIRE_OFF, T.WIRE_ON)
         line._layout_key, line._plain, line._vfracs = None, True, [0.0] * len(pts)
-    _index_many([(v, polyline_boxes(v.points)) for v in views])
+    by_index: dict[int, tuple] = {}
+    for v in views:
+        if v.index is not None:
+            by_index.setdefault(id(v.index), (v.index, []))[1].append((v, v.points))
+    for index, members in by_index.values():
+        index.put_polylines(members)
     Touched.wire_many(v.wire.uid for v in views)
 
 
@@ -1206,7 +1260,6 @@ class _Slots:
     def parts(self, views: list[PartView]) -> _Slots:
         self.shapes([v.body for v in views])
         self.shapes([d for v in views for d in v.pin_dots])
-        self.shapes([v.outline for v in views if v.outline is not None])
         self.shapes([bg for v in views for bg, _ in v.pin_tags])
         self.labels([v.kind_text for v in views if v.kind_text.slots.size])
         self.labels([v.name for v in views if v.name.slots.size])
@@ -1215,7 +1268,6 @@ class _Slots:
 
     def wires(self, views: list[WireView]) -> _Slots:
         self.lines([v.line for v in views])
-        self.lines([v.highlight for v in views if v.highlight is not None])
         self.shapes([d for v in views for d in v.dots.values()])
         return self
 
@@ -1269,86 +1321,41 @@ def delete_views(parts: list[PartView], wires: list[WireView]) -> None:
         for dot in v.pin_dots:
             dot.slot = None
         v.kind_text.slots = v.name.slots = empty
-        v.outline, v.pin_tags = None, []
+        v.pin_tags = []
+        v._selected = False
     for v in wires:
-        for line in (v.line, v.highlight):
-            if line is not None:
-                line.segments.clear()
-                line._slots = empty
+        v.line.segments.clear()
+        v.line._slots = empty
         for dot in v.dots.values():
             dot.slot = None
-        v.highlight = None
+        v._selected = False
 
 
 def select_many(parts: list[PartView], wires: list[WireView], on: bool) -> None:
-    """set_selected for many parts and wires at once: the outlines and wire highlights
-    made (or freed) per buffer, not one shape at a time."""
-    parts = [v for v in parts if v.selected != on]
-    wires = [v for v in wires if v.selected != on]
-    if not on:
-        gone = _Slots()
-        gone.shapes([v.outline for v in parts])
-        gone.lines([v.highlight for v in wires])
-        for buf, slots in gone:
-            buf.free_many(slots)
-        for v in parts:
-            v.outline = None
-        for v in wires:
-            v.highlight = None
+    """set_selected for many parts and wires at once. Selection is a flag on the shapes
+    themselves (`sel`: the body, the line's segments), which the canvas draws again as
+    outlines and halos (see canvas.Echo, sdf_shapes.RECT_OUTLINE / SEGMENT_HALO): one
+    write per buffer, and nothing to keep in step when they move, lift or go away."""
+    parts = [v for v in parts if v._selected != on]
+    wires = [v for v in wires if v._selected != on]
+    if not (parts or wires):
         return
-    if parts:
-        v0, o = parts[0], T.SELECT_OUTSET
-        buf = v0.canvas.buffer(RECT, v0.layers.selection)
-        slots = buf.alloc_many(len(parts))
-        f = buf.f
-        f["rect"][slots] = [(v.x - o, v.y - o, v.w + 2 * o, v.h + 2 * o) for v in parts]
-        f["border"][slots] = T.SELECT_THICKNESS
-        f["fill"][slots] = f["fill_on"][slots] = _rgba((*T.SELECT, 0))
-        f["edge"][slots] = f["edge_on"][slots] = _rgba(T.SELECT)
-        f["flags"][slots] = 0, 255, 0, 0
-        f["lift"][slots] = [1.0 if v.lifted else 0.0 for v in parts]
+    value = 255 if on else 0
+    for v in parts:
+        v._selected = on
+    for v in wires:
+        v._selected = on
+        v.line._sel = value
+    v0 = parts[0] if parts else wires[0]
+    canvas, layers = v0.canvas, v0.layers
+    canvas.echo(RECT_OUTLINE, layers.selection, RECT, layers.bodies)
+    canvas.echo(SEGMENT_HALO, layers.wire_halo, SEGMENT, layers.wires)
+    flagged = _Slots()
+    flagged.shapes([v.body for v in parts])
+    flagged.lines([v.line for v in wires])
+    for buf, slots in flagged:
+        buf.f["sel"][slots, 0] = value
         buf.mark_many(slots)
-        for v, outline in zip(parts, Rect.adopt(buf, slots.tolist())):
-            v.outline = outline
-    if wires:
-        v0 = wires[0]
-        thickness = T.WIRE_THICKNESS + 6
-        buf = v0.canvas.buffer(SEGMENT, v0.layers.wire_halo)
-        a, b, caps, lifts = [], [], [], []
-        for v in wires:
-            pts, lifted = v.points, 1.0 if v.lifted else 0.0
-            last = len(pts) - 2  # corners (round caps): the points between the ends
-            for k in range(len(pts) - 1):
-                a.append(pts[k])
-                b.append(pts[k + 1])
-                caps.append((255 if k >= 1 else 0, 255 if k + 1 <= last else 0))
-                lifts.append(lifted)
-        slots = buf.alloc_many(len(a))
-        if len(a):
-            f = buf.f
-            f["a"][slots] = a
-            f["b"][slots] = b
-            f["radius"][slots] = thickness / 2
-            color = _rgba(T.SELECT_WIRE)
-            for name in ("ca", "ca_on", "cb", "cb_on"):
-                f[name][slots] = color
-            f["flags"][slots] = 0, 255, 0, 0
-            f["flags"][slots, 2:] = caps
-            f["lift"][slots] = lifts
-            buf.mark_many(slots)
-        k, slot_list = 0, slots.tolist()
-        for v in wires:
-            pts = v.points
-            n = len(pts) - 1
-            line = Polyline.__new__(Polyline)
-            line._init(T.SELECT_WIRE, v.canvas, v.layers.wire_halo, thickness)
-            line.segments = Segment.adopt(buf, slot_list[k : k + n])
-            line._slots = slots[k : k + n]
-            line.points = list(pts)
-            line._layout_key, line._plain, line._vfracs = None, True, [0.0] * len(pts)
-            line._lift = 1.0 if v.lifted else 0.0
-            v.highlight = line
-            k += n
 
 
 # What the views remember of their shapes (coordinates, lift), and the spatial index:
@@ -1372,8 +1379,6 @@ def _lift_mirrors(
     for v in wires:
         v.lifted = on
         v.line._lift = value
-        if v.highlight is not None:
-            v.highlight._lift = value
     return parts, wires
 
 
@@ -1395,9 +1400,7 @@ def _move_wire_mirrors(views: list[WireView], dx: float, dy: float) -> None:
     for v in views:
         v.src, v.dst = (v.src[0] + dx, v.src[1] + dy), (v.dst[0] + dx, v.dst[1] + dy)
         v.bends = [(x + dx, y + dy) for x, y in v.bends]
-        for line in (v.line, v.highlight):
-            if line is not None:
-                line.points = [(x + dx, y + dy) for x, y in line.points]
+        v.line.points = [(x + dx, y + dy) for x, y in v.line.points]
     _shift_indexed(views, dx, dy)
     Touched.wires.update(v.wire.uid for v in views)
 

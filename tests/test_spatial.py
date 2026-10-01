@@ -46,3 +46,42 @@ def test_huge_query():
     h.put_rect("b", 1e6, 1e6, 1e6 + 1, 1e6 + 1)
     assert h.query(-1e7, -1e7, 1e7, 1e7) == {"a", "b"}
     assert h.query(-1e7, -1e7, 10, 10) == {"a"}
+
+
+def test_bulk_boxes_match_one_line_at_a_time():
+    import random
+
+    from pijl.ui.spatial import polyline_boxes, polylines_boxes
+
+    rng = random.Random(1)
+    lines = [
+        [
+            (rng.uniform(-3e3, 3e3), rng.uniform(-3e3, 3e3))
+            for _ in range(rng.randint(1, 5))
+        ]
+        for _ in range(200)
+    ]
+    boxes, counts = polylines_boxes(lines)
+    assert counts.tolist() == [len(polyline_boxes(pts)) for pts in lines]
+    single = [b for pts in lines for b in polyline_boxes(pts)]
+    assert abs(boxes - single).max() < 1e-9
+
+
+def test_a_straight_run_is_one_box_a_diagonal_many():
+    from pijl.ui.spatial import polyline_boxes
+
+    assert len(polyline_boxes([(0, 0), (5000, 0)])) == 1
+    assert (
+        len(polyline_boxes([(0, 0), (5000, 30)])) == 1
+    )  # barely off axis: still tight
+    assert len(polyline_boxes([(0, 0), (1000, 1000)])) > 10
+
+
+def test_put_polylines_replaces_what_was_there():
+    h = SpatialIndex()
+    h.put_polyline("w", [(0, 0), (500, 0)])
+    h.put_rect("r", 1000, 1000, 1001, 1001)
+    h.put_polylines([("w", [(0, 100), (10, 100)]), ("v", [(0, 0), (30, 30)])])
+    assert h.near(400, 0, 1) == set()  # w's old boxes are gone
+    assert h.near(5, 100, 1) == {"w"} and h.near(15, 15, 1) == {"v"}
+    assert h.near(1000.5, 1000.5, 0.1) == {"r"}

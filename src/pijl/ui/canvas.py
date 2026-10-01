@@ -99,15 +99,21 @@ class InstanceBuffer:
         self._make_gl()
 
     def _make_gl(self) -> None:
-        vao, vbo = gl.GLuint(), gl.GLuint()
-        gl.glGenVertexArrays(1, ctypes.byref(vao))
+        vbo = gl.GLuint()
         gl.glGenBuffers(1, ctypes.byref(vbo))
-        self.vao, self.vbo = vao, vbo
+        self.vbo = vbo
+        self.vao = self.make_vao(self.program)
+
+    def make_vao(self, program: ShaderProgram) -> gl.GLuint:
+        """A vertex array feeding this buffer's instances to `program` (its own, or an
+        echo's: see Echo)."""
+        vao = gl.GLuint()
+        gl.glGenVertexArrays(1, ctypes.byref(vao))
         gl.glBindVertexArray(vao)
-        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
         stride = self.dtype.itemsize
         for name in self.dtype.names:
-            loc = gl.glGetAttribLocation(self.program.id, name.encode())
+            loc = gl.glGetAttribLocation(program.id, name.encode())
             if loc < 0:
                 continue  # unused by the shader (optimized away)
             sub, offset = self.dtype.fields[name][:2]
@@ -126,6 +132,7 @@ class InstanceBuffer:
             )
             gl.glVertexAttribDivisor(loc, 1)
         gl.glBindVertexArray(0)
+        return vao
 
     # ---- slots ---------------------------------------------------------------
 
@@ -275,6 +282,35 @@ class InstanceBuffer:
         self.program.stop()
 
 
+class Echo:
+    """Another buffer's instances drawn again, in another layer, by another program
+    (`kind`: the same instance layout, other shaders). Selection outlines and wire
+    halos are echoes: the shapes carry a `sel` flag, and the echo's shaders draw only
+    the selected ones -- so selecting is a flag write, not new shapes, and the
+    highlight moves, lifts and goes away with its shape by itself."""
+
+    def __init__(self, kind: Kind, source: InstanceBuffer) -> None:
+        if kind.dtype != source.dtype:
+            raise TypeError(f"{kind.name} can't echo {source.kind.name}: other layout")
+        self.kind, self.source = kind, source
+        self.program = kind.program
+        self.vao = source.make_vao(self.program)
+
+    def draw(self, offset: tuple[float, float] = (0.0, 0.0), now: float = 0.0) -> None:
+        src = self.source
+        if not src.top:
+            return
+        src._upload()  # (it may come after us in the draw order)
+        self.program.use()
+        self.program["lift_offset"] = offset
+        if "time" in self.program.uniforms:
+            self.program["time"] = now
+        gl.glBindVertexArray(self.vao)
+        gl.glDrawArraysInstanced(gl.GL_TRIANGLE_STRIP, 0, 4, src.top)
+        gl.glBindVertexArray(0)
+        self.program.stop()
+
+
 class Canvas:
     """The world: instance buffers by layer, then a plain pyglet batch (`batch`) on top
     for the few things still made of pyglet shapes (wire-edit handles, the caret)."""
@@ -282,6 +318,7 @@ class Canvas:
     def __init__(self, batch: pyglet.graphics.Batch) -> None:
         self.batch = batch
         self._buffers: dict[tuple[int, int, str], InstanceBuffer] = {}
+        self._echoes: dict[tuple[int, int, str], Echo] = {}
         self.offset = (
             0.0,
             0.0,
@@ -298,12 +335,20 @@ class Canvas:
     def buffers(self):
         return self._buffers.values()
 
+    def echo(self, kind: Kind, layer, source_kind: Kind, source_layer) -> None:
+        """Draw source_kind's instances in source_layer again, in `layer`, with `kind`'s
+        shaders (see Echo). Once per canvas; asking again does nothing."""
+        key = (getattr(layer, "order", layer), kind.rank, kind.name)
+        if key not in self._echoes:
+            self._echoes[key] = Echo(kind, self.buffer(source_kind, source_layer))
+
     def draw(self) -> None:
         gl.glEnable(gl.GL_BLEND)
         gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
         now = time.monotonic() % 3600.0  # (kept small: it's a float32 in the shaders)
-        for key in sorted(self._buffers):
-            self._buffers[key].draw(self.offset, now)
+        drawn = {**self._buffers, **self._echoes}
+        for key in sorted(drawn):
+            drawn[key].draw(self.offset, now)
         gl.glDisable(gl.GL_BLEND)
         self.batch.draw()
 

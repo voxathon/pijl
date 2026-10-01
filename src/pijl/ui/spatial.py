@@ -28,7 +28,7 @@ class SpatialIndex:
             (4, capacity), np.inf
         )  # x0, y0, x1, y1 per box; free rows never match
         self._cols[2:] = -np.inf
-        self._owner: list[Hashable | None] = [None] * capacity
+        self._owner = np.full(capacity, None, object)  # per row: whose box it is
         self._free: list[int] = []
         self._end = 0  # rows below this were handed out at some point
         self.where: dict[Hashable, list[int]] = {}  # object -> its boxes' rows
@@ -47,33 +47,53 @@ class SpatialIndex:
         self._put(obj, polyline_boxes(points))
 
     def put_many(self, items: list[tuple[Hashable, list[tuple]]]) -> None:
-        """(object, its boxes) for many objects at once (new ones: in bulk)."""
-        new = []
-        for obj, boxes in items:
-            if obj in self.where:
-                self._put(obj, boxes)
-            else:
-                new.append((obj, boxes))
-        n = sum(len(boxes) for _, boxes in new)
-        if not n:
+        """(object, its boxes) for many objects at once."""
+        if not items:
             return
+        boxes = [box for _, bs in items for box in bs]
+        counts = np.fromiter((len(bs) for _, bs in items), np.intp, len(items))
+        self._put_arrays(
+            [obj for obj, _ in items],
+            np.array(boxes, np.float64).reshape(-1, 4),
+            counts,
+        )
+
+    def put_boxes(self, objs: list, boxes: np.ndarray) -> None:
+        """One box each (n x 4: x0, y0, x1, y1) for many objects at once."""
+        if objs:
+            self._put_arrays(objs, boxes, np.ones(len(objs), np.intp))
+
+    def put_polylines(self, items: list[tuple[Hashable, list[Point]]]) -> None:
+        """put_polyline for many objects at once: (object, its points)."""
+        if items:
+            boxes, counts = polylines_boxes([points for _, points in items])
+            self._put_arrays([obj for obj, _ in items], boxes, counts)
+
+    def _put_arrays(self, objs: list, boxes: np.ndarray, counts: np.ndarray) -> None:
+        """objs[i] gets the next counts[i] rows of `boxes` (n x 4), replacing any it had."""
+        self.remove_many([obj for obj in objs if obj in self.where])
+        n = len(boxes)
         free = self._free
-        rows = [free.pop() for _ in range(min(n, len(free)))]
-        rest = n - len(rows)
+        take = min(n, len(free))
+        rows = np.empty(n, np.intp)
+        if take:  # (from the end, last first: as popping them one at a time would)
+            rows[:take] = free[len(free) - take :][::-1]
+            del free[len(free) - take :]
+        rest = n - take
         while self._end + rest > self._cols.shape[1]:
             self._grow()
-        rows += range(self._end, self._end + rest)
+        rows[take:] = np.arange(self._end, self._end + rest)
         self._end += rest
-        k = 0
-        owner, where = self._owner, self.where
-        for obj, boxes in new:
-            mine = where[obj] = rows[k : k + len(boxes)]
-            for r in mine:
-                owner[r] = obj
-            k += len(boxes)
-        self._cols[:, rows] = np.array(
-            [box for _, boxes in new for box in boxes], np.float64
-        ).T
+        owners = np.empty(len(objs), object)
+        for i, obj in enumerate(objs):  # (owners[:] = objs would unpack tuples)
+            owners[i] = obj
+        self._owner[rows] = np.repeat(owners, counts)
+        self._cols[:, rows] = boxes.T
+        row_list = rows.tolist()
+        k, where = 0, self.where
+        for obj, c in zip(objs, counts.tolist()):
+            where[obj] = row_list[k : k + c]
+            k += c
 
     def _put(self, obj: Hashable, boxes: list[tuple]) -> None:
         rows = self.where.get(obj)
@@ -104,7 +124,9 @@ class SpatialIndex:
         grown[2:] = -np.inf
         grown[:, :n] = self._cols
         self._cols = grown
-        self._owner.extend([None] * n)
+        owner = np.full(2 * n, None, object)
+        owner[:n] = self._owner
+        self._owner = owner
 
     def _release(self, row: int) -> None:
         self._cols[:2, row], self._cols[2:, row] = np.inf, -np.inf
@@ -119,11 +141,9 @@ class SpatialIndex:
         pop = self.where.pop
         rows = [r for obj in objs for r in pop(obj, ())]
         if rows:
-            owner = self._owner
-            for r in rows:
-                owner[r] = None
             self._free.extend(rows)
             rows = np.array(rows, np.intp)
+            self._owner[rows] = None
             self._cols[:2, rows], self._cols[2:, rows] = np.inf, -np.inf
 
     def shift(self, objs: Iterable[Hashable], dx: float, dy: float) -> None:
@@ -147,8 +167,7 @@ class SpatialIndex:
         hit = np.flatnonzero(
             (c[0, :n] <= x1) & (c[2, :n] >= x0) & (c[1, :n] <= y1) & (c[3, :n] >= y0)
         )
-        owner = self._owner
-        return {owner[i] for i in hit.tolist()}
+        return set(self._owner[hit].tolist())
 
     def bounds(self) -> tuple[float, float, float, float] | None:
         """The box around everything (x0, y0, x1, y1), or None if empty."""
@@ -167,21 +186,43 @@ class SpatialIndex:
 
 
 def polyline_boxes(points: list[Point]) -> list[tuple]:
-    """A line's boxes: one per piece (see PIECE)."""
+    """A line's boxes (see polylines_boxes; for one line, plain Python is quicker)."""
+    if len(points) == 1:
+        points = [points[0], points[0]]
     boxes = []
     for (ax, ay), (bx, by) in zip(points, points[1:]):
-        n = max(1, math.ceil(max(abs(bx - ax), abs(by - ay)) / PIECE))
-        if n == 1:
-            boxes.append((min(ax, bx), min(ay, by), max(ax, bx), max(ay, by)))
-            continue
+        dx, dy = bx - ax, by - ay
+        n = max(1, math.ceil(min(abs(dx), abs(dy)) / PIECE))
         for k in range(n):
-            px, py = ax + (bx - ax) * k / n, ay + (by - ay) * k / n
-            qx, qy = ax + (bx - ax) * (k + 1) / n, ay + (by - ay) * (k + 1) / n
+            px, py = ax + dx * k / n, ay + dy * k / n
+            qx, qy = ax + dx * (k + 1) / n, ay + dy * (k + 1) / n
             boxes.append((min(px, qx), min(py, qy), max(px, qx), max(py, qy)))
-    if len(points) == 1:
-        ((x, y),) = points
-        boxes.append((x, y, x, y))
     return boxes
+
+
+def polylines_boxes(lines: list[list[Point]]) -> tuple[np.ndarray, np.ndarray]:
+    """The boxes of many lines at once: all of them, line by line (n x 4: x0, y0, x1,
+    y1), and how many each line has. A segment is cut into pieces until each piece's
+    box is at most PIECE across its narrow side -- that's how far a box can stray from
+    the line -- so a diagonal is boxed tightly and a straight run of any length is one
+    box. A single point is a box of its own."""
+    lines = [pts if len(pts) != 1 else [pts[0], pts[0]] for pts in lines]
+    sizes = np.fromiter((len(pts) for pts in lines), np.intp, len(lines))
+    if not sizes.sum():
+        return np.empty((0, 4)), np.zeros(len(lines), np.intp)
+    p = np.array([xy for pts in lines for xy in pts], np.float64)
+    line_of = np.repeat(np.arange(len(lines)), sizes)
+    seg = np.flatnonzero(line_of[:-1] == line_of[1:])  # point i -> i + 1
+    a, d = p[seg], p[seg + 1] - p[seg]
+    pieces = np.maximum(1, np.ceil(np.abs(d).min(axis=1) / PIECE)).astype(np.intp)
+    which = np.repeat(np.arange(len(seg)), pieces)
+    k = (np.arange(len(which)) - (np.cumsum(pieces) - pieces)[which])[:, None]
+    n = pieces[which][:, None]
+    lo = a[which] + d[which] * (k / n)
+    hi = a[which] + d[which] * ((k + 1) / n)
+    boxes = np.hstack((np.minimum(lo, hi), np.maximum(lo, hi)))
+    counts = np.bincount(line_of[seg], weights=pieces, minlength=len(lines))
+    return boxes, counts.astype(np.intp)
 
 
 def ordered(views: Iterable, newest_first: bool = False) -> list:

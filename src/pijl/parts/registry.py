@@ -192,6 +192,20 @@ def fresh_props(t: PartType) -> dict:
     return props
 
 
+def copy_props(props: dict) -> dict:
+    """An instance's own copy of these props: a plain copy when every value is
+    immutable (the usual case, and much cheaper than a deep copy)."""
+    return dict(props) if flat(props) else copy.deepcopy(props)
+
+
+def flat(props: dict) -> bool:
+    """Every value immutable: a plain copy of these props is as good as a deep one."""
+    return all(
+        v is None or isinstance(v, (bool, int, float, str, bytes))
+        for v in props.values()
+    )
+
+
 def check_props(t: PartType, props: dict) -> tuple[dict, list[str]]:
     """Saved props -> what an instance gets: defaults for what's missing, every setting's
     value through its parse(). A value that doesn't parse is reset to the default; the

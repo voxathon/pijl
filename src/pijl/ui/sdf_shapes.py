@@ -179,6 +179,11 @@ void main() {{
             ("edge_on", "u1", 4),
             ("flags", "u1", 4),
             ("lift", "f4"),
+            (
+                "sel",
+                "u1",
+                4,
+            ),  # x: selected (see RECT_OUTLINE); four bytes keep it aligned
         ]
     ),
     positions=("rect",),
@@ -313,9 +318,98 @@ void main() {{
             ("cb_on", "u1", 4),
             ("flags", "u1", 4),
             ("lift", "f4"),
+            (
+                "sel",
+                "u1",
+                4,
+            ),  # x: selected (see SEGMENT_HALO); four bytes keep it aligned
         ]
     ),
     positions=("a", "b"),
+)
+
+
+# ---- Selection: echoes of bodies and wires (see canvas.Echo) ------------------------
+
+_UNSELECTED = "if (sel.x < 0.5) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }  // nothing to draw"
+
+
+def _vec4(rgba) -> str:
+    r, g, b, a = _rgba(rgba)
+    return f"vec4({r / 255:.4f}, {g / 255:.4f}, {b / 255:.4f}, {a / 255:.4f})"
+
+
+RECT_OUTLINE = Kind(
+    "rect_outline",
+    0,
+    f"""#version 150 core
+in vec4 rect;
+in float lift;
+in vec4 sel;
+out vec2 local;
+out vec2 world;
+flat out vec2 size;
+flat out float bw;
+flat out vec4 cf;
+flat out vec4 ce;
+flat out int show;
+{UNIFORMS}
+void main() {{
+    {_UNSELECTED}
+    {_CORNER}
+    vec4 r = rect + vec4(-{float(T.SELECT_OUTSET)}, -{float(T.SELECT_OUTSET)}, {2.0 * T.SELECT_OUTSET}, {2.0 * T.SELECT_OUTSET});
+    local = corner * r.zw;
+    size = r.zw;
+    bw = {float(T.SELECT_THICKNESS)};
+    show = {SHOW_OFF};
+    cf = {_vec4((*T.SELECT, 0))};
+    ce = {_vec4(T.SELECT)};
+    world = r.xy + lift * lift_offset + local;
+    gl_Position = window.projection * window.view * vec4(world, 0.0, 1.0);
+}}
+""",
+    RECT.fragment,
+    RECT.dtype,
+)
+
+SEGMENT_HALO = Kind(
+    "segment_halo",
+    2,
+    f"""#version 150 core
+in vec2 a;
+in vec2 b;
+in float radius;
+in vec4 flags;
+in float lift;
+in vec4 sel;
+out vec2 uv;
+out vec2 world;
+flat out vec2 ext;
+flat out vec4 c0;
+flat out vec4 c1;
+flat out int show;
+{UNIFORMS}
+void main() {{
+    {_UNSELECTED}
+    {_CORNER}
+    vec2 d = b - a;
+    float len = length(d);
+    vec2 dir = len > 0.0 ? d / len : vec2(1.0, 0.0);
+    vec2 n = vec2(-dir.y, dir.x);
+    float r = radius + 3.0;  // the glow: 3 world units around the line
+    float w = r * {PAD};
+    float u = mix(flags.z > 0.5 ? -w : 0.0, len + (flags.w > 0.5 ? w : 0.0), corner.x);
+    float v = mix(-w, w, corner.y);
+    uv = vec2(u, v);
+    ext = vec2(len, r);
+    show = {SHOW_OFF};
+    c0 = c1 = {_vec4(T.SELECT_WIRE)};
+    world = a + lift * lift_offset + dir * u + n * v;
+    gl_Position = window.projection * window.view * vec4(world, 0.0, 1.0);
+}}
+""",
+    SEGMENT.fragment,
+    SEGMENT.dtype,
 )
 
 

@@ -67,6 +67,7 @@ from scipy.sparse.csgraph import connected_components
 
 from ..logic import CODE, ONE, X, Z, ZERO, Level, Logic, codes, fights, resolve
 from ..parts import Ctx, PartType, Registry, builtin_registry, fresh_props
+from ..parts.registry import flat
 
 _FAILED = object()  # what Circuit._guard returns when the hook raised
 
@@ -86,16 +87,34 @@ class _PinStates:
 
     def add(self, pin: Pin, initial: Level, weak: bool) -> int:
         slot = len(self.pins)
-        if slot == len(self.states):
-            for name in ("states", "reader", "alive", "weak"):
-                old = getattr(self, name)
-                setattr(self, name, np.concatenate((old, np.zeros_like(old))))
+        self._room(slot + 1)
         self.pins.append(pin)
         self.states[slot] = initial
         self.reader[slot] = pin.is_input
         self.alive[slot] = True
         self.weak[slot] = weak
         return slot
+
+    def add_block(
+        self, pins: list[Pin], initial: np.ndarray, reader: np.ndarray, weak: np.ndarray
+    ) -> None:
+        """add() for many pins at once, whose slots the caller already set: they're
+        the next len(pins) slots, in order."""
+        first = len(self.pins)
+        end = first + len(pins)
+        self._room(end)
+        self.pins.extend(pins)
+        self.states[first:end] = initial
+        self.reader[first:end] = reader
+        self.alive[first:end] = True
+        self.weak[first:end] = weak
+
+    def _room(self, n: int) -> None:
+        """Arrays long enough for n pins."""
+        while n > len(self.states):
+            for name in ("states", "reader", "alive", "weak"):
+                old = getattr(self, name)
+                setattr(self, name, np.concatenate((old, np.zeros_like(old))))
 
 
 class _WireSlots:
@@ -311,17 +330,99 @@ class Circuit:
         """`uid` recreates a specific part (undo, loading); normally leave it None.
         `live=False` makes a ghost: call open_part once it's placed for real.
         KeyError if there's no such kind (or it's a macro that can't be loaded)."""
-        t = self.registry.get(kind)
-        if uid is None:
-            uid = self._next_uid
-        self._next_uid = max(self._next_uid, uid + 1)
-        part = self._make(t, uid)
-        self._parts[part] = None
-        self.part_by_uid[uid] = part
+        return self.add_parts([self.registry.get(kind)], [uid], live)[0]
+
+    def add_parts(
+        self, types: list[PartType], uids: list[int | None], live: bool = True
+    ) -> list[Part]:
+        """add_part for many parts at once, by type (registry.get(kind)): pins, settling
+        and the rest set up a whole type at a time rather than part by part."""
+        given = []
+        for uid in uids:
+            if uid is None:
+                uid = self._next_uid
+            self._next_uid = max(self._next_uid, uid + 1)
+            given.append(uid)
+        parts = self._make_many(types, given)
+        for part in parts:
+            self._parts[part] = None
+            self.part_by_uid[part.uid] = part
         self.revision += 1
         if live:
-            self.open_part(part)
-        return part
+            self.open_parts(parts)
+        return parts
+
+    def _make_many(
+        self, types: list[PartType], uids: list[int], owner: Part | None = None
+    ) -> list[Part]:
+        """_make for each (type, uid), in order: the same parts, in the same part and
+        pin slots, as making them one by one. Plain types (no joins, no body) skip the
+        per-pin bookkeeping: their pins go into the store a block at a time."""
+        store = self._pins
+        templates: dict[PartType, _Template] = {}
+        parts: list[Part] = []
+        block: list[Pin] = []  # plain parts' pins, not in the store yet ...
+        initial: list[int] = []  # ... and what the store gets for them
+        reader: list[bool] = []
+        weak: list[bool] = []
+
+        def flush() -> None:
+            if block:
+                store.add_block(
+                    block, np.array(initial, CODE), np.array(reader), np.array(weak)
+                )
+                block.clear(), initial.clear(), reader.clear(), weak.clear()
+
+        new_part, new_pin = Part.__new__, Pin.__new__
+        for t, uid in zip(types, uids):
+            if t.joins or getattr(t, "body", None) is not None:
+                flush()  # (_make adds its pins one at a time, after these)
+                parts.append(self._make(t, uid, owner))
+                continue
+            tm = templates.get(t)
+            if tm is None:
+                tm = templates[t] = _Template(t)
+            slot = len(store.pins) + len(block)
+            part = new_part(Part)
+            mine = []
+            for is_input, index in tm.sides:
+                pin = new_pin(Pin)
+                pin.part, pin.index, pin.is_input = part, index, is_input
+                pin._passive, pin._store, pin.slot = False, store, slot
+                slot += 1
+                mine.append(pin)
+            outputs = mine[tm.n_in :]
+            part.__dict__.update(
+                kind=t.kind,
+                inputs=mine[: tm.n_in],
+                outputs=outputs,
+                label="",
+                uid=uid,
+                type=t,
+                props=tm.props(),
+                state={},
+                live=False,
+                slot=self._n_part_slots,
+                owner=owner,
+                inner={},
+                inner_wires=[],
+                links=[],
+                drives=list(outputs),
+            )
+            self._n_part_slots += 1
+            if self._n_part_slots > len(self._settle):
+                self._settle = np.concatenate(
+                    (self._settle, np.zeros(len(self._settle), np.int32))
+                )
+            parts.append(part)
+            block += mine
+            initial += tm.initial
+            reader += tm.reader
+            weak += tm.weak
+        flush()
+        if parts:
+            self._kinds_dirty = self._batches_dirty = self._nets_dirty = True
+        return parts
 
     def _make(self, t: PartType, uid: int, owner: Part | None = None) -> Part:
         part = Part(
@@ -421,19 +522,31 @@ class Circuit:
     def open_part(self, part: Part) -> None:
         """Make a ghost live (placed for real): open hooks, and settling starts.
         A macro instance opens everything inside it too."""
-        for p in self._tree(part):
-            if p.live:
-                continue
+        self.open_parts([part])
+
+    def open_parts(self, parts: Iterable[Part]) -> None:
+        """open_part for many parts at once."""
+        opening = [
+            p
+            for part in parts
+            for p in (self._tree(part) if part.inner else (part,))
+            if not p.live
+        ]
+        if not opening:
+            return
+        for p in opening:
             p.live = True
-            self._batches_dirty = True
-            if self.settle_ticks:
-                self._settle[p.slot] = self.settle_ticks
-                self._settling += 1
-                if p.drives and p.type.has("eval"):  # power-on noise
-                    slots = [pin.slot for pin in p.drives]
-                    self._pins.states[slots] = self.rng.integers(
-                        ZERO, ONE + 1, len(slots), dtype=CODE
-                    )
+        self._batches_dirty = True
+        if self.settle_ticks:
+            self._settle[[p.slot for p in opening]] = self.settle_ticks
+            self._settling += len(opening)
+            evals = {t for t in {p.type for p in opening} if t.has("eval")}
+            noisy = [pin.slot for p in opening if p.type in evals for pin in p.drives]
+            if noisy:  # power-on noise
+                self._pins.states[noisy] = self.rng.integers(
+                    ZERO, ONE + 1, len(noisy), dtype=CODE
+                )
+        for p in opening:
             t = p.type
             if t.has("open") and t.kind not in self.faults:
                 self._guard(t, "open", lambda: t.open(p))
@@ -1001,6 +1114,30 @@ def _grouped(
     slots = slots[np.argsort(net_of[slots], kind="stable")]
     nets, starts = np.unique(net_of[slots], return_index=True)
     return slots, nets, starts
+
+
+class _Template:
+    """What every new part of a plain type (no joins, no body) starts as: its pins'
+    sides and indices, their power-on codes, reader and weak flags, its props."""
+
+    def __init__(self, t: PartType) -> None:
+        n_in, n_out = len(t.ins), len(t.outs)
+        self.n_in = n_in
+        self.sides = [(True, i) for i in range(n_in)] + [
+            (False, i) for i in range(n_out)
+        ]
+        power_on = X if t.has("eval") else ZERO  # (the IN switch starts off)
+        self.initial = [int(Z)] * n_in + [int(power_on)] * n_out
+        self.reader = [True] * n_in + [False] * n_out
+        self.weak = [False] * n_in + [name in t.weak for name in t.outs]
+        self.props = _props_maker(t)
+
+
+def _props_maker(t: PartType) -> Callable[[], dict]:
+    """What makes a new instance's props (fresh_props): a plain copy of one fresh set
+    when every value in it is immutable, so no two parts can end up sharing one."""
+    template = fresh_props(t)
+    return template.copy if flat(template) else lambda: fresh_props(t)
 
 
 def _one_type(parts: list[Part]) -> PartType:

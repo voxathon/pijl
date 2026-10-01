@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from .editor import Editor
 
 Rgb = tuple[int, int, int]
+Point = tuple[float, float]
 Pair = tuple[Rgb, Rgb]  # (off, on)
 Stops = list[tuple[float, Pair]]  # (fraction of the wire's length, color), ascending
 
@@ -78,20 +79,18 @@ def paint(
         affected = seed_parts | {
             e.part for w in todo for e in w.ends if isinstance(e, Pin)
         }
+    wire_views = editor.wire_views
     for wire in todo:
-        view = editor.wire_views.get(wire)
+        view = wire_views.get(wire)
         if view is None:
             continue
-        ends = []
-        for end, pos in ((wire.src, view.src), (wire.dst, view.dst)):
-            if isinstance(end, Pin):
-                ends.append(color_pair(part_color(end.part)))
-            else:
-                parent = editor.wire_views.get(end)
-                ends.append(parent.color_at(pos) if parent is not None else None)
-        colors = [
-            c for c in (ends[0], color_pair(view.color), ends[1]) if c is not None
-        ]
+        src = _end_color(wire.src, view.src, wire_views)
+        dst = _end_color(wire.dst, view.dst, wire_views)
+        if src is None and dst is None and not view.color:
+            if view.stops:  # (the usual case, nothing colored nearby: no gradient)
+                view.set_stops([])
+            continue
+        colors = [c for c in (src, color_pair(view.color), dst) if c is not None]
         n = len(colors)
         view.set_stops(
             [(i / (n - 1) if n > 1 else 0.0, c) for i, c in enumerate(colors)]
@@ -101,17 +100,33 @@ def paint(
         if view is None:
             continue
         own = color_pair(part_color(part))
-        pins = [own[1] if own else _pin_tint(editor, pin) for pin in part.pins]
+        pins = [own[1] if own else _pin_tint(c, wire_views, pin) for pin in part.pins]
         view.set_tints(pins, own[1] if own else next((t for t in pins if t), None))
 
 
-def _pin_tint(editor: Editor, pin: Pin) -> Rgb | None:
+def _end_color(end, at: Point, wire_views: dict) -> Pair | None:
+    """A wire end's color: its part's (pin ends), or the parent wire's gradient where
+    the end sits on it (junction ends)."""
+    if isinstance(end, Pin):
+        return color_pair(part_color(end.part))
+    parent = wire_views.get(end)
+    return parent.color_at(at) if parent is not None and parent.stops else None
+
+
+def _pin_tint(c, wire_views: dict, pin: Pin) -> Rgb | None:
     """The color at the end of the oldest wire on `pin` that has one."""
-    for wire in editor.circuit.wires_at(pin):  # creation order
-        view = editor.wire_views.get(wire)
-        if view is not None and view.stops:
-            return sample(view.stops, 0.0 if wire.src is pin else 1.0)[1]
-    return None
+    oldest = None
+    for wire in c.ends_on(pin):
+        view = wire_views.get(wire)
+        if (
+            view is not None
+            and view.stops
+            and (oldest is None or wire.uid < oldest.uid)
+        ):
+            oldest, stops = wire, view.stops
+    if oldest is None:
+        return None
+    return sample(stops, 0.0 if oldest.src is pin else 1.0)[1]
 
 
 # ---- color math -----------------------------------------------------------------

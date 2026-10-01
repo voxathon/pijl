@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from ..snapshot import EndRef, Snapshot
 from . import theme as T
@@ -33,31 +33,12 @@ MIN_GAP = (
 
 @dataclass
 class Cell:
-    """One copy of the unit, with where each piece sits in the unit (cell 0, 0)."""
+    """One copy of the unit: its views, and where it sits relative to the unit (cell
+    0, 0). Moving it to another offset moves every view by the difference."""
 
-    parts: list[tuple[PartView, float, float]] = field(default_factory=list)
-    wires: list[tuple[WireView, list[Point], Point, Point]] = field(
-        default_factory=list
-    )
-
-    @classmethod
-    def of(
-        cls, parts: list[PartView], wires: list[WireView], at: Point = (0, 0)
-    ) -> Cell:
-        """A cell of these views, which sit `at` that offset from the unit."""
-        dx, dy = at
-        return cls(
-            [(v, v.x - dx, v.y - dy) for v in parts],
-            [
-                (
-                    w,
-                    [(x - dx, y - dy) for x, y in w.bends],
-                    (w.src[0] - dx, w.src[1] - dy),
-                    (w.dst[0] - dx, w.dst[1] - dy),
-                )
-                for w in wires
-            ],
-        )
+    parts: list[PartView]
+    wires: list[WireView]
+    at: Point = (0, 0)
 
 
 class Tiling:
@@ -73,7 +54,7 @@ class Tiling:
         ]
         self.size = (_cells(max(xs) - min(xs)), _cells(max(ys) - min(ys)))
         self.gap = [max(MIN_GAP, s) for s in self.size]  # default: the unit's own size
-        self.cells: dict[tuple[int, int], Cell] = {(0, 0): Cell.of(parts, wires)}
+        self.cells: dict[tuple[int, int], Cell] = {(0, 0): Cell(parts, wires)}
         self.cols = self.rows = 1
         self.last: int | None = None  # axis of the last doubling
         self.signature = None  # the selection right after our last change (see Editor)
@@ -118,23 +99,28 @@ class Tiling:
         """Move every cell into place; returns the wires moved (their ends need re-attaching)."""
         moved = []
         for (i, j), cell in self.cells.items():
-            dx, dy = self.offset(i, j)
-            for view, x, y in cell.parts:
-                view.move_to(x + dx, y + dy)
-            for view, bends, (sx, sy), (tx, ty) in cell.wires:
+            at = self.offset(i, j)
+            dx, dy = at[0] - cell.at[0], at[1] - cell.at[1]
+            if not (dx or dy):
+                continue
+            cell.at = at
+            for view in cell.parts:
+                view.move_to(view.x + dx, view.y + dy)
+            for view in cell.wires:
+                (sx, sy), (tx, ty) = view.src, view.dst
                 view.src, view.dst = (
                     (sx + dx, sy + dy),
                     (tx + dx, ty + dy),
                 )  # junction ends ride along
-                view.set_bends([(bx + dx, by + dy) for bx, by in bends])
+                view.set_bends([(bx + dx, by + dy) for bx, by in view.bends])
                 moved.append(view)
         return moved
 
     def all_parts(self) -> list[PartView]:
-        return [v for c in self.cells.values() for v, _, _ in c.parts]
+        return [v for c in self.cells.values() for v in c.parts]
 
     def all_wires(self) -> list[WireView]:
-        return [w for c in self.cells.values() for w, *_ in c.wires]
+        return [w for c in self.cells.values() for w in c.wires]
 
 
 def tiled(unit: Snapshot, offsets: list[Point]) -> tuple[Snapshot, int]:

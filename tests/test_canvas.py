@@ -49,3 +49,56 @@ def test_fields_survive_growing(monkeypatch):
     for _ in range(10):
         buf.alloc()
     assert buf.f["x"][s] == 3.5  # `f` points at the new arrays
+
+
+def test_sources_are_forgotten_when_freed_and_kept_when_growing(monkeypatch):
+    buf = _buffer(monkeypatch)
+    a, b = buf.alloc(), buf.alloc()
+    gen = buf.gen
+    buf.show_pins([a, b], [10, 11])
+    assert buf.gen > gen
+    buf.free(a)
+    assert buf.pin_src[a] == -1 and buf.pin_src[b] == 11
+    for _ in range(5):  # grows past the capacity of 2
+        buf.alloc()
+    assert (
+        buf.pin_src[b] == 11
+        and (buf.pin_src[2:] == -1).all()
+        and (buf.wire_src == -1).all()
+    )
+
+
+def test_view_sync_writes_what_the_sim_says(monkeypatch):
+    from pijl.logic import ONE, ZERO
+    from pijl.sim import Circuit
+    from pijl.ui.sdf_shapes import SHOW_OFF, SHOW_ON
+    from pijl.ui.sync import ViewSync
+
+    c = Circuit()
+    a, g = c.add_part("IN"), c.add_part("NOT")
+    w, _ = c.connect(a.outputs[0], g.inputs[0])
+    buf = _buffer(monkeypatch, capacity=8)
+    pin_shape, wire_shape, other = buf.alloc(), buf.alloc(), buf.alloc()
+    buf.show_pins([pin_shape], [g.outputs[0].slot])
+    buf.show_wires([wire_shape], [w.slot])
+
+    class Canvas:
+        def buffers(self):
+            return [buf]
+
+    sync = ViewSync()
+    a.outputs[0].state = ZERO
+    for _ in range(3):
+        c.step()
+    sync(c, Canvas())
+    flags = buf.f["flags"][:, 0]
+    assert (
+        flags[pin_shape] == SHOW_ON
+        and flags[wire_shape] == SHOW_OFF
+        and flags[other] == 0
+    )
+    a.outputs[0].state = ONE
+    for _ in range(3):
+        c.step()
+    sync(c, Canvas())
+    assert flags[pin_shape] == SHOW_OFF and flags[wire_shape] == SHOW_ON

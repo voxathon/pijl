@@ -103,6 +103,7 @@ from pyglet.window import key, mouse
 from ..macros import Catalog
 from ..parts import Choice, Number, Toggle
 from ..parts import load as load_parts
+from ..parts.registry import copy_props
 from ..project import (
     Project,
     last_project,
@@ -407,19 +408,24 @@ class Editor(pyglet.window.Window):
     def add_parts(self, specs: list[tuple], live: bool = True) -> list[PartView]:
         """add_part for each (kind, x, y, uid, label, props) -- label "" and props None
         leave the new part's own -- with the views made all at once (undo, loading, paste)."""
+        c = self.circuit
         parts = []
         with paused_gc():
+            types = []
             try:
-                for kind, _x, _y, uid, label, props in specs:
-                    part = self.circuit.add_part(
-                        kind, uid, live
-                    )  # (KeyError: no such kind)
+                for spec in specs:
+                    types.append(c.registry.get(spec[0]))  # (KeyError: no such kind)
+            finally:  # (what did get added gets its view, even if a later kind was missing)
+                parts = c.add_parts(
+                    types, [s[3] for s in specs[: len(types)]], live=False
+                )
+                for part, (_kind, _x, _y, _uid, label, props) in zip(parts, specs):
                     if label:
                         part.label = label
                     if props is not None:
-                        part.props = copy.deepcopy(props) if props else {}
-                    parts.append(part)
-            finally:  # (what did get added gets its view, even if a later kind was missing)
+                        part.props = copy_props(props)
+                if live:  # (opened with their own props, not the defaults)
+                    c.open_parts(parts)
                 views = PartView.many(
                     [(p, s[1], s[2]) for p, s in zip(parts, specs)],
                     self.world,
@@ -2032,7 +2038,7 @@ class Editor(pyglet.window.Window):
         clip, stride = tiled(unit, offsets)
         parts, wires = instantiate_keyed(self, clip)
         return [
-            Cell.of(
+            Cell(
                 [parts[k * stride + uid] for uid in unit.parts],
                 [wires[k * stride + uid] for uid in sorted(unit.wires)],
                 at,
