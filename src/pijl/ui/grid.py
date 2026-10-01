@@ -18,14 +18,16 @@ from .camera import Camera
 
 _VERTEX = """#version 150 core
 in vec2 position;
-void main() { gl_Position = vec4(position, 0.0, 1.0); }
+out vec2 ndc;
+void main() { ndc = position; gl_Position = vec4(position, 0.0, 1.0); }
 """
 
 _FRAGMENT = """#version 150 core
+in vec2 ndc;  // not gl_FragCoord: its y origin came out flipped on Linux + NVIDIA
 out vec4 final_color;
 uniform vec2 translate;     // camera translation in screen px (same as the view matrix)
 uniform float zoom;
-uniform float px_ratio;     // framebuffer px per window px (HiDPI)
+uniform vec2 size;          // window size in screen px
 uniform float spacing;      // world units between minor lines
 uniform float major_every;
 uniform vec3 background;
@@ -40,7 +42,7 @@ float lines(vec2 screen, float step_px) {
 
 void main() {
     // -0.5: pixel centers sit at .5, so this lands lines on whole pixels (crisp at zoom 1)
-    vec2 screen = gl_FragCoord.xy / px_ratio - 0.5 - translate;
+    vec2 screen = (ndc * 0.5 + 0.5) * size - 0.5 - translate;
     // Level 0 = snap grid (minor). Levels 1+ = major lines, each major_every x coarser
     // than the last, so zooming far out shows sparse coarse lines instead of mush.
     // Each level fades in only while its lines are comfortably spaced on screen.
@@ -83,7 +85,7 @@ class Grid:
         p.use()
         p["translate"] = camera.translation()
         p["zoom"] = camera.zoom
-        p["px_ratio"] = window.get_framebuffer_size()[0] / window.width
+        p["size"] = (float(window.width), float(window.height))
         p["spacing"] = T.GRID / divisions
         p["major_every"] = float(T.GRID_MAJOR_EVERY * divisions)
         p["background"] = _rgb(T.INSIDE_BACKGROUND if inside else T.BACKGROUND)
