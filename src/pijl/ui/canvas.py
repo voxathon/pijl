@@ -22,6 +22,13 @@ offset per mouse move, instead of rewriting every shape (see Editor._begin_move)
 
 Draw order: layers by their order; inside a layer, by slot. Freed slots are reused
 lowest first (like pyglet's allocator), so "newer on top" is only roughly true.
+
+Wire layers (2.5D, see snapshot.py): a `layered` buffer's instances say which wire
+layer they're on, and it's drawn once per layer it has anything on (`layer_mask`),
+bottom up, then the active one (Canvas.layer) last: higher layers cover lower ones,
+and the one being worked on covers them all. Its shaders fade and tint the others by
+distance (see sdf_shapes._LAYERED). The parts are under layer 0: buffers in
+`part_orders` fade with it, by how far up the active layer is (`top_fade`).
 """
 
 from __future__ import annotations
@@ -35,13 +42,17 @@ import pyglet
 from pyglet import gl
 from pyglet.graphics.shader import Shader, ShaderProgram
 
+from ..snapshot import LAYER_COUNT
+from .theme import layer_fade
+
 GAP = 64  # dirty slots at most this far apart are uploaded as one run
 MAX_RUNS = (
     32  # more runs than this: upload one range from the first dirty slot to the last
 )
 
 UNIFORMS = """uniform WindowBlock { mat4 projection; mat4 view; } window;
-uniform vec2 lift_offset;  // added to the position of lifted instances (Canvas.offset)"""
+uniform vec2 lift_offset;  // added to the position of lifted instances (Canvas.offset)
+uniform float top_fade;  // parts' opacity: how far up the active wire layer is"""
 
 
 class Kind:
@@ -102,6 +113,8 @@ class InstanceBuffer:
         self.end = 0  # slots below this were handed out at some point
         self.top = 0  # highest slot in use + 1: what gets drawn
         self.gen = 0  # bumped whenever pin_src / wire_src may have changed (see ViewSync)
+        self.layered = False  # its instances are on wire layers (see the module doc) ...
+        self.layer_mask = 1  # ... these ones (bits; the users of a layered buffer set them)
         self._make_gl()
 
     def _make_gl(self) -> None:
@@ -311,12 +324,20 @@ class InstanceBuffer:
         self.dirty[:] = False
         self.realloc = self.any_dirty = False
 
-    def draw(self, offset: tuple[float, float] = (0.0, 0.0), now: float = 0.0) -> None:
+    def draw(
+        self,
+        offset: tuple[float, float] = (0.0, 0.0),
+        now: float = 0.0,
+        layer: int = 0,
+        fade: float = 1.0,
+    ) -> None:
         if not self.top:
             return
         self._upload()
         self.program.use()
         self.program["lift_offset"] = offset
+        if "top_fade" in self.program.uniforms:
+            self.program["top_fade"] = fade
         if (
             "time" in self.program.uniforms
         ):  # (only programs that animate something have it)
@@ -326,7 +347,7 @@ class InstanceBuffer:
             gl.glActiveTexture(gl.GL_TEXTURE0)
             gl.glBindTexture(tex.target, tex.id)
         gl.glBindVertexArray(self.vao)
-        gl.glDrawArraysInstanced(gl.GL_TRIANGLE_STRIP, 0, 4, self.top)
+        _draw_passes(self.program, self.layered and self.layer_mask, layer, self.top)
         gl.glBindVertexArray(0)
         self.program.stop()
 
@@ -345,19 +366,45 @@ class Echo:
         self.program = kind.program
         self.vao = source.make_vao(self.program)
 
-    def draw(self, offset: tuple[float, float] = (0.0, 0.0), now: float = 0.0) -> None:
+    def draw(
+        self,
+        offset: tuple[float, float] = (0.0, 0.0),
+        now: float = 0.0,
+        layer: int = 0,
+        fade: float = 1.0,
+    ) -> None:
         src = self.source
         if not src.top:
             return
         src._upload()  # (it may come after us in the draw order)
         self.program.use()
         self.program["lift_offset"] = offset
+        if "top_fade" in self.program.uniforms:
+            self.program["top_fade"] = fade
         if "time" in self.program.uniforms:
             self.program["time"] = now
         gl.glBindVertexArray(self.vao)
-        gl.glDrawArraysInstanced(gl.GL_TRIANGLE_STRIP, 0, 4, src.top)
+        _draw_passes(self.program, src.layered and src.layer_mask, layer, src.top)
         gl.glBindVertexArray(0)
         self.program.stop()
+
+
+def _draw_passes(program: ShaderProgram, mask: int, layer: int, n: int) -> None:
+    """Draw n instances: a layered buffer (`mask`: its layers in use, 0 if it isn't one)
+    once per layer, bottom up, the active one last (layer_pass: that layer); anything
+    else once, as it is (layer_pass -1)."""
+    if "layer_pass" not in program.uniforms:  # (a kind without layers)
+        gl.glDrawArraysInstanced(gl.GL_TRIANGLE_STRIP, 0, 4, n)
+        return
+    program["layer_active"] = layer
+    passes = (
+        [k for k in range(LAYER_COUNT) if k != layer and mask >> k & 1] + [layer]
+        if mask
+        else [-1]
+    )
+    for k in passes:
+        program["layer_pass"] = k
+        gl.glDrawArraysInstanced(gl.GL_TRIANGLE_STRIP, 0, 4, n)
 
 
 class Canvas:
@@ -372,6 +419,8 @@ class Canvas:
             0.0,
             0.0,
         )  # where lifted instances are drawn, relative to their data
+        self.layer = 0  # the active wire layer (see the module doc)
+        self.part_orders: frozenset = frozenset()  # layers (orders) holding parts' shapes
 
     def buffer(self, kind: Kind, layer) -> InstanceBuffer:
         """`layer`: a pyglet Group (its order counts) or an order number."""
@@ -396,8 +445,11 @@ class Canvas:
         gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
         now = time.monotonic() % 3600.0  # (kept small: it's a float32 in the shaders)
         drawn = {**self._buffers, **self._echoes}
+        fade = layer_fade(self.layer)  # (the parts: as on layer 0, where their pins are)
         for key in sorted(drawn):
-            drawn[key].draw(self.offset, now)
+            drawn[key].draw(
+                self.offset, now, self.layer, fade if key[0] in self.part_orders else 1.0
+            )
         gl.glDisable(gl.GL_BLEND)
         self.batch.draw()
 

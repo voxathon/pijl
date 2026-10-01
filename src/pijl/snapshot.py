@@ -8,6 +8,14 @@ deliberately NOT part of it: toggling is using the circuit, not editing it.
 
 Wire uids grow in creation order and a wire is always created after the wires
 it attaches to, so iterating wires by uid always visits parents first.
+
+Wire layers (2.5D), like a chip's metal layers: the parts are the silicon, and the
+wiring stacks up above them, layer 0 (the lowest, the only one pins connect to) up
+to LAYER_COUNT - 1. Every wire runs on one layer. Layers only say where a wire is
+drawn and what it can be wired to from where, never what it connects: that's its
+ends, as ever. A *via* is a wire of zero length with both ends free (see is_via);
+others attach to it like to any wire, so going through one is a junction. Its layer
+is its floor: it reaches that layer and every layer above it.
 """
 
 from __future__ import annotations
@@ -28,6 +36,15 @@ EndRef = tuple
 WireData = tuple[EndRef, EndRef, tuple[Point, ...], Point | None, Point | None]
 
 
+LAYER_COUNT = 16
+
+
+def is_via(data: WireData, uid: int) -> bool:
+    """Is this wire (its data and uid) a via: no length, attached to nothing?"""
+    src, dst, bends, src_pt, dst_pt = data
+    return src == dst == ("w", uid) and not bends and src_pt == dst_pt
+
+
 @dataclass(frozen=True)
 class Snapshot:
     parts: dict[int, PartData]
@@ -35,6 +52,9 @@ class Snapshot:
     wire_colors: dict[int, str] = field(
         default_factory=dict
     )  # wire uid -> color name; absent = default
+    wire_layers: dict[int, int] = field(
+        default_factory=dict
+    )  # wire uid -> its layer (a via's: its floor); absent = 0, the lowest
 
 
 EMPTY = Snapshot({}, {})

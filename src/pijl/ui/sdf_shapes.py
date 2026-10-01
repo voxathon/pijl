@@ -44,7 +44,8 @@ float coverage(float d) {
 }
 """
 
-# flags: x = unused, y = opacity, z / w = per-kind extras. u8, normalized.
+# flags: x = unused (segments: their wire layer), y = opacity, z / w = per-kind extras.
+# u8, normalized.
 # The state byte (what it shows) is kept outside the record: InstanceBuffer.state, the
 # `state` attribute. Off / on pick the shape's own colors; the rest are patterns.
 SHOW_OFF, SHOW_ON, SHOW_X, SHOW_Z, SHOW_FIGHT = 0, 255, 1, 2, 3
@@ -96,6 +97,35 @@ vec4 pattern(int kind, vec2 world, float wpp, float alpha) {{
 }}
 bool patterned(int s) {{ return s == {SHOW_X} || s == {SHOW_Z} || s == {SHOW_FIGHT}; }}
 """
+# Wire layers (see snapshot.py, Canvas.layer). Segments say which layer they're on in
+# flags.x; a via reaches from its floor, flags.x, up to sel.y. (A sel.y below flags.x
+# -- 0, as in fresh and freed slots -- means just flags.x.) The canvas draws a layered
+# buffer once per layer (`layer_pass`), bottom up with the active one last, so higher
+# layers cover lower ones and the active layer covers them all. An instance shows in
+# the pass of its layer nearest to the active one. -1 draws everything as it is (every
+# other buffer of these kinds).
+_LAYERED = f"""
+uniform int layer_active;
+uniform int layer_pass;
+const vec3 LAYER_RGB[{T.LAYER_COUNT}] = vec3[{T.LAYER_COUNT}]({", ".join(_vec3(c) for c in T.LAYER_COLORS)});
+// The layer of this instance nearest to the active one; -1: not drawn in this pass.
+int layer_shown(vec4 flags, vec4 sel) {{
+    if (layer_pass < 0) return layer_active;
+    int lo = int(flags.x * 255.0 + 0.5);
+    int hi = max(lo, int(sel.y * 255.0 + 0.5));
+    int at = clamp(layer_active, lo, hi);
+    return at == layer_pass ? at : -1;
+}}
+// Colors of an instance on layer `at`: faded by its distance, tinted toward its color.
+vec4 layer_look(vec4 c, int at) {{
+    int d = abs(at - layer_active);
+    if (d == 0) return c;
+    float t = float(d - 1) / {float(max(T.LAYER_COUNT - 2, 1))};
+    float fade = mix({T.LAYER_FADE_NEAR}, {T.LAYER_FADE_FAR}, t);
+    return vec4(mix(c.rgb, LAYER_RGB[at], {T.LAYER_TINT}), c.a * fade);
+}}
+"""
+_HIDDEN = "gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return;"  # (nothing to draw)
 _CORNER = "vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));  // triangle strip: 0,0 1,0 0,1 1,1"
 
 
@@ -140,8 +170,8 @@ void main() {{
     bool on = show == {SHOW_ON};
     cf = on ? fill_on : fill;
     ce = on ? edge_on : edge;
-    cf.a *= flags.y;
-    ce.a *= flags.y;
+    cf.a *= flags.y * top_fade;
+    ce.a *= flags.y * top_fade;
     world = rect.xy + lift * lift_offset + local;
     gl_Position = window.projection * window.view * vec4(world, 0.0, 1.0);
 }}
@@ -213,7 +243,7 @@ void main() {{
     local = (corner * 2.0 - 1.0) * {PAD};
     show = int(state * 255.0 + 0.5);
     c = show == {SHOW_ON} ? color_on : color;
-    c.a *= flags.y;
+    c.a *= flags.y * top_fade;
     world = center + lift * lift_offset + local * radius;
     gl_Position = window.projection * window.view * vec4(world, 0.0, 1.0);
 }}
@@ -258,9 +288,10 @@ in vec2 b;
 in float radius;
 in vec4 ca; in vec4 ca_on;  // color at a (off / on) ...
 in vec4 cb; in vec4 cb_on;  // ... and at b; blended along the length
-in vec4 flags;              // z / w: round cap at a / b
+in vec4 flags;              // x: layer; y: opacity; z / w: round cap at a / b
 in float state;             // InstanceBuffer.state
 in float lift;
+in vec4 sel;                // y: the highest layer a via reaches
 out vec2 uv;                // world units: along the segment from a, and across it
 out vec2 world;
 flat out vec2 ext;          // (length, radius)
@@ -268,7 +299,10 @@ flat out vec4 c0;
 flat out vec4 c1;
 flat out int show;
 {UNIFORMS}
+{_LAYERED}
 void main() {{
+    int at = layer_shown(flags, sel);
+    if (at < 0) {{ {_HIDDEN} }}
     {_CORNER}
     vec2 d = b - a;
     float len = length(d);
@@ -286,6 +320,8 @@ void main() {{
     c1 = on ? cb_on : cb;
     c0.a *= flags.y;
     c1.a *= flags.y;
+    c0 = layer_look(c0, at);
+    c1 = layer_look(c1, at);
     world = a + lift * lift_offset + dir * u + n * v;
     gl_Position = window.projection * window.view * vec4(world, 0.0, 1.0);
 }}
@@ -368,6 +404,7 @@ void main() {{
     show = {SHOW_OFF};
     cf = {_vec4((*T.SELECT, 0))};
     ce = {_vec4(T.SELECT)};
+    ce.a *= top_fade;
     world = r.xy + lift * lift_offset + local;
     gl_Position = window.projection * window.view * vec4(world, 0.0, 1.0);
 }}
@@ -393,8 +430,11 @@ flat out vec4 c0;
 flat out vec4 c1;
 flat out int show;
 {UNIFORMS}
+{_LAYERED}
 void main() {{
     {_UNSELECTED}
+    int at = layer_shown(flags, sel);
+    if (at < 0) {{ {_HIDDEN} }}
     {_CORNER}
     vec2 d = b - a;
     float len = length(d);
@@ -407,7 +447,7 @@ void main() {{
     uv = vec2(u, v);
     ext = vec2(len, r);
     show = {SHOW_OFF};
-    c0 = c1 = {_vec4(T.SELECT_WIRE)};
+    c0 = c1 = layer_look({_vec4(T.SELECT_WIRE)}, at);
     world = a + lift * lift_offset + dir * u + n * v;
     gl_Position = window.projection * window.view * vec4(world, 0.0, 1.0);
 }}

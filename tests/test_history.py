@@ -32,6 +32,7 @@ def test_undo_redo_roundtrip():
         ({}, {2: ("NOT", "", 2.0, 0.0, {})}, ()),
         ({}, {}, ()),
         ({}, {}, ()),
+        ({}, {}, ()),
     )  # the step, per section: (before, after, moves); uid 2 wasn't there before
     assert h.current == snap(2)
     h.undo()
@@ -85,6 +86,7 @@ def test_record_takes_only_what_changed():
     assert h.record({1: moved, 7: None}, {}, {})  # 7 was never there: not a change
     assert h.undo_stack[0][0] == (
         ({1: ("NOT", "", 1.0, 0.0, {})}, {1: moved}, ()),
+        ({}, {}, ()),
         ({}, {}, ()),
         ({}, {}, ()),
     )

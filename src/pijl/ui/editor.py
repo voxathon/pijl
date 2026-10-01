@@ -124,8 +124,9 @@ from ..project import (
 from ..storage import NAME_MAX, FormatError, MacroStore, check_name
 from ..sim import FREE, Part, Circuit, Pin, Wire
 from ..snapshot import (
-    MACRO,
-)  # library entries (and part kinds) of saved macros: "macro:<name>"
+    LAYER_COUNT,
+    MACRO,  # library entries (and part kinds) of saved macros: "macro:<name>"
+)
 from . import theme as T
 from .camera import MIN_LEVEL, Camera
 from .canvas import Canvas
@@ -294,6 +295,7 @@ class Editor(pyglet.window.Window):
 
         self.world = Canvas(pyglet.graphics.Batch())  # parts and wires; see canvas.py
         self.layers = Layers()
+        self.world.part_orders = self.layers.parts
         self.text = SDFText(self.world, self.layers.text_order)
         self.hud = pyglet.graphics.Batch()
         self.library = self._load_library()
@@ -364,6 +366,9 @@ class Editor(pyglet.window.Window):
         self.wire_start: Pin | Wire | None = None  # where the wire being drawn starts
         self.wire_start_pos: Point = (0.0, 0.0)
         self.wire_bends: list[Point] = []
+        # the layer of each segment drawn so far (up to each bend; the one on the cursor
+        # is on the active layer, self.layer)
+        self.wire_layers: list[int] = []
         self.preview: Polyline | None = None
         # a free end being carried (DRAGGING_END): its wire's view and "src" / "dst",
         # what it would plug into where it is (or None), and whether a click drops it
@@ -523,8 +528,9 @@ class Editor(pyglet.window.Window):
         old = self.wire_views[wire]
         spec = (wire, old.src, list(old.bends), old.dst)
         color, selected = old.color, old in self.selection.wires
+        layer = old.layer
         self._drop_views([], [wire])
-        view = self.wire_views[wire] = WireView(*spec, self.wire_table, color)
+        view = self.wire_views[wire] = WireView(*spec, self.wire_table, color, layer)
         if selected:
             self.selection.add(view)
         return view
@@ -574,10 +580,11 @@ class Editor(pyglet.window.Window):
         uid: int | None = None,
         color: str | None = None,
         check: bool = True,
+        layer: int = 0,
     ) -> Wire | None:
         """Connect two endpoints (pins, wires or FREE); `bends` are ordered from a to b.
         `a_pos` / `b_pos` say where on a wire endpoint the junction sits (or where a
-        free end is).
+        free end is). `layer`: the wire layer it runs on.
         `check=False`: rebuilding wiring that existed before (see Circuit.connect)."""
         wire, replaced = self.circuit.connect(a, b, uid, check)
         for old in replaced:
@@ -590,10 +597,10 @@ class Editor(pyglet.window.Window):
             src = self.pin_pos(wire.src) if isinstance(wire.src, Pin) else a_pos
             dst = self.pin_pos(wire.dst) if isinstance(wire.dst, Pin) else b_pos
             if self._wire_batch is not None:
-                self._wire_batch[wire] = (wire, src, list(bends), dst, color)
+                self._wire_batch[wire] = (wire, src, list(bends), dst, color, layer)
             else:
                 self.wire_views[wire] = WireView(
-                    wire, src, list(bends), dst, self.wire_table, color
+                    wire, src, list(bends), dst, self.wire_table, color, layer
                 )
         return wire
 
@@ -605,6 +612,19 @@ class Editor(pyglet.window.Window):
         removed = self.circuit.remove_wires([v.wire for v in views])
         self._drop_views([], removed)
         return removed
+
+    def remove_vias(self, views: list[WireView]) -> None:
+        """Remove vias. What's attached to them is left where it is, unplugged (free
+        ends), like the wires on a deleted part -- not removed along, as the branches
+        of a deleted wire are."""
+        c = self.circuit
+        for view in views:
+            for x in c.attachments(view.wire):
+                for side in ("src", "dst"):
+                    if getattr(x, side) is view.wire:
+                        c.detach(x, side)
+                self._remake_wire_view(x)
+        self.remove_wires(views)
 
     def cut_wire(self, view: WireView, at: Point) -> None:
         """Delete a wire the way Digital Logic Sim does, from the spot `at` onward.
@@ -651,7 +671,7 @@ class Editor(pyglet.window.Window):
             else (list(reversed(sv.bends)), sv.src)
         )
         bends = [*points_before(pts, s_j)[1:], j, *tail]
-        src_pos, color = view.src, view.color
+        src_pos, color, layer = view.src, view.color, view.layer
 
         self.circuit.merge(
             w, splice
@@ -661,7 +681,7 @@ class Editor(pyglet.window.Window):
         for gone in (w, splice):
             self._drop_wire_view(gone)
         dst_pos = far_pos if w.dst is w else self.end_pos(w.dst, far_pos)
-        self.wire_views[w] = WireView(w, src_pos, bends, dst_pos, self.wire_table, color)
+        self.wire_views[w] = WireView(w, src_pos, bends, dst_pos, self.wire_table, color, layer)
         self.refresh_wires([self.wire_views[w]])
 
     def _attach_point(self, x: Wire, parent: Wire) -> Point:
@@ -675,7 +695,9 @@ class Editor(pyglet.window.Window):
 
     def delete_selection(self) -> None:
         # (in uid order, not the sets': what's freed first is reused last, see spatial.py)
-        self.remove_wires(sorted(self.selection.wires, key=lambda v: v.wire.uid))
+        wires = sorted(self.selection.wires, key=lambda v: v.wire.uid)
+        self.remove_wires([v for v in wires if not v.is_via])
+        self.remove_vias([v for v in wires if v.is_via and v.wire in self.wire_views])
         self.remove_parts(
             sorted(self.selection.parts, key=lambda v: v.part.uid), unplug=True
         )
@@ -789,26 +811,48 @@ class Editor(pyglet.window.Window):
             hit = hit if d <= self.slop else None
         return hit
 
-    def wire_at(self, wx: float, wy: float, skip=()) -> WireView | None:
+    def wire_at(
+        self, wx: float, wy: float, skip=(), layer: int | None = None
+    ) -> WireView | None:
         """The nearest wire within reach (the older one on a tie, e.g. right on a junction),
-        other than the wires in `skip`."""
+        other than the wires in `skip`: a via first, if one's there. Only what can be
+        reached from the active layer (or `layer`): the rest are just to look at."""
+        layer = self.layer if layer is None else layer
+        if via := self.via_at(wx, wy, skip, layer):
+            return via
         limit = T.WIRE_THICKNESS / 2 + self.slop
         near = (
             (v.distance_to(wx, wy), v.seq, v)
             for v in self.wire_index.near(wx, wy, limit)
-            if v.wire not in skip
+            if v.wire not in skip and v.layer == layer and not v.is_via
         )
         d, _, best = min(near, default=(math.inf, 0, None))
         return best if d <= limit else None
 
+    def via_at(
+        self, wx: float, wy: float, skip=(), layer: int | None = None
+    ) -> WireView | None:
+        """The nearest via within reach that reaches the active layer (or `layer`)."""
+        layer = self.layer if layer is None else layer
+        reach = T.VIA_RADIUS + self.slop
+        near = (
+            (math.dist(v.src, (wx, wy)), -v.seq, v)
+            for v in self.wire_index.near(wx, wy, reach)
+            if v.is_via and v.wire not in skip and v.reaches(layer)
+        )
+        d, _, best = min(near, default=(math.inf, 0, None))
+        return best if d <= reach else None
+
     def wire_target(
-        self, wx: float, wy: float, skip=()
+        self, wx: float, wy: float, skip=(), layer: int | None = None
     ) -> tuple[Pin | Wire, Point] | None:
-        """What a wire being drawn would connect to here: a pin (preferred) or a
-        point on another wire (not one in `skip`)."""
-        if pin := self.pin_at(wx, wy):
+        """What a wire being drawn (on the active layer, or `layer`) would connect to
+        here: a pin (preferred; only from layer 0) or a point on another wire (not one
+        in `skip`)."""
+        layer = self.layer if layer is None else layer
+        if layer == 0 and (pin := self.pin_at(wx, wy)):
             return pin, self.pin_pos(pin)
-        if view := self.wire_at(wx, wy, skip):
+        if view := self.wire_at(wx, wy, skip, layer):
             return view.wire, project_onto(view.points, self.snapped(wx, wy))
         return None
 
@@ -819,6 +863,8 @@ class Editor(pyglet.window.Window):
         best, best_key = None, None
         for v in self.wire_index.near(wx, wy, reach):
             w = v.wire
+            if v.is_via or v.layer != self.layer:
+                continue  # (a via's ends are free, but they're the via)
             for side, p in (("src", v.src), ("dst", v.dst)):
                 if getattr(w, side) is w:
                     d = max(abs(p[0] - wx), abs(p[1] - wy))  # (a square's distance)
@@ -850,6 +896,62 @@ class Editor(pyglet.window.Window):
             if doomed & (family | up):
                 return False
         return True
+
+    # ---- wire layers (2.5D: see theme.LAYER_COUNT) ----------------------------------
+
+    @property
+    def layer(self) -> int:
+        """The active wire layer: what's drawn as usual, and what clicks reach."""
+        return self.world.layer
+
+    def set_layer(self, layer: int, notice: bool = False) -> None:
+        layer = max(0, min(LAYER_COUNT - 1, layer))
+        if layer == self.world.layer:
+            return
+        self.world.layer = layer
+        if notice:
+            self._notice(f"layer {layer}" + (" (pins)" if layer == 0 else ""))
+        if self.mode is Mode.WIRING:
+            self._update_preview()  # (what it would connect to may be on another layer)
+
+    def _switch_layer_while_wiring(self, layer: int) -> None:
+        """A layer key while drawing a wire: the stretch on the cursor goes on that layer
+        (the last bend becomes a via when it's done, see _make_chain). Without a bend
+        yet, the wire starts on it: fine from nothing, not from a pin (they only reach
+        layer 0), nor off a wire on another layer, nor off a via that doesn't reach it."""
+        layer = max(0, min(LAYER_COUNT - 1, layer))
+        start = self.wire_start
+        if not self.wire_bends and isinstance(start, Pin):
+            self._notice("pins connect to layer 0: place a bend for a via first")
+            return
+        if not self.wire_bends and isinstance(start, Wire):
+            view = self.wire_views[start]
+            if not view.reaches(layer):
+                self._notice(
+                    f"that via only reaches down to layer {view.layer}"
+                    if view.is_via
+                    else "a branch starts on its wire's layer: place a bend first"
+                )
+                return
+        self.set_layer(layer, notice=True)
+
+    def _move_to_layer(self, step: int) -> None:
+        """Move the selected wires (and vias' floors) up (step 1) or down a layer. Not
+        the ones on a pin: those stay on layer 0, the only one pins connect to."""
+        moved, pinned = 0, 0
+        for view in self.selection.wires:
+            if any(isinstance(e, Pin) for e in view.wire.ends):
+                pinned += 1
+                continue
+            new = max(0, min(LAYER_COUNT - 1, view.layer + step))
+            if new != view.layer:
+                view.layer = new
+                moved += 1
+        if moved:
+            self.set_layer(self.layer + step)  # (follow them: they stay where you look)
+            self._notice(f"{moved} wire{'s' if moved > 1 else ''} to layer {self.layer}")
+        elif pinned:
+            self._notice("wires on pins stay on layer 0")
 
     def can_wire_to(self, end: Pin | Wire | None) -> bool:
         return (
@@ -972,11 +1074,6 @@ class Editor(pyglet.window.Window):
                 if end is self.wire_start:
                     self._cancel()
                 elif self.can_wire_to(end):
-                    start_pos = (
-                        None
-                        if isinstance(self.wire_start, Pin)
-                        else self.wire_start_pos
-                    )
                     # a branch takes the color of the wire it comes off (or joins)
                     color = next(
                         (
@@ -986,13 +1083,12 @@ class Editor(pyglet.window.Window):
                         ),
                         None,
                     )
-                    self.connect(
-                        self.wire_start,
-                        end,
+                    self._make_chain(
                         self.wire_bends,
-                        start_pos,
+                        end,
                         None if isinstance(end, Pin) else end_pos,
-                        color=color,
+                        [*self.wire_layers, self.layer],
+                        color,
                     )
                     self._cancel()  # clears the preview; the wire now exists
                 elif end is None:
@@ -1007,6 +1103,7 @@ class Editor(pyglet.window.Window):
                         pass  # (a third click of the double-click that started it)
                     else:
                         self.wire_bends.append(p)
+                        self.wire_layers.append(self.layer)
                         self._update_preview()
                 # clicking an invalid target (in->in pin, same part, ...) does nothing
             elif button == mouse.RIGHT:
@@ -1040,8 +1137,10 @@ class Editor(pyglet.window.Window):
         if button == mouse.LEFT:
             if hit := self.free_end_at(wx, wy):
                 self._start_end_drag(*hit)
-            elif pin := self.pin_at(wx, wy):
+            elif (pin := self.pin_at(wx, wy)) and self.layer == 0:
                 self._start_wiring(pin, self.pin_pos(pin))
+            elif not modifiers & key.MOD_SHIFT and (via := self.via_at(wx, wy)):
+                self._start_wiring(via.wire, via.src)  # (like a pin; Shift: select it)
             elif modifiers & key.MOD_ALT and (view := self.wire_at(wx, wy)):
                 self._start_wiring(
                     view.wire, project_onto(view.points, self.snapped(wx, wy))
@@ -1106,7 +1205,18 @@ class Editor(pyglet.window.Window):
         def new_wire() -> None:
             self._start_wiring(FREE, self.snapped(wx, wy) if self.snapping else at)
 
-        self._open_menu(x, y, [MenuItem("New wire", new_wire)])
+        def place_via() -> None:
+            p = self.snapped(wx, wy) if self.snapping else at
+            self.connect(FREE, FREE, [], p, p, layer=self.layer)
+
+        self._open_menu(
+            x,
+            y,
+            [
+                MenuItem("New wire", new_wire),
+                MenuItem(f"Place via (down to layer {self.layer})", place_via),
+            ],
+        )
 
     def _item_menu(
         self, x: float, y: float, wx: float, wy: float, modifiers: int
@@ -1157,7 +1267,17 @@ class Editor(pyglet.window.Window):
                 )
             )
             self._open_menu(x, y, items)
-        elif wire := self.wire_at(wx, wy):
+        elif (wire := self.wire_at(wx, wy)) and wire.is_via:
+            self.selection.set(wires=[wire])
+            self._open_menu(
+                x,
+                y,
+                [
+                    MenuItem("Wire from here", lambda: self._start_wiring(wire.wire, wire.src)),
+                    MenuItem("Delete", lambda: self.remove_vias([wire]), danger=True),
+                ],
+            )
+        elif wire:
             self.selection.set(wires=[wire])
             at = project_onto(wire.points, (wx, wy))
             w = wire.wire
@@ -1218,7 +1338,9 @@ class Editor(pyglet.window.Window):
                 view.part, pin_labels=self.pin_label_mode == PIN_LABELS_ALWAYS
             )
         self.inside.append(level)
+        layer = self.layer
         put_scene(self, scene)
+        self.world.layer = layer  # (looking in at the layer you were on)
         self._fit_camera()
         self._update_pin_labels()
         self._notice(f"inside {_crumb(view.part)}: read-only   Esc: back out")
@@ -1284,6 +1406,8 @@ class Editor(pyglet.window.Window):
             self._notice(f"pin names: {PIN_LABEL_MODES[self.pin_label_mode]}")
         elif symbol == key.HOME:
             self._home(fit=bool(ctrl))
+        elif symbol in (key.PAGEUP, key.PAGEDOWN):
+            self.set_layer(self.layer + (1 if symbol == key.PAGEUP else -1), notice=True)
         elif ctrl and symbol == key.S:
             self._save_as()
         elif ctrl and symbol == key.O:
@@ -1549,6 +1673,14 @@ class Editor(pyglet.window.Window):
             self._duplicate()
         elif symbol == key.BACKSPACE and self.mode is Mode.WIRING:
             self._pop_bend_or_cancel()
+        elif symbol in (key.PAGEUP, key.PAGEDOWN):
+            step = 1 if symbol == key.PAGEUP else -1  # (up: away from the parts)
+            if modifiers & key.MOD_SHIFT and self.mode is Mode.IDLE:
+                self._move_to_layer(step)
+            elif self.mode is Mode.WIRING:
+                self._switch_layer_while_wiring(self.layer + step)
+            else:
+                self.set_layer(self.layer + step, notice=True)
         elif symbol == key.TAB:
             self.pin_label_mode = (self.pin_label_mode + 1) % len(PIN_LABEL_MODES)
             self._update_pin_labels()
@@ -2697,13 +2829,21 @@ class Editor(pyglet.window.Window):
             else:
                 self.wire_edit.refresh()  # zoom changes handle sizes
 
+    def _preview_line(self, color) -> Polyline:
+        """A line for showing a wire being drawn (or plugged in): over everything, and
+        by wire layer, vias and all, like the wires on the board."""
+        line = Polyline([], color, self.world, self.layers.preview)
+        line.buf.layered = True
+        line.buf.layer_mask = (1 << LAYER_COUNT) - 1  # (it can be on any of them)
+        return line
+
     def _start_wiring(self, start: Pin | Wire | object, start_pos: Point) -> None:
         """`start`: a pin, a wire (a branch) or FREE (a wire from nothing)."""
         self.selection.clear()
         self.mode = Mode.WIRING
         self.wire_start, self.wire_start_pos = start, start_pos
-        self.wire_bends = []
-        self.preview = Polyline([], T.WIRE_PREVIEW, self.world, self.layers.overlay)
+        self.wire_bends, self.wire_layers = [], []
+        self.preview = self._preview_line(T.WIRE_PREVIEW)
         self._update_preview()
 
     def _update_preview(self) -> None:
@@ -2711,12 +2851,15 @@ class Editor(pyglet.window.Window):
         target = self.wire_target(wx, wy)
         valid = target is not None and self.can_wire_to(target[0])
         end = target[1] if valid else self.snapped(wx, wy)  # valid targets always win
-        self.preview.set_points([self.wire_start_pos, *self.wire_bends, end])
+        self.preview.set_points(
+            [self.wire_start_pos, *self.wire_bends, end], (*self.wire_layers, self.layer)
+        )
         self.preview.color = T.WIRE_PREVIEW_SNAP if valid else T.WIRE_PREVIEW
 
     def _pop_bend_or_cancel(self) -> None:
         if self.wire_bends:
             self.wire_bends.pop()
+            self.set_layer(self.wire_layers.pop())  # (back on the layer it was drawn on)
             self._update_preview()
         else:
             self._cancel()
@@ -2726,9 +2869,23 @@ class Editor(pyglet.window.Window):
         *bends, last = self.wire_bends
         start = self.wire_start
         color = self.wire_views[start].color if isinstance(start, Wire) else None
-        start_pos = None if isinstance(start, Pin) else self.wire_start_pos
-        self.connect(start, FREE, bends, start_pos, last, color=color)
+        self._make_chain(bends, FREE, last, self.wire_layers, color)
         self._cancel()  # clears the preview; the wire now exists
+
+    def _make_chain(self, bends: list[Point], end, end_pos, layers: list[int], color) -> None:
+        """Make the wire just drawn, from wire_start to `end` through `bends`, with
+        `layers` the layer of each stretch between them: one wire per layer, joined by a
+        via at each bend where the layer changes (its floor: the lower of the two)."""
+        cuts = [k for k in range(len(bends)) if layers[k] != layers[k + 1]]
+        start = self.wire_start
+        nodes = [(start, None if isinstance(start, Pin) else self.wire_start_pos, -1)]
+        for k in cuts:  # (vias first: a wire only attaches to older wires)
+            p = bends[k]
+            via = self.connect(FREE, FREE, [], p, p, layer=min(layers[k], layers[k + 1]))
+            nodes.append((via, p, k))
+        nodes.append((end, end_pos, len(bends)))
+        for (a, a_pos, i), (b, b_pos, j) in zip(nodes, nodes[1:]):
+            self.connect(a, b, bends[i + 1 : j], a_pos, b_pos, color=color, layer=layers[i + 1])
 
     # ---- carrying a free wire end -------------------------------------------------
 
@@ -2753,7 +2910,7 @@ class Editor(pyglet.window.Window):
         self.end_moved = click  # (a press must move a little first: a click selects)
         self.end_skip = {view.wire, *self.circuit.descendants(view.wire)}
         self.press_at = self.mouse
-        self.preview = Polyline([], T.WIRE_PREVIEW_SNAP, self.world, self.layers.overlay)
+        self.preview = self._preview_line(T.WIRE_PREVIEW_SNAP)
         self._carry_end()
 
     def _carry_end(self) -> None:
@@ -2766,15 +2923,16 @@ class Editor(pyglet.window.Window):
                 return
             self.end_moved = True
         wx, wy = self.camera.screen_to_world(*self.mouse)
-        target = self.wire_target(wx, wy, self.end_skip)
+        target = self.wire_target(wx, wy, self.end_skip, view.layer)
         if target is not None and not self.can_rewire(view.wire, side, target[0]):
             target = None
         self.end_target = target
         p = target[1] if target else self.snapped(wx, wy)
         self._set_end(view, side, p)
         pts = view.points
+        k = 0 if side == "src" else len(pts) - 2  # (the segment at the carried end)
         self.preview.set_points(
-            (pts[:2] if side == "src" else pts[-2:]) if target else []
+            pts[k : k + 2] if target else [], (view.layer,)
         )
 
     def _set_end(self, view: WireView, side: str, p: Point) -> None:
@@ -2851,7 +3009,7 @@ class Editor(pyglet.window.Window):
         self.mode = Mode.IDLE
         self.active = None
         self.wire_start = None
-        self.wire_bends = []
+        self.wire_bends, self.wire_layers = [], []
 
     # ======================================================================
     # history: every finished edit is recorded, automatically
@@ -3008,6 +3166,7 @@ class Editor(pyglet.window.Window):
         hidden = c.hidden_count
         self.bar.set_stats(
             [  # (rank, text): the bar leaves out the highest ranks first when short on room
+                (0, f"layer {self.layer}"),
                 (0, f"{n / st['time']:.0f} fps"),
                 (1, f"sim {1000 * st['sim'] / n:.2f} ms"),
                 (2, f"ui {1000 * st['ui'] / n:.1f} ms"),

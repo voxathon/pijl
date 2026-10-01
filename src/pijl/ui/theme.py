@@ -1,5 +1,7 @@
 """Colors and sizes in one place so the look can be tweaked without hunting."""
 
+from ..snapshot import LAYER_COUNT as _LAYER_COUNT
+
 BACKGROUND = (28, 28, 34, 255)
 
 # Screen-space UI (part picker, context menus) is drawn this many times its base size.
@@ -124,6 +126,46 @@ IO_WIDTH = 40
 WIRE_THICKNESS = 3
 JUNCTION_RADIUS = 4.5  # dot where a wire attaches to another wire
 FREE_END_HALF = 3.5  # half the side of the square on a wire end attached to nothing
+
+# Wire layers (2.5D: see snapshot.py), stacked like a chip's metal over its silicon:
+# the parts at the bottom, layer 0 just above them (the only one pins connect to), up
+# to 15. Every wire runs on one layer. The active layer draws as usual and over the
+# rest; every other layer shows too, fading with its distance from the active one
+# (LAYER_FADE_NEAR one layer away, down to LAYER_FADE_FAR fifteen away) and tinted
+# toward its layer's color. The parts fade the same way, as if on layer 0.
+LAYER_COUNT = _LAYER_COUNT
+LAYER_COLORS = (  # by layer, bottom (0, over the parts) to top
+    (185, 175, 210),
+    (140, 160, 200),
+    (150, 180, 150),
+    (200, 150, 110),
+    (240, 110, 160),
+    (225, 100, 220),
+    (170, 100, 240),
+    (120, 120, 250),
+    (70, 160, 245),
+    (60, 205, 200),
+    (70, 200, 120),
+    (150, 215, 80),
+    (230, 215, 80),
+    (245, 165, 60),
+    (240, 110, 100),
+    (235, 235, 245),
+)
+LAYER_FADE_NEAR, LAYER_FADE_FAR = 0.5, 0.1  # opacity one layer away ... fifteen away
+LAYER_TINT = 0.8  # how far other layers' wires lean toward their layer's color
+# A via: a ring in its floor layer's color (it reaches that layer and all above it)
+VIA_RADIUS = 5.5
+VIA_HOLE_RADIUS = 2.5
+VIA_HOLE = BACKGROUND[:3]
+
+
+def layer_fade(d: int) -> float:
+    """Opacity of what's d layers from the active one."""
+    if d <= 0:
+        return 1.0
+    t = (min(d, LAYER_COUNT - 1) - 1) / max(LAYER_COUNT - 2, 1)
+    return LAYER_FADE_NEAR + (LAYER_FADE_FAR - LAYER_FADE_NEAR) * t
 PART_BORDER = 2
 LABEL_SIZE = 10  # pt at zoom 1
 LABEL_GAP = 6  # between a part and its label

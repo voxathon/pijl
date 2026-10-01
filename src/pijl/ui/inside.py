@@ -94,6 +94,7 @@ def build_scene(inst: Part, pin_labels: bool) -> dict[str, Any]:
     """A fresh scene showing `inst`'s body, bound to its hidden parts and wires."""
     world = Canvas(pyglet.graphics.Batch())
     layers = Layers()
+    world.part_orders = layers.parts
     text = SDFText(world, layers.text_order)
     part_index, wire_index = SpatialIndex(), SpatialIndex()
     part_table = PartTable(world, layers, text, part_index)
@@ -117,7 +118,9 @@ def build_scene(inst: Part, pin_labels: bool) -> dict[str, Any]:
             _src, _dst, bends, src_pt, dst_pt = body.wires[uid]
             src = part_views[wire.src.part].pin_pos(wire.src) if isinstance(wire.src, Pin) else src_pt
             dst = part_views[wire.dst.part].pin_pos(wire.dst) if isinstance(wire.dst, Pin) else dst_pt
-            specs.append((wire, src, list(bends), dst, body.wire_colors.get(uid)))
+            specs.append(
+                (wire, src, list(bends), dst, body.wire_colors.get(uid), body.wire_layers.get(uid, 0))
+            )
         wire_views = dict(zip((s[0] for s in specs), WireView.many(specs, wire_table)))
         paint(_Painted([s[0] for s in specs], part_views, wire_views))
     return {
