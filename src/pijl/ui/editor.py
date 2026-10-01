@@ -10,8 +10,10 @@ Controls
     click a part           pick it up; it follows the cursor (dragging it out of the panel does too)
       click                place it (shift+click: place and keep another)
       click another part   swap to that part instead
-      right-click / Esc    cancel (so does a click anywhere on the panel; clicking the carried
-                           part puts it back, so a double-click leaves you ready to drag rows)
+      click it again       one more of it, below the last: a column, spaced like Ctrl+D's
+                           (each part's own height). Ctrl+scroll spaces it out; placed, it's a
+                           Ctrl+D block: Ctrl+scroll still spaces it, Ctrl+D doubles it right
+      right-click / Esc    cancel (so does a click anywhere else on the panel)
     click a collection     expand / collapse it (a quick second click is ignored: mouse bounce)
     drag a part            move it into another collection (drop on its header or between its
                            parts), or below everything to take it out of collections; the other
@@ -372,6 +374,9 @@ class Editor(pyglet.window.Window):
         self.place_again = None  # shift+click: start another of the same
         self.placing_kind: str | None = (
             None  # the picker part on the cursor (None for a paste)
+        )
+        self.column: Tiling | None = (
+            None  # the picker parts on the cursor, one below the other (see _stack)
         )
         self.clipboard: Snapshot | None = None
         self.tiling: Tiling | None = (
@@ -827,15 +832,14 @@ class Editor(pyglet.window.Window):
 
         if self.mode is Mode.PLACING_PART:
             if button == mouse.LEFT and in_picker:
-                # Back onto the panel: never mind. A press there then acts like any picker press
-                # (so rows can be dragged right away; clicking another part swaps to it), except
-                # that pressing the part being carried just puts it back -- which is also what
-                # the second half of a double-click does.
-                held = self.placing_kind
+                # Pressing the part being carried adds one more below it (so does each half of
+                # a double-click). Anywhere else on the panel: never mind, and the press acts
+                # like any picker press (rows can be dragged right away; another part swaps in).
+                if tool is not None and tool == self.placing_kind:
+                    self._stack(1)
+                    return
                 self._cancel()
-                self._picker_press(
-                    in_picker, x, y, put_back=tool is not None and tool == held
-                )
+                self._picker_press(in_picker, x, y)
             elif button == mouse.LEFT:
                 # Shift = "keep another", but Ctrl+Shift is subgrid snapping, not a request for more.
                 again = bool(modifiers & key.MOD_SHIFT) and not modifiers & key.MOD_CTRL
@@ -1210,7 +1214,7 @@ class Editor(pyglet.window.Window):
             row, self.picker_row, self.mode = self.picker_row, None, Mode.IDLE
             self.last_picker_click = (row.key, time.monotonic())
             if self.picker_bounce:
-                pass  # 2nd half of a double-click, or putting the carried part back
+                pass  # a quick second click on the same row: mouse bounce
             elif row.what == "part":
                 self._start_placing(row.part)
             else:
@@ -1244,6 +1248,15 @@ class Editor(pyglet.window.Window):
             and self._tiling_active()
         ):
             self._space_tiling(scroll_y)
+            return
+        if (
+            scroll_y
+            and self.snapping
+            and self.mode is Mode.PLACING_PART
+            and self.column is not None
+            and self.column.rows > 1
+        ):
+            self._space_column(scroll_y)
             return
         if (
             self.mode is Mode.MENU
@@ -1712,7 +1725,7 @@ class Editor(pyglet.window.Window):
         self.edit_view, self.edit = None, None
         self.mode = Mode.IDLE
 
-    def _picker_press(self, hit, x: float, y: float, put_back: bool = False) -> None:
+    def _picker_press(self, hit, x: float, y: float) -> None:
         if hit == "toggle":
             self.picker.toggle()
         elif hit == "new":
@@ -1723,7 +1736,7 @@ class Editor(pyglet.window.Window):
             self.picker_row, self.press_at, self.picker_bounce = (
                 hit,
                 (x, y),
-                put_back or bounce,
+                bounce,
             )
             self.mode = (
                 Mode.PICKER_PRESS
@@ -2099,7 +2112,9 @@ class Editor(pyglet.window.Window):
         fb_w, _ = self.get_framebuffer_size()
         return fb_w / self.width if self.width else 1.0
 
-    def _start_placing(self, kind: str) -> None:
+    def _start_placing(self, kind: str, count: int = 1, gap: int | None = None) -> None:
+        """Put `kind` on the cursor; `count` of them in a column, `gap` grid cells apart
+        (default: Ctrl+D's, the part's own height)."""
         if self._unplaceable(kind):
             self._notice(
                 f"{self._entry_title(kind)} can't go in here: it contains {self.doc_title}"
@@ -2120,6 +2135,47 @@ class Editor(pyglet.window.Window):
             again=lambda: self._start_placing(kind),
         )
         self.placing_kind = kind
+        # A Ctrl+D block in the making: one column, the carried part its top cell. Its
+        # unit is captured when it's placed (see _commit_placing).
+        self.column = Tiling(None, list(self.placing_views), [])
+        self.column.last = DOWN
+        if gap is not None:
+            self.column.gap[DOWN] = gap
+        self._stack(count - 1)
+
+    def _stack(self, n: int) -> None:
+        """Add `n` more of the carried part to the bottom of its column."""
+        t = self.column
+        if t is None or n <= 0:
+            return
+        self._end_move()  # (lifted views keep their old coordinates: put them down first)
+        top = t.cells[(0, 0)].parts[0]
+        for _ in range(n):
+            at = t.offset(0, t.rows)
+            view = self.add_part(
+                self.placing_kind, top.x + at[0], top.y + at[1], live=False
+            )
+            view.set_ghost(True)
+            t.cells[(0, t.rows)] = Cell([view], [], at)
+            t.rows += 1
+        self._lift_column()
+
+    def _space_column(self, scroll_y: float) -> None:
+        t = self.column
+        if not t.adjust(DOWN, 1 if scroll_y > 0 else -1):
+            return
+        self._end_move()
+        t.layout()  # (ghost parts only: no wires to re-attach)
+        self._lift_column()
+
+    def _lift_column(self) -> None:
+        """Pick the column back up where it was put down: its top part keeps its grab,
+        so it stays under the cursor and the column hangs below it."""
+        views = self.column.all_parts()
+        self.drag_origin = (views[0].x, views[0].y)
+        self._begin_move(views, [])
+        self.placing_views = views
+        self._follow_cursor()
 
     def _start_paste(self) -> None:
         views, wires = instantiate(self, self.clipboard, live=False)
@@ -2128,6 +2184,7 @@ class Editor(pyglet.window.Window):
         )  # ghosts show their colors too
         self._carry(views, wires, again=self._start_paste)
         self.placing_kind = None
+        self.column = None
 
     def _selection_signature(self):
         """What the selection is and where it sits: a Ctrl+D block keeps growing only
@@ -2235,14 +2292,23 @@ class Editor(pyglet.window.Window):
         for w in wires:
             w.set_ghost(False)
         self.placing_views, self.placing_wires, self.place_again = [], [], None
-        self.placing_kind = None
+        kind, column = self.placing_kind, self.column
+        self.placing_kind, self.column = None, None
         self.mode = Mode.IDLE
-        if again:
+        if again and column is not None:
+            self._start_placing(kind, column.rows, column.gap[DOWN])
+        elif again:
             place_again()
         elif wires or len(views) > 1:
             self.selection.set(
                 views, wires
             )  # a paste stays selected, ready to move/delete
+            if column is not None:
+                # A placed column is a Ctrl+D block: Ctrl+scroll keeps spacing it, Ctrl+D
+                # doubles it to the right. Its cells kept their offsets from the top one.
+                column.unit = capture(self, column.cells[(0, 0)].parts)
+                self.tiling = column
+                column.signature = self._selection_signature()
 
     def _apply(self, change: Change | None) -> None:
         """Show the board after an undo/redo step (history.current), which changed `change`."""
@@ -2487,7 +2553,7 @@ class Editor(pyglet.window.Window):
             for view in self.placing_views:
                 self.remove_part(view)  # takes the ghost wires with it
             self.placing_views, self.placing_wires, self.place_again = [], [], None
-            self.placing_kind = None
+            self.placing_kind, self.column = None, None
         if self.preview is not None:
             self.preview.delete()
             self.preview = None

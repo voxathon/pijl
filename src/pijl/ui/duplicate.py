@@ -43,8 +43,9 @@ class Cell:
 
 class Tiling:
     def __init__(
-        self, unit: Snapshot, parts: list[PartView], wires: list[WireView]
+        self, unit: Snapshot | None, parts: list[PartView], wires: list[WireView]
     ) -> None:
+        # (unit None: a column still being carried, see Editor._stack; set once placed)
         self.unit = unit
         xs = [x for v in parts for x in (v.x, v.x + v.w)] + [
             p[0] for w in wires for p in w.points

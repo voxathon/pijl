@@ -31,6 +31,8 @@ CONTROLS: list[tuple[str, list[tuple[str, str]]]] = [
         [
             ("click a part (picker)", "pick it up; it follows the cursor"),
             ("click", "place it (Shift+click: place it and keep another)"),
+            ("  click it again (picker)", "one more below it, Ctrl+D's spacing"),
+            ("  Ctrl+scroll", "space that column out (placed: still, like Ctrl+D)"),
             ("right-click / Esc", "put it back"),
             ("click a part", "select it; a plain click on an IN switch toggles it"),
             ("drag a part", "move it (a selected part moves the whole selection)"),
