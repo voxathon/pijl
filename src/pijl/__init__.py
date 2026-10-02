@@ -1,4 +1,6 @@
 def main() -> None:
-    from .ui import run
+    import sys
 
-    run()
+    from .cli import main
+
+    sys.exit(main())

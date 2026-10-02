@@ -1,9 +1,6 @@
-from pijl.ui import run
+import sys
 
-
-def main():
-    run()
-
+from pijl.cli import main
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

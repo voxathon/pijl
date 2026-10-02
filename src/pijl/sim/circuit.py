@@ -1515,6 +1515,19 @@ class Circuit:
         self.net_value, self.net_conflict = value, conflict
         states[self._readers] = value[self._reader_net]
 
+    def run_until_stable(self, limit: int) -> int | None:
+        """Step until a step changes no pin and nothing is settling any more, at most
+        `limit` steps that change something (plus the one that shows nothing does).
+        Returns how many changed something (0: it already was stable), or None if it
+        never got there (it oscillates, or just needs more). A part that isn't pure
+        may change the world without changing a pin; it counts as stable all the same."""
+        for n in range(limit + 1):
+            before = self._pins.states.copy()
+            self.step()
+            if not self._settling and np.array_equal(before, self._pins.states):
+                return n
+        return None
+
     def frame(self) -> None:
         """Once per frame (not per step): the frame hook of every live part that has one."""
         now = time.monotonic()

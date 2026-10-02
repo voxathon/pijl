@@ -400,7 +400,12 @@ class MacroStore:
 
     def load(self, id: str, types: Registry) -> Loaded:
         """FormatError / OSError if the file can't be used at all."""
-        return decode(_read(self.path(id)), types)
+        return load_file(self.path(id), types)
+
+
+def load_file(path: Path, types: Registry) -> Loaded:
+    """A macro file anywhere on disk. FormatError / OSError if it can't be used at all."""
+    return decode(_read(path), types)
 
 
 def _read(path: Path) -> Any:
