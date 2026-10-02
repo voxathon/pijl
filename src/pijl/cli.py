@@ -2,6 +2,7 @@
 
     pijl                          the editor (same as `pijl gui`)
     pijl list [--projects]        the project's macros and their pins
+    pijl bench bogobips           the shift register benchmark (see bogobips.py)
     pijl run MACRO [VALUES...]    run a macro headless (see below)
 
 Global: --project NAME|PATH (default: the one the editor had open last) and
@@ -13,6 +14,7 @@ Global: --project NAME|PATH (default: the one the editor had open last) and
     pijl run "half adder" 10           all inputs in pin order, as bits
     pijl run "half adder" --table      every 0/1 combination
     pijl run counter -                 a stream: one line in, one line out
+    pijl run counter --raw             a raw stream, for speed (see _raw)
 
 A stream reads stdin line by line, keeping the circuit's state from line to line,
 and flushes every answer, so another program can hold the macro as a co-process.
@@ -32,13 +34,13 @@ import argparse
 import json
 import os
 import sys
-from typing import TYPE_CHECKING, Any, TextIO
+from typing import TYPE_CHECKING, Any, BinaryIO, TextIO
 
 if TYPE_CHECKING:
     from .engine import Harness
     from .logic import Level
 
-COMMANDS = ("gui", "run", "list")
+COMMANDS = ("gui", "run", "list", "bench")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -51,6 +53,10 @@ def main(argv: list[str] | None = None) -> int:
 
         run()
         return 0
+    if args.command == "bench":
+        from .bogobips import main as bogobips
+
+        return bogobips(args)
     from .engine import Engine
 
     try:
@@ -109,6 +115,19 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--max-ticks", type=int, default=10_000, help="give up settling after this many (default 10000)")
     run.add_argument("--noise", type=int, default=64, help="power-on settling ticks, 0 for none (default 64, as the editor)")
     run.add_argument("--seed", type=int, default=0, help="seed for the power-on noise")
+    run.add_argument("--raw", action="store_true", help="a raw stream on stdin: vectors of level characters, ? to read (see pydoc pijl.cli)")
+    bench = sub.add_parser(
+        "bench",
+        parents=[common],
+        help="internal benchmarks",
+        description="bogobips: BIt-shifts Per Second through generated shift registers. See `pydoc pijl.bogobips`.",
+    )
+    bench.add_argument("name", choices=["bogobips"])
+    bench.add_argument("--kind", default="sipo,piso", help="sipo, piso or both (default)")
+    bench.add_argument("--depth", default="8,64,512,4096", help="register depths, comma separated")
+    bench.add_argument("--layers", default="engine,settle,pipe", help="which of engine, settle, pipe")
+    bench.add_argument("--seconds", type=float, default=0.5, help="time spent per measurement (default 0.5)")
+    bench.add_argument("--seed", type=int, default=0, help="seed for the random bit stream")
     return p
 
 
@@ -170,6 +189,10 @@ def _run(engine, args) -> int:
             if args.values:
                 raise _BadInput("--table takes no input values")
             _table(h, run, args.json, out)
+        elif args.raw:
+            if args.values not in ([], ["-"]):
+                raise _BadInput("--raw reads stdin; it takes no input values")
+            return _raw(h, run, sys.stdin.buffer, sys.stdout.buffer) or (3 if unsettled else 0)
         elif args.values == ["-"]:
             return _stream(h, run, args.json, sys.stdin, out) or (3 if unsettled else 0)
         else:
@@ -208,6 +231,49 @@ def _stream(h: Harness, run, as_json: bool, inp: TextIO, out: TextIO) -> int:
             continue
         _answer(h.read(), as_json or is_json, out)
     return status
+
+
+_LEVEL_BYTES = frozenset(b"01xXzZ")
+_SKIP = frozenset((9, 10, 13, 32))  # whitespace
+
+
+def _raw(h: Harness, run, inp: BinaryIO, out: BinaryIO) -> int:
+    """The --raw stream: built for speed, so no lines and no names. Each level
+    character (0 1 X Z) drives the next input in pin order; once every input has
+    one, that's a vector: it's applied and run. ";" applies a vector early (only
+    the inputs given so far change; on its own: run, change nothing). "?" answers
+    with every output's level, one character each, no newline. Whitespace is
+    ignored. Answers are flushed whenever the input there is has been worked off."""
+    n = len(h.inputs)
+    vec = bytearray()
+    answer = bytearray()
+
+    def apply() -> None:
+        h.set_bits(bytes(vec))
+        vec.clear()
+        run()
+
+    while chunk := (inp.read1(65536) if hasattr(inp, "read1") else inp.read(65536)):
+        for b in chunk:
+            if b in _LEVEL_BYTES:
+                vec.append(b)
+                if len(vec) == n:
+                    apply()
+            elif b == 63:  # ?
+                answer += h.bits().encode()
+            elif b == 59:  # ;
+                apply()
+            elif b not in _SKIP:
+                out.write(answer)
+                out.flush()
+                return _fail(f"--raw: unexpected {chr(b)!r} in the stream", 2)
+        if answer:
+            out.write(answer)
+            out.flush()
+            answer.clear()
+    if vec:
+        apply()
+    return 0
 
 
 def _apply(h: Harness, text: str) -> None:

@@ -183,3 +183,60 @@ def test_headless_never_imports_pyglet(project):
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
     assert r.returncode == 0, r.stderr
     assert r.stdout == "sum=0 carry=1\n"
+
+
+# ---- fast bits and the raw stream ----------------------------------------------------
+
+
+def test_bits_in_and_out():
+    h = Engine("bench").harness("ha")
+    h.set_bits("11")
+    h.settle()
+    assert h.bits() == "01"
+    h.set_bits("0", start=1)  # only b
+    h.settle()
+    assert h.bits() == "10" and h.driven() == {"a": ONE, "2": ZERO}
+    with pytest.raises(ValueError):
+        h.set_bits("111")
+    with pytest.raises(ValueError):
+        h.set_bits("2")
+
+
+def raw(text: bytes, macro="latch", ticks=None):
+    from pijl import cli as C
+
+    h = Engine("bench").harness(macro)
+
+    def run():
+        h.settle() if ticks is None else h.step(ticks)
+
+    out = io.BytesIO()
+    return C._raw(h, run, io.BytesIO(text), out), out.getvalue()
+
+
+def test_raw_stream_vectors_partial_vectors_and_reads():
+    # s r: set (q=1), hold, reset (q=0); "1;" changes only s; ";" alone just runs
+    assert raw(b"01? 11?\n10?1;?;?") == (0, b"1010010101")  # 10 10 01 01 01
+
+
+def test_raw_stream_refuses_junk(capsys):
+    status, out = raw(b"01?k11?")
+    assert status == 2 and out == b"10" and "'k'" in capsys.readouterr().err
+
+
+# ---- bogobips --------------------------------------------------------------------------
+
+
+def test_bogobips_registers_shift_and_the_script_agrees(tmp_path):
+    from pijl import bogobips as B
+
+    eng = B.make_project(tmp_path / "bogo-data", ["sipo", "piso"], [5])
+    for kind in ("sipo", "piso"):
+        h = eng.harness(f"{kind} 5", settle_ticks=0)
+        steps = B.script(kind, 5, seed=1)
+        for _ in range(40):  # every read checked against the stream, both ways
+            bits, read, expect = next(steps)
+            h.set_bits(bits)
+            assert h.settle(100)
+            if read:
+                assert h.bits() == expect()

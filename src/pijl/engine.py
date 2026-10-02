@@ -32,7 +32,9 @@ from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
-from .logic import Level
+import numpy as np
+
+from .logic import CODE, Level
 from .macros import Catalog, MacroType
 from .parts import TEMPLATES, Registry
 from .parts import load as load_parts
@@ -51,6 +53,13 @@ _LEVELS = {
     "false": Level.ZERO,
     "true": Level.ONE,
 }
+
+
+# bit strings <-> logic codes (see logic.py): "Z01X"[code]
+_CODE_OF = np.full(256, 255, CODE)
+for _i, _c in enumerate("Z01X"):
+    _CODE_OF[ord(_c)] = _CODE_OF[ord(_c.lower())] = _i
+_CHAR_OF = np.frombuffer(b"Z01X", np.uint8)
 
 
 def level(value: Any) -> Level:
@@ -157,6 +166,9 @@ class Harness:
             c.connect(part.outputs[i], led.inputs[0])
         self.part = part
         self.last_ticks: int | None = 0  # what the last settle() took (None: gave up)
+        # pin slots, for set_bits / bits: no handles or Levels per pin on the fast path
+        self._in_slots = np.array([sw.outputs[0].slot for sw in self._ins], np.intp)
+        self._out_slots = np.array([led.inputs[0].slot for led in self._outs], np.intp)
 
     # ---- pins by name -------------------------------------------------------------
 
@@ -184,6 +196,23 @@ class Harness:
             raise ValueError(f"{self.macro.title} has {len(self.inputs)} inputs, got {len(values)} values")
         for sw, value in zip(self._ins, values):
             sw.outputs[0].state = level(value)
+
+    def set_bits(self, bits: str | bytes, start: int = 0) -> None:
+        """Drive inputs start, start + 1, ... from a string of 0 / 1 / X / Z, one per
+        pin: the fast way (no Levels made). Inputs past the string keep their values."""
+        raw = np.frombuffer(bits.encode() if isinstance(bits, str) else bytes(bits), np.uint8)
+        codes = _CODE_OF[raw]
+        if start < 0 or start + len(codes) > len(self._in_slots):
+            raise ValueError(
+                f"{self.macro.title} has {len(self._in_slots)} inputs; can't set {len(codes)} from #{start + 1}"
+            )
+        if (codes == 255).any():
+            raise ValueError(f"{bytes(raw).decode(errors='replace')!r}: levels are 0, 1, X and Z")
+        self.circuit._pins.states[self._in_slots[start : start + len(codes)]] = codes
+
+    def bits(self) -> str:
+        """Every output as one string of 0 / 1 / X / Z, in pin order (the fast read)."""
+        return _CHAR_OF[self.circuit._pins.states[self._out_slots]].tobytes().decode()
 
     def get(self, name: str | int) -> Level:
         """One output's level (as of the last step)."""
