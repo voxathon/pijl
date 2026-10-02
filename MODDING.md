@@ -114,6 +114,49 @@ Many UI modules copy theme values when they're imported (`S = T.UI_SCALE`). To
 change those, patch `pijl.ui.theme` in an `after_import("pijl.ui.theme")` hook.
 That hook runs before the modules that copy the values are imported.
 
+## Patching other mods
+
+Mods are patched the same way as pijl itself. How you reach the other mod depends
+on where it is in the load order.
+
+A mod that loads **earlier** has already been imported, so import it and patch it:
+
+```python
+import pijl_mods.other
+
+old = pijl_mods.other.Thing.run
+
+def run(self):
+    ...
+    return old(self)
+
+pijl_mods.other.Thing.run = run
+```
+
+A mod that loads **later** hasn't been imported yet. Hook it with `after_import`.
+The hook runs right after that mod's own code, before the next mod loads:
+
+```python
+@after_import("pijl_mods.later")
+def _(m):
+    m.Thing.run = ...
+```
+
+Don't `import pijl_mods.later` from an earlier mod. The import runs the later mod
+on the spot, ahead of its place in the load order, and any errors from its
+`after_import` hooks are reported against your mod.
+
+When several mods wrap the same method, the last one in the load order wraps all
+the others, so its code runs first. The load order is the only thing that decides
+this.
+
+If the other mod is disabled, missing or fails to import, an `after_import` hook
+on it never runs, and nothing reports it. For a mod that loads earlier, put it in
+`requires` and you get a warning when it's not enabled. Don't do that for a mod
+that loads later: `requires` would warn that it loads after yours. The rule about
+module-level functions applies here too: patch the class, not a name another
+module has already copied.
+
 ## Adding part types from a mod
 
 You can, but it's discouraged: projects then depend on a mod that isn't saved with
