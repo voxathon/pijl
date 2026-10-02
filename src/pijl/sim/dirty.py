@@ -5,34 +5,25 @@ A pure part whose inputs didn't change since it last ran would only say the same
 again, so a step runs just the dirty ones: those with an input that changed in the
 last carry, or a pin written from outside (Pin.state, Circuit.write_pins: "pokes").
 Only nets with a changed driver are carried. When picking parts out would cost more
-than running everything (a rough cost model, below), the step runs everything, and
-when a carry changes many readers, the next step does without making a list at all.
+than running everything (a rough cost model: the evaluator's COSTS), the step runs
+everything, and when a carry changes many readers, the next step does without making
+a list at all.
 
 Tick for tick the same as sim/plain.py: tests/test_circuit.py checks it against it.
 """
 
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from ..logic import CODE, Z, fights, resolve
-from ..parts import Ctx
-from .circuit import _FAILED, _evaluate, _Handles
 
 if TYPE_CHECKING:
-    from .circuit import Circuit, _Batch
+    from .circuit import Circuit
 
 TAKES_POKES = True
-
-# What a step costs, roughly (microseconds; measured with bogobips on an i5-9600K), for
-# choosing between running every pure part and only the dirty ones. Only the ratios
-# matter. Picking parts out costs much more per part than running a whole kind at once,
-# and every kind touched costs its share of numpy calls.
-FULL_FIXED, FULL_PER_PART = 75.0, 0.019
-PICK_FIXED, PICK_PER_KIND, PICK_PER_PART = 20.0, 43.0, 0.1
 
 
 def step(c: Circuit) -> None:
@@ -51,55 +42,28 @@ def step(c: Circuit) -> None:
         bid = c._batch_of[dirty]
         dirty, bid = dirty[bid >= 0], bid[bid >= 0]
         if dirty.size:  # (none: next to free) is picking them out worth it?
+            cost = c._costs
             kinds = np.zeros(len(batches), bool)
             kinds[bid] = True
-            pick = PICK_FIXED + PICK_PER_KIND * np.count_nonzero(kinds) + PICK_PER_PART * dirty.size
-            full = pick > FULL_FIXED + FULL_PER_PART * c._n_pure
+            pick = cost.PICK_FIXED + cost.PICK_PER_KIND * np.count_nonzero(kinds)
+            pick += cost.PICK_PER_PART * dirty.size
+            full = pick > cost.FULL_FIXED + cost.FULL_PER_PART * c._n_pure
 
-    # Phase 1: parts compute outputs from current inputs, one kind at a time.
-    # Compute all first, then write, so evaluation order doesn't matter.
-    now = time.monotonic()
-    results: list[tuple[_Batch, np.ndarray | None, list[np.ndarray]]] = []
-    for b, batch in enumerate(batches):
-        t = batch.type
-        if t.kind in c.faults:
-            continue
-        pos = None  # (everyone)
-        parts, ins = batch.parts, batch.ins
-        if not full and t.pure:
-            pos = c._batch_pos[dirty[bid == b]]
-            if not pos.size:
-                continue
-            parts, ins = _Handles(c, batch.slots[pos]), [idx[pos] for idx in ins]
-        ctx = Ctx(parts, c.tick, now)
-        outs = c._guard(t, "eval", lambda: _evaluate(t, ctx, [states[idx] for idx in ins]))
-        if outs is not _FAILED:
-            results.append((batch, pos, outs))
-    moved: list[np.ndarray] = []  # output pins whose state changed (picking only)
-    outs_moved = False
-    for batch, pos, outs in results:
-        keep = None
-        if c._settling:  # settling parts take their new outputs only half the time
-            keep = (c._settle[batch.slots] <= 0) | (c.rng.random(len(batch.parts)) < 0.5)
-        for idx, values in zip(batch.outs, outs):
-            if pos is not None:
-                idx = idx[pos]
-            elif keep is not None:
-                idx, values = idx[keep], values[keep]
-            if pos is None:  # (a full carry follows: just whether anything moved)
-                outs_moved = outs_moved or not np.array_equal(states[idx], values)
-                states[idx] = values
-                continue
-            diff = states[idx] != values
-            if diff.any():
-                idx = idx[diff]
-                moved.append(idx)
-                states[idx] = values[diff]
+    # Phase 1: parts compute outputs from current inputs (sim/batches.py, sim/lut.py).
+    if full:
+        outs_moved, moved = c._run_all_tracked(), []
+    else:
+        outs_moved, moved = False, c._run_some(dirty, bid)
 
     # Phase 2: nets resolve their drivers and hand the value to their readers. Many
     # changed readers (past `most`, where picking out even one kind's parts would cost
     # more than running everything): the next step runs everything, no list.
-    most = int((FULL_FIXED + FULL_PER_PART * c._n_pure - PICK_FIXED - PICK_PER_KIND) / PICK_PER_PART)
+    cost = c._costs
+    most = int(
+        (cost.FULL_FIXED + cost.FULL_PER_PART * c._n_pure - cost.PICK_FIXED - cost.PICK_PER_KIND)
+        / cost.PICK_PER_PART
+    )
+    most = max(most, 0)  # (nothing changed: idle next, never a full run)
     if full or c._full:  # (a hook that failed just now set its outputs to X)
         n, changed = _carry_all(c, most, poked)
     else:

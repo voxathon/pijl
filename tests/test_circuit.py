@@ -448,21 +448,66 @@ def test_merge_onto_a_free_end_leaves_a_free_end():
 # ---- dirty-set evaluation --------------------------------------------------------------
 
 
-def test_dirty_set_matches_running_everything():
-    """The dirty-set stepper only runs pure parts whose inputs changed and carries only
-    nets whose drivers did. It must match the plain one (running everything) tick for
-    tick: random boards with loops, fights, tri-states and pulls, pins written from
-    outside (inputs and outputs alike, X and Z included), settling, and wiring edits
-    while it runs."""
+def _test_registry():
+    """The shipped parts plus some odd ones: a part that isn't pure (it blinks), a
+    pure one with 3 inputs, one with 5 (too many for a table), and one whose eval
+    fails on Z (no table; it faults when a Z reaches it)."""
+    from pijl.logic import Logic
+    from pijl.parts import TEMPLATES, PartType, part
+    from pijl.parts.registry import load
+
+    class Blink(PartType):
+        kind, outs = "BLINK", ("out",)
+
+        def eval(self, ctx):
+            return bool((ctx.tick // 3) % 2)
+
+    def picky(a, b):
+        if (a.codes == Z).any() or (b.codes == Z).any():
+            raise ValueError("no Z, please")
+        return a ^ b
+
+    reg = load(TEMPLATES)
+    reg.add(Blink())
+    reg.add(part("MAJ", ins=("a", "b", "c"), outs=("out", "nout"), eval=lambda a, b, c: ((a & b) | (b & c) | (a & c), ~((a & b) | (b & c) | (a & c)))))
+    reg.add(part("AND5", ins=tuple("abcde"), outs=("out",), eval=lambda a, b, c, d, e: a & b & c & d & e))
+    reg.add(part("PICKY", ins=("a", "b"), outs=("out",), eval=picky))
+    return reg
+
+
+def test_every_engine_matches_the_plain_one():
+    """Every engine config must do exactly what the plain one (dirty=off,
+    eval=batches: everything runs, a kind at a time) does, tick for tick: random
+    boards with loops, fights, tri-states, pulls, parts that aren't pure, kinds too
+    big for a table, a kind that faults, pins written from outside (inputs and outputs
+    alike, X and Z included), settling, and wiring edits while it runs."""
+    import itertools
     import random
 
-    kinds = ["IN", "NAND", "AND", "OR", "NOT", "XOR", "BUF", "TRI", "PULLUP", "PULLDOWN", "OUT"]
-    levels = [ZERO, ONE, X, Z]
+    from pijl.sim.config import OPTIONS
 
-    def build(seed: int, dirty: str):
+    reg = _test_registry()
+    kinds = ["IN", "NAND", "AND", "OR", "NOT", "XOR", "BUF", "TRI", "PULLUP", "PULLDOWN", "OUT"]
+    kinds += ["BLINK", "MAJ", "AND5", "PICKY"]
+    levels = [ZERO, ONE, X, Z]
+    configs = [EngineConfig(**dict(zip(OPTIONS, combo))) for combo in itertools.product(*OPTIONS.values())]
+    reference = EngineConfig(dirty="off", eval="batches")
+    configs.remove(reference)
+    # (boards this small mostly run everything: also try each dirty-set config with a
+    # cost model that always picks the dirty parts out)
+    configs += [(cfg, "always pick") for cfg in configs if cfg.dirty == "adaptive"]
+
+    class AlwaysPick:
+        FULL_FIXED, FULL_PER_PART = 1e12, 0.0
+        PICK_FIXED, PICK_PER_KIND, PICK_PER_PART = 0.0, 0.0, 1.0
+
+    def build(seed: int, config):
         rng = random.Random(seed)
-        c = Circuit(settle_ticks=rng.choice([0, 0, 6]), seed=seed, config=EngineConfig(dirty=dirty))
-        parts = [c.add_part(rng.choice(kinds)) for _ in range(rng.randint(4, 40))]
+        config, costs = config if isinstance(config, tuple) else (config, None)
+        c = Circuit(reg, settle_ticks=rng.choice([0, 0, 6]), seed=seed, config=config)
+        if costs:
+            c._costs = AlwaysPick
+        parts = [c.add_part(rng.choice(kinds if seed % 3 else kinds[:-4])) for _ in range(rng.randint(4, 40))]
         outs = [q for p in parts for q in p.outputs]
         ins = [q for p in parts for q in p.inputs]
         for pin in ins:
@@ -473,26 +518,50 @@ def test_dirty_set_matches_running_everything():
                 c.connect(rng.choice(outs), rng.choice(outs), check=False)
         return rng, c, parts, outs, ins
 
+    def tick(rng, c, parts, outs, ins):
+        r = rng.random()
+        if r < 0.25:  # drive a switch, or poke any pin at all
+            pins = [p.outputs[0] for p in parts if p.kind == "IN"] or outs
+            if rng.random() < 0.3:
+                pins = outs + ins
+            if pins:
+                rng.choice(pins).state = rng.choice(levels)
+        elif r < 0.27 and outs and ins:  # an edit while it runs
+            c.connect(rng.choice(outs), rng.choice(ins), check=False)
+        c.step()
+
     for seed in range(60):
-        ra, a, pa, oa, ia = build(seed, "adaptive")
-        rb, b, pb, ob, ib = build(seed, "off")
-        for tick in range(80):
-            for rng, c, parts, outs, ins in ((ra, a, pa, oa, ia), (rb, b, pb, ob, ib)):
-                r = rng.random()
-                if r < 0.25:  # drive a switch, or poke any pin at all
-                    pins = [p.outputs[0] for p in parts if p.kind == "IN"] or outs
-                    if rng.random() < 0.3:
-                        pins = outs + ins
-                    if pins:
-                        rng.choice(pins).state = rng.choice(levels)
-                elif r < 0.27 and outs and ins:  # an edit while it runs
-                    c.connect(rng.choice(outs), rng.choice(ins), check=False)
-                c.step()
-            n = a._pins.n
-            assert np.array_equal(a._pins.states[:n], b._pins.states[:n]), (seed, tick)
-            assert np.array_equal(a.net_value, b.net_value), (seed, tick)
-            assert np.array_equal(a.net_conflict, b.net_conflict), (seed, tick)
-        assert a.run_until_stable(200) == b.run_until_stable(200), seed
+        ref = build(seed, reference)
+        others = [build(seed, cfg) for cfg in configs]
+        b = ref[1]
+        for t in range(80):
+            tick(*ref)
+            n = b._pins.n
+            for cfg, board in zip(configs, others):
+                tick(*board)
+                a = board[1]
+                where = (str(cfg), seed, t)
+                assert np.array_equal(a._pins.states[:n], b._pins.states[:n]), where
+                assert np.array_equal(a.net_value, b.net_value), where
+                assert np.array_equal(a.net_conflict, b.net_conflict), where
+                assert a.faults == b.faults, where
+        want = b.run_until_stable(200)
+        for cfg, board in zip(configs, others):
+            assert board[1].run_until_stable(200) == want, (str(cfg), seed)
+
+
+def test_lut_tables():
+    from pijl.sim import lut
+
+    reg = _test_registry()
+    nand = lut.tabulate(reg.get("NAND"))
+    assert nand.shape == (1, 16)
+    row = lambda a, b: int(a) + 4 * int(b)  # noqa: E731
+    assert nand[0, row(ONE, ONE)] == ZERO and nand[0, row(ZERO, X)] == ONE
+    assert nand[0, row(ONE, X)] == X and nand[0, row(ONE, Z)] == X  # (Z reads as X)
+    assert lut.tabulate(reg.get("MAJ")).shape == (2, 64)
+    for kind in ("BLINK", "AND5", "PICKY", "IN", "OUT"):
+        assert lut.tabulate(reg.get(kind)) is None, kind
 
 
 def test_engine_config_text_and_binding():

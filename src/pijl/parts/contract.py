@@ -34,6 +34,11 @@ What the engine promises:
     the cursor before placement -- and every opened instance gets a close().
   - Parts that aren't `pure` are never skipped, cached or reordered; only live
     (opened) instances of them are evaluated.
+  - A `pure` part's eval may be skipped when its inputs didn't change, and one with
+    up to 4 inputs may be called once, on every combination of 0 / 1 / X / Z at
+    once, and turned into a lookup table (sim/lut.py). So a pure eval must depend
+    on its inputs only: not on ctx.parts, props, ctx.tick or time. If it raises on
+    some combination, it just isn't tabulated.
   - Settings (see settings.py) are props the user edits from the context menu,
     on one part or on a selection of parts of the same kind. Every value written
     has been through the setting's parse(). changed() runs once per finished edit

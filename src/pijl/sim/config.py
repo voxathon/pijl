@@ -14,6 +14,10 @@ Options:
                     nets whose drivers did, when that's cheaper than everything
                     (sim/dirty.py)
           off:      every part runs and every net is carried, every tick (sim/plain.py)
+  eval    lut:      pure kinds with up to 4 inputs become lookup tables, and every
+                    part of those kinds is looked up at once (sim/lut.py); the rest
+                    run as batches
+          batches:  each kind's eval runs on arrays of its instances (sim/batches.py)
 """
 
 from __future__ import annotations
@@ -23,12 +27,14 @@ from dataclasses import dataclass, fields, replace
 
 OPTIONS: dict[str, tuple[str, ...]] = {
     "dirty": ("adaptive", "off"),
+    "eval": ("lut", "batches"),
 }
 
 
 @dataclass(frozen=True)
 class EngineConfig:
     dirty: str = OPTIONS["dirty"][0]
+    eval: str = OPTIONS["eval"][0]
 
     def __post_init__(self) -> None:
         for f in fields(self):

@@ -595,6 +595,7 @@ class Circuit:
         self._batch_of = np.zeros(0, np.intp)  # per part slot: its batch (-1: none) ...
         self._batch_pos = np.zeros(0, np.intp)  # ... and its place in it
         self._n_pure = 0  # parts in pure batches
+        self._lut_plan = None  # sim/lut.py's units, made from the batches
         # Nets by number, for carrying only some (sim/dirty.py); -1 where none
         self._pin_net = np.zeros(0, np.intp)  # per pin slot
         self._solo_of = np.zeros(0, np.intp)  # per net: its only driver
@@ -612,11 +613,16 @@ class Circuit:
 
     def _bind(self) -> None:
         """Take on the code paths self.config names: step() and run_until_stable() come
-        from its stepper. Pokes (pin slots written from outside step(): Pin.state,
+        from its stepper, and the stepper runs the parts through its evaluator. Pokes (pin slots written from outside step(): Pin.state,
         write_pins) are only kept for a stepper that wants them."""
-        from . import dirty, plain  # (they import this module)
+        from . import batches, dirty, lut, plain  # (they import this module)
 
         stepper = {"adaptive": dirty, "off": plain}[self.config.dirty]
+        evaluator = {"batches": batches, "lut": lut}[self.config.eval]
+        self._run_all = MethodType(evaluator.run_all, self)
+        self._run_all_tracked = MethodType(evaluator.run_all_tracked, self)
+        self._run_some = MethodType(evaluator.run_some, self)
+        self._costs = evaluator.COSTS
         self.step: Callable[[], None] = MethodType(stepper.step, self)
         # run_until_stable(limit): step until a step changes no pin and nothing is
         # settling any more, at most `limit` steps that change something (plus the one
@@ -1650,6 +1656,7 @@ class Circuit:
                 for s in self._by_kind().get(t, np.empty(0, np.intp)).tolist():
                     self._pins.states[self._drive_slots(s)] = X
                 self._full = True
+                self._batches_dirty = True  # (evaluators leave faulted kinds out)
             return _FAILED
 
 
