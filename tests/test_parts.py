@@ -40,6 +40,7 @@ def test_builtins_are_the_ports_plus_the_template_scripts():
         "OR",
         "TRI",
         "XOR",
+        "CLK",
         "PULLUP",
         "PULLDOWN",
     ]  # ports, then by path
@@ -171,6 +172,19 @@ def test_frame_state_and_props(circuit):
     assert (a.state["count"], b.state["count"]) == (1, 2)
     assert (a.outputs[0].state, b.outputs[0].state) == (ONE, ZERO)
     assert circuit.registry.get("COUNTER").props == {"step": 1}  # instances got copies
+
+
+def test_clock_ticks_low_then_high_per_its_period(circuit):
+    a, b = circuit.add_part("CLK"), circuit.add_part("CLK")
+    a.props["period"], b.props["period"] = 4, 5
+    seen = []
+    for _ in range(10):
+        circuit.step()
+        seen.append((circuit.tick - 1, a.outputs[0].state, b.outputs[0].state))
+    for tick, sa, sb in seen:
+        assert sa is level(tick % 4 >= 2)
+        assert sb is level(tick % 5 >= 3)  # odd: the extra tick is low
+    assert circuit.faults == {}
 
 
 def test_impure_ghosts_are_not_evaluated(circuit):
