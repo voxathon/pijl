@@ -3,6 +3,9 @@
 A visual logic circuit editor and simulator. Place gates, draw wires, and
 package circuits into reusable macros.
 
+## Performance
+See [BENCH.md](BENCH.md). More benchmarks coming.
+
 ## Install
 
 ```bash
