@@ -10,6 +10,10 @@ See [BENCH.md](BENCH.md). More benchmarks coming.
 Macros run without the editor too: from Python, the command line, or as a
 co-process over a pipe. See [HEADLESS.md](HEADLESS.md).
 
+## Modding support
+
+Modding support is extremely extensive, every aspect of pijl is moddable. See [MODDING.md](MODDING.md).
+
 ## Install
 
 ```bash
