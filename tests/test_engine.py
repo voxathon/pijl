@@ -227,16 +227,68 @@ def test_raw_stream_refuses_junk(capsys):
 # ---- bogobips --------------------------------------------------------------------------
 
 
-def test_bogobips_registers_shift_and_the_script_agrees(tmp_path):
+SMALL = {"sipo": 5, "piso": 5, "tree-and": 4, "tree-xor": 4, "decoder": 5, "adder": 6}
+
+
+@pytest.mark.parametrize("nest", [False, True])
+def test_bogobips_every_kind_computes_what_its_script_says(tmp_path, nest):
+    import numpy as np
+
     from pijl import bogobips as B
 
-    eng = B.make_project(tmp_path / "bogo-data", ["sipo", "piso"], [5])
-    for kind in ("sipo", "piso"):
-        h = eng.harness(f"{kind} 5", settle_ticks=0)
-        steps = B.script(kind, 5, seed=1)
-        for _ in range(40):  # every read checked against the stream, both ways
-            bits, read, expect = next(steps)
-            h.set_bits(bits)
-            assert h.settle(100)
-            if read:
-                assert h.bits() == expect()
+    plan = list(SMALL.items())
+    eng = B.make_project(tmp_path / "bogo-data", plan, nest)
+    for kind, n in plan:
+        k = B.KINDS[kind]
+        for fixed in (False, True):  # settle, and the longest path's ticks
+            if fixed and k.path is None:
+                continue
+            h = eng.harness(f"{kind} {n}", settle_ticks=0)
+            steps = k.script(n, np.random.default_rng(3), 2)
+            reads = 0
+            while reads < 60:  # every read checked, not every 64th
+                sets, read, expect = next(steps)
+                for start, bits in sets:
+                    h.set_bits(bits, start)
+                if fixed:
+                    h.step(k.path(n))
+                else:
+                    assert h.settle(10_000)
+                    assert k.path is None or h.last_ticks <= k.path(n), (kind, h.last_ticks)
+                if read:
+                    assert h.bits() == expect(), (kind, n, fixed, reads)
+                    reads += 1
+
+
+def test_bogobips_steps_survive_the_raw_stream(tmp_path):
+    import numpy as np
+
+    from pijl import bogobips as B
+    from pijl import cli as C
+
+    eng = B.make_project(tmp_path / "bogo-data", [("adder", 4), ("piso", 3)])
+    for macro, kind, n in (("adder 4", "adder", 4), ("piso 3", "piso", 3)):
+        h = eng.harness(macro, settle_ticks=0)
+        steps = B.KINDS[kind].script(n, np.random.default_rng(5), 2)
+        stream, want = bytearray(), bytearray()
+        for _ in range(40):
+            sets, read, expect = next(steps)
+            stream += B.encode(sets, len(h.inputs)) + (b"?" if read else b"")
+            want += expect().encode() if read else b""
+        out = io.BytesIO()
+        assert C._raw(h, h.settle, io.BytesIO(bytes(stream)), out) == 0
+        assert out.getvalue() == bytes(want)
+
+
+def test_raw_addresses_and_chunk_edges(capsys):
+    from pijl import cli as C
+
+    class Dribble(io.BytesIO):  # one byte per read: every token cut somewhere
+        def read1(self, n=-1):
+            return self.read(1)
+
+    h = Engine("bench").harness("latch")
+    out = io.BytesIO()
+    assert C._raw(h, h.settle, Dribble(b"01?@1=1;?@2=0;?@12=1;"), out) == 2
+    assert out.getvalue() == b"101001"  # 10 10 01
+    assert "12" in capsys.readouterr().err

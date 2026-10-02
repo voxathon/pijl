@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from typing import TYPE_CHECKING, Any, BinaryIO, TextIO
 
@@ -123,11 +124,13 @@ def _parser() -> argparse.ArgumentParser:
         description="bogobips: BIt-shifts Per Second through generated shift registers. See `pydoc pijl.bogobips`.",
     )
     bench.add_argument("name", choices=["bogobips"])
-    bench.add_argument("--kind", default="sipo,piso", help="sipo, piso or both (default)")
-    bench.add_argument("--depth", default="8,64,512,4096", help="register depths, comma separated")
+    bench.add_argument("--kind", default="sipo,piso,tree,decoder,adder", help="any of sipo, piso, tree-and, tree-xor (tree: both), decoder, adder (default: all)")
+    bench.add_argument("--depth", help="depths, comma separated (default: each kind's own; see pydoc pijl.bogobips)")
     bench.add_argument("--layers", default="engine,settle,pipe", help="which of engine, settle, pipe")
     bench.add_argument("--seconds", type=float, default=0.5, help="time spent per measurement (default 0.5)")
-    bench.add_argument("--seed", type=int, default=0, help="seed for the random bit stream")
+    bench.add_argument("--seed", type=int, default=0, help="seed for the random stimulus")
+    bench.add_argument("--flips", type=int, default=1, help="inputs flipped per vector, for trees, decoders and adders (default 1)")
+    bench.add_argument("--nest", action="store_true", help="build trees and adders from nested macros")
     return p
 
 
@@ -233,44 +236,72 @@ def _stream(h: Harness, run, as_json: bool, inp: TextIO, out: TextIO) -> int:
     return status
 
 
-_LEVEL_BYTES = frozenset(b"01xXzZ")
-_SKIP = frozenset((9, 10, 13, 32))  # whitespace
+# a level run, a read, a run-now, or an addressed level (@7=1: input 7, counting from 1)
+_RAW_TOKEN = re.compile(rb"([01xXzZ]+)|(\?)|(;)|@([0-9]+)=([01xXzZ])")
+_RAW_PARTIAL = re.compile(rb"@[0-9]*=?")  # an addressed level cut off by the chunk's end
 
 
 def _raw(h: Harness, run, inp: BinaryIO, out: BinaryIO) -> int:
     """The --raw stream: built for speed, so no lines and no names. Each level
     character (0 1 X Z) drives the next input in pin order; once every input has
     one, that's a vector: it's applied and run. ";" applies a vector early (only
-    the inputs given so far change; on its own: run, change nothing). "?" answers
-    with every output's level, one character each, no newline. Whitespace is
-    ignored. Answers are flushed whenever the input there is has been worked off."""
+    the inputs given so far change; on its own: run, change nothing). "@n=L" drives
+    input n (counting from 1) right away, without running: "@7=1@9=0;" changes two
+    inputs, then runs. "?" answers with every output's level, one character each,
+    no newline. Whitespace is ignored. Answers are flushed whenever the input there
+    is has been worked off. Read a chunk at a time: a long vector costs a few slice
+    copies, not a Python step per character."""
     n = len(h.inputs)
     vec = bytearray()
     answer = bytearray()
+    pending = b""
 
     def apply() -> None:
         h.set_bits(bytes(vec))
         vec.clear()
         run()
 
+    def stop(msg: str) -> int:
+        out.write(answer)
+        out.flush()
+        return _fail(f"--raw: {msg}", 2)
+
     while chunk := (inp.read1(65536) if hasattr(inp, "read1") else inp.read(65536)):
-        for b in chunk:
-            if b in _LEVEL_BYTES:
-                vec.append(b)
-                if len(vec) == n:
+        data = pending + chunk.translate(None, b" \t\r\n")
+        pending, pos = b"", 0
+        while pos < len(data):
+            m = _RAW_TOKEN.match(data, pos)
+            if m is None:
+                if _RAW_PARTIAL.fullmatch(data, pos):
+                    pending = data[pos:]
+                    break
+                return stop(f"unexpected {chr(data[pos])!r} in the stream")
+            pos = m.end()
+            levels, read, now, at, level = m.groups()
+            try:
+                if levels is not None:
+                    if not n:
+                        return stop(f"{h.macro.title} has no inputs")
+                    while levels:
+                        take = n - len(vec)
+                        vec += levels[:take]
+                        levels = levels[take:]
+                        if len(vec) == n:
+                            apply()
+                elif read is not None:
+                    answer += h.bits().encode()
+                elif now is not None:
                     apply()
-            elif b == 63:  # ?
-                answer += h.bits().encode()
-            elif b == 59:  # ;
-                apply()
-            elif b not in _SKIP:
-                out.write(answer)
-                out.flush()
-                return _fail(f"--raw: unexpected {chr(b)!r} in the stream", 2)
+                else:
+                    h.set_bits(level, int(at) - 1)
+            except ValueError as e:
+                return stop(str(e))
         if answer:
             out.write(answer)
             out.flush()
             answer.clear()
+    if pending:
+        return stop(f"the stream ends in the middle of {pending.decode()!r}")
     if vec:
         apply()
     return 0

@@ -1,36 +1,55 @@
 """bogobips: BIt-shifts Per Second. A play on bogomips, and about as scientific.
 
-    pijl bench bogobips [--kind sipo,piso] [--depth 8,64,512,4096]
+    pijl bench bogobips [--kind sipo,piso,tree,decoder,adder] [--depth ...]
                         [--layers engine,settle,pipe] [--seconds 0.5] [--seed 0]
+                        [--flips 1] [--nest]
 
-A seeded random bit stream is pushed through shift registers built from NANDs and
-read back out. Every stage that moves its bit on a clock is one bit-shift, so
+Circuits built from gates are driven with a seeded random stimulus and read back,
+and every piece of the circuit that does its job once counts as one unit of work:
 
-    BIPS = clocks per second x depth
+    BIPS = clocks (or vectors) per second x work per clock
 
-With unit delay all stages shift at once: a clock costs the same number of ticks
-at any depth, and what grows with depth is what a tick costs (array work over
-every gate). So BIPS rises while numpy's batching pays for itself, then flattens.
+Only compare BIPS within one kind: a flip-flop stage and a gate aren't the same
+amount of work.
 
-Two registers, for the two ends of the I/O:
-  - sipo (serial in, parallel out): one bit in per clock, all `depth` outputs read
-    back every clock. Stresses readout.
-  - piso (parallel in, serial out): a whole word loaded at once (a mux in front of
-    every stage), then shifted out a bit per clock. Stresses the drive side.
+Kinds, and what --depth means for each:
+  - sipo (serial in, parallel out; depth = stages): one bit in per clock, every
+    stage read back every clock. Work: the stages, all of which shift. Stresses
+    readout. Flip-flops are NAND master-slave ones.
+  - piso (parallel in, serial out; depth = stages): a word loaded at once (a mux in
+    front of every stage), then shifted out a bit per clock. Stresses driving.
+  - tree-and, tree-xor (depth = levels: 2^depth inputs, one output): a binary tree
+    of gates, everything merging into one. Each vector flips --flips random
+    inputs. AND is where changes die out (one 0 settles a gate, so a random tree is
+    mostly quiet past its bottom levels); XOR is where every change runs all the way
+    to the root. The two ends of how busy a circuit is. "tree" means both.
+  - decoder (depth = inputs: 2^depth outputs, one of them 1): built from smaller
+    decoders whose outputs are ANDed pairwise, so every line fans out to many
+    gates. Each vector flips --flips inputs and reads every output.
+  - adder (depth = bits): ripple carry, a + b + carry in, flipping --flips of its
+    inputs a vector. Carries split and join again, so with unit delay it glitches,
+    and how long it takes depends on the data: a carry may run the whole width.
+For the combinational kinds the work per vector is the gate count: each gate
+passing its value on once.
+
+--nest builds trees and adders out of macros (a depth-k tree is two depth-(k-1)
+trees and a gate; an adder is a row of full-adder macros) instead of flat gates:
+the same circuit, so the same answers, but built by stamping nested macros.
 
 Three layers, each a column:
-  - engine: the macro driven in-process, a fixed number of ticks per clock edge
-    (measured by the settle run). The engine's own speed.
+  - engine: driven in-process, a fixed number of ticks per edge or vector: the
+    most the settle run needed, or the circuit's longest path if that's more (an
+    adder's full-width carry is rare in random data, but it must fit).
   - settle: the same, but run-to-stable after every edge (Harness.settle): what
-    not knowing the timing costs.
+    not knowing the timing costs -- or saves, where most of a circuit is idle.
   - pipe:   a child `pijl run --raw` process fed over stdin, answers read back
     from stdout. The whole external I/O round trip.
 
-A shift register is its own oracle: what comes out is what went in, delayed. Every
-clock is read, and every 64th read is checked (a register starts out X, and that's
-expected too), so a speed-up that breaks timing shows up as FAIL, not as a better
-number. Only every 64th: building what a deep SIPO should show is a string as long
-as the register, which would otherwise be timed as if it were the engine's work.
+Each circuit is its own oracle (a register gives back its input, delayed; a tree
+is an AND or a parity; a decoder one-hot; an adder a sum). Every clock is read,
+and every 64th read is checked, so a speed-up that breaks timing shows up as FAIL,
+not as a better number. Only every 64th: what a deep circuit should show can be a
+string as long as it is wide, and building it would be timed as engine work.
 
 Everything is generated into a throwaway data folder: no project of yours is read
 or touched.
@@ -45,6 +64,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -55,147 +75,369 @@ from .snapshot import MACRO, Snapshot
 PROJECT = "bogo"
 LAYERS = ("engine", "settle", "pipe")
 CHECK_EVERY = 64  # reads; the rest are read but not compared
-KINDS = ("sipo", "piso")
 
-# input bits (from the first input on), read now?, what must come out (made when asked)
-Step = tuple[str, bool, Callable[[], str] | None]
+# what to drive (input index, levels from there on), read now?, what must come out (made
+# when asked)
+Step = tuple[tuple[tuple[int, str], ...], bool, Callable[[], str] | None]
 
 
-# ---- the macros ----------------------------------------------------------------------
+# ---- building blocks -----------------------------------------------------------------
 
 
 def _w(src: int, dst: int, di: int = 0, si: int = 0):
     return (("p", src, False, si), ("p", dst, True, di), (), None, None)
 
 
-def _snap(parts: dict, wires: list) -> Snapshot:
-    return Snapshot(parts, {i: w for i, w in enumerate(wires, 1)})
+class _Board:
+    """A body being put together: parts and wires, uids handed out in order."""
+
+    def __init__(self) -> None:
+        self.parts: dict = {}
+        self.wires: list = []
+
+    def add(self, kind: str, label: str = "", y: float = 0.0, x: float = 0.0) -> int:
+        """A part; for ports, y sets the pin order (top to bottom: see macros.py)."""
+        uid = len(self.parts) + 1
+        self.parts[uid] = (kind, label, x, y, {})
+        return uid
+
+    def wire(self, src: int, dst: int, di: int = 0, si: int = 0) -> None:
+        self.wires.append(_w(src, dst, di, si))
+
+    def gate(self, kind: str, a: int, b: int | None = None, a_out: int = 0, b_out: int = 0) -> int:
+        g = self.add(kind)
+        self.wire(a, g, 0, a_out)
+        if b is not None:
+            self.wire(b, g, 1, b_out)
+        return g
+
+    def snapshot(self) -> Snapshot:
+        return Snapshot(self.parts, {i: w for i, w in enumerate(self.wires, 1)})
 
 
-def _port(kind: str, label: str, y: float, x: float = 0.0):
-    """A port: macro pins go top to bottom by y (see macros.py), so y sets the order."""
-    return (kind, label, x, y, {})
+def _ins(board: _Board, labels: list[str]) -> list[int]:
+    return [board.add("IN", lab, -i) for i, lab in enumerate(labels)]
+
+
+def _outs(board: _Board, labels: list[str], x: float = 1000.0) -> list[int]:
+    return [board.add("OUT", lab, -i, x) for i, lab in enumerate(labels)]
+
+
+def _random_bits(rng: np.random.Generator, n: int) -> np.ndarray:
+    return rng.integers(0, 2, n).astype(np.uint8)
+
+
+def _text(bits: np.ndarray) -> str:
+    return (bits + 48).astype(np.uint8).tobytes().decode()
+
+
+def _flips(rng: np.random.Generator, cur: np.ndarray, k: int) -> list[int]:
+    """Flip k random inputs (in place); their indices."""
+    at = rng.integers(0, len(cur), k).tolist()
+    for i in at:
+        cur[i] ^= 1
+    return at
+
+
+def _sets(cur: np.ndarray, at: list[int]) -> tuple[tuple[int, str], ...]:
+    return tuple((i, "01"[cur[i]]) for i in at)
+
+
+# ---- shift registers -----------------------------------------------------------------
 
 
 def dff() -> Snapshot:
     """Positive edge D flip-flop: two gated D latches (4 NANDs each), the master
     open while C is low, the slave while it's high. Pins: D, C -> Q."""
-    nand = ("NAND", "", 0.0, 0.0, {})
-    parts = {1: _port("IN", "D", 0), 2: _port("IN", "C", -1), 3: ("NOT", "", 0.0, 0.0, {})}
-    parts |= {uid: nand for uid in range(4, 12)}
-    parts[12] = _port("OUT", "Q", 0, 100)
-    wires = [
-        _w(2, 3),  # nc = not C: the master's enable
-        _w(1, 4, 0), _w(3, 4, 1),  # master: s = nand(D, nc)
-        _w(4, 5, 0), _w(3, 5, 1),  # r = nand(s, nc)
-        _w(4, 6, 0), _w(7, 6, 1),  # mq = nand(s, mqb)
-        _w(5, 7, 0), _w(6, 7, 1),  # mqb = nand(r, mq)
-        _w(6, 8, 0), _w(2, 8, 1),  # slave, enabled by C: s2 = nand(mq, C)
-        _w(8, 9, 0), _w(2, 9, 1),  # r2 = nand(s2, C)
-        _w(8, 10, 0), _w(11, 10, 1),  # q = nand(s2, qb)
-        _w(9, 11, 0), _w(10, 11, 1),  # qb = nand(r2, q)
-        _w(10, 12),
-    ]
-    return _snap(parts, wires)
+    b = _Board()
+    d, c = _ins(b, ["D", "C"])
+    nc = b.gate("NOT", c)  # the master's enable
+    s = b.gate("NAND", d, nc)
+    r = b.gate("NAND", s, nc)
+    mq, mqb = b.add("NAND"), b.add("NAND")
+    b.wire(s, mq, 0), b.wire(mqb, mq, 1), b.wire(r, mqb, 0), b.wire(mq, mqb, 1)
+    s2 = b.gate("NAND", mq, c)  # the slave, enabled by C
+    r2 = b.gate("NAND", s2, c)
+    q, qb = b.add("NAND"), b.add("NAND")
+    b.wire(s2, q, 0), b.wire(qb, q, 1), b.wire(r2, qb, 0), b.wire(q, qb, 1)
+    (out,) = _outs(b, ["Q"])
+    b.wire(q, out)
+    return b.snapshot()
 
 
 def stage() -> Snapshot:
     """One PISO stage: a mux (L ? P : S) into a flip-flop. Pins: P, S, L, C -> Q."""
-    nand = ("NAND", "", 0.0, 0.0, {})
-    parts = {
-        1: _port("IN", "P", 0),
-        2: _port("IN", "S", -1),
-        3: _port("IN", "L", -2),
-        4: _port("IN", "C", -3),
-        5: ("NOT", "", 0.0, 0.0, {}),
-        6: nand,
-        7: nand,
-        8: nand,
-        9: (MACRO + "dff", "", 0.0, 0.0, {}),
-        10: _port("OUT", "Q", 0, 100),
-    }
-    wires = [
-        _w(3, 5),  # not L
-        _w(1, 6, 0), _w(3, 6, 1),  # nand(P, L)
-        _w(2, 7, 0), _w(5, 7, 1),  # nand(S, not L)
-        _w(6, 8, 0), _w(7, 8, 1),  # the mux
-        _w(8, 9, 0), _w(4, 9, 1),  # into the flip-flop's D, C
-        _w(9, 10),
-    ]
-    return _snap(parts, wires)
+    b = _Board()
+    p, s, load, c = _ins(b, ["P", "S", "L", "C"])
+    mux = b.gate("NAND", b.gate("NAND", p, load), b.gate("NAND", s, b.gate("NOT", load)))
+    ff = b.add(MACRO + "dff")
+    b.wire(mux, ff, 0), b.wire(c, ff, 1)
+    (out,) = _outs(b, ["Q"])
+    b.wire(ff, out)
+    return b.snapshot()
 
 
 def sipo(n: int) -> Snapshot:
     """D, C -> q1 .. qn: n flip-flops in a row, every one read out."""
-    parts = {1: _port("IN", "D", 0), 2: _port("IN", "C", -1)}
-    wires = []
-    for j in range(1, n + 1):
-        ff, out = 2 + j, 2 + n + j
-        parts[ff] = (MACRO + "dff", "", 100.0 * j, 0.0, {})
-        parts[out] = _port("OUT", f"q{j}", -j, 100.0 * (n + 1))
-        wires += [_w(1 if j == 1 else ff - 1, ff, 0), _w(2, ff, 1), _w(ff, out)]
-    return _snap(parts, wires)
+    b = _Board()
+    d, c = _ins(b, ["D", "C"])
+    outs = _outs(b, [f"q{j}" for j in range(1, n + 1)])
+    prev = d
+    for out in outs:
+        ff = b.add(MACRO + "dff")
+        b.wire(prev, ff, 0), b.wire(c, ff, 1), b.wire(ff, out)
+        prev = ff
+    return b.snapshot()
 
 
 def piso(n: int) -> Snapshot:
     """SI, L, C, p1 .. pn -> out: L high loads p1..pn on the clock, low shifts them
     along (SI coming in at the front); out is the last stage."""
-    parts = {1: _port("IN", "SI", 0), 2: _port("IN", "L", -1), 3: _port("IN", "C", -2)}
-    wires = []
-    for j in range(1, n + 1):
-        p, st = 3 + j, 3 + n + j
-        parts[p] = _port("IN", f"p{j}", -2 - j)
-        parts[st] = (MACRO + "pstage", "", 100.0 * j, 0.0, {})
-        wires += [_w(p, st, 0), _w(1 if j == 1 else st - 1, st, 1), _w(2, st, 2), _w(3, st, 3)]
-    parts[4 + 2 * n] = _port("OUT", "out", 0, 100.0 * (n + 1))
-    wires.append(_w(3 + 2 * n, 4 + 2 * n))
-    return _snap(parts, wires)
+    b = _Board()
+    si, load, c, *ps = _ins(b, ["SI", "L", "C"] + [f"p{j}" for j in range(1, n + 1)])
+    prev = si
+    for p in ps:
+        st = b.add(MACRO + "pstage")
+        b.wire(p, st, 0), b.wire(prev, st, 1), b.wire(load, st, 2), b.wire(c, st, 3)
+        prev = st
+    (out,) = _outs(b, ["out"])
+    b.wire(prev, out)
+    return b.snapshot()
 
 
-def make_project(root: Path, kinds, depths) -> Engine:
-    """A throwaway project under data root `root` with the registers in it."""
+def sipo_script(n: int, rng: np.random.Generator, flips: int) -> Iterator[Step]:
+    """Inputs D, C; outputs q1..qn. One clock: C low (the masters take D), then high
+    (everything moves one along)."""
+    fed = bytearray()  # every bit so far
+
+    def window(k: int) -> str:
+        """q1..qn after k bits went in: the last n, newest first; X where none got yet."""
+        got = fed[max(0, k - n) : k][::-1].decode()
+        return got + "X" * (n - len(got))
+
+    while True:
+        for bit in rng.integers(0, 2, 4096).tolist():
+            d = "01"[bit]
+            yield ((0, d + "0"),), False, None
+            fed.append(48 + bit)
+            k = len(fed)
+            yield ((0, d + "1"),), True, lambda k=k: window(k)
+
+
+def piso_script(n: int, rng: np.random.Generator, flips: int) -> Iterator[Step]:
+    """Inputs SI, L, C, p1..pn; output: the last stage. A load clock, then n - 1 shifts."""
+    while True:
+        word = _text(_random_bits(rng, n))
+        yield ((0, "010" + word),), False, None  # L high: the masters take p1..pn
+        yield ((0, "011"),), True, lambda w=word: w[-1]  # the load clock: out = pn
+        for k in range(1, n):
+            yield ((0, "000"),), False, None
+            yield ((0, "001"),), True, lambda w=word, k=k: w[n - 1 - k]  # out = p(n-k)
+
+
+# ---- trees ---------------------------------------------------------------------------
+
+
+def tree(gate: str, depth: int, nest: bool) -> Snapshot:
+    """x1 .. x(2^depth) -> out, through `depth` levels of `gate`. Nested: two trees of
+    depth - 1 (macros "tree-<gate> <depth - 1>") and a gate."""
+    b = _Board()
+    xs = _ins(b, [f"x{i}" for i in range(1, 2**depth + 1)])
+    if nest and depth > 1:
+        half = len(xs) // 2
+        sub = MACRO + f"tree-{gate.lower()} {depth - 1}"
+        left, right = b.add(sub), b.add(sub)
+        for i, x in enumerate(xs):
+            b.wire(x, left if i < half else right, i % half)
+        level = [left, right]
+    else:
+        level = xs
+    while len(level) > 1:
+        level = [b.gate(gate, level[i], level[i + 1]) for i in range(0, len(level), 2)]
+    (out,) = _outs(b, ["out"])
+    b.wire(level[0], out)
+    return b.snapshot()
+
+
+def tree_script(gate: str) -> Callable[[int, np.random.Generator, int], Iterator[Step]]:
+    def script(depth: int, rng: np.random.Generator, flips: int) -> Iterator[Step]:
+        cur = _random_bits(rng, 2**depth)
+        zeros, parity = int(np.count_nonzero(cur == 0)), int(cur.sum()) & 1
+
+        def value() -> str:
+            return "01"[zeros == 0] if gate == "AND" else "01"[parity]
+
+        v = value()
+        yield ((0, _text(cur)),), True, lambda v=v: v
+        while True:
+            at = _flips(rng, cur, flips)
+            for i in at:
+                zeros += -1 if cur[i] else 1
+                parity ^= 1
+            v = value()
+            yield _sets(cur, at), True, lambda v=v: v
+
+    return script
+
+
+# ---- decoder -------------------------------------------------------------------------
+
+
+def decoder(n: int) -> Snapshot:
+    """a1 .. an (a1 the top bit) -> y0 .. y(2^n - 1): y_v is 1 when the inputs spell v.
+    Two half-width decoders, every pair of their outputs ANDed."""
+    b = _Board()
+    ins = _ins(b, [f"a{i}" for i in range(1, n + 1)])
+
+    def dec(inputs: list[int]) -> list[int]:
+        if len(inputs) == 1:
+            return [b.gate("NOT", inputs[0]), inputs[0]]
+        h = len(inputs) // 2
+        top, bottom = dec(inputs[:h]), dec(inputs[h:])
+        return [b.gate("AND", t, u) for t in top for u in bottom]
+
+    for src, out in zip(dec(ins), _outs(b, [f"y{v}" for v in range(2**n)])):
+        b.wire(src, out)
+    return b.snapshot()
+
+
+def _decoder_depth(n: int) -> int:
+    return 1 if n == 1 else max(_decoder_depth(n // 2), _decoder_depth(n - n // 2)) + 1
+
+
+def _decoder_gates(n: int) -> int:
+    return 1 if n == 1 else _decoder_gates(n // 2) + _decoder_gates(n - n // 2) + 2**n
+
+
+def decoder_script(n: int, rng: np.random.Generator, flips: int) -> Iterator[Step]:
+    cur = _random_bits(rng, n)
+    value = int("".join(map(str, cur.tolist())), 2)
+    size = 2**n
+
+    def one_hot(v: int) -> str:
+        return "0" * v + "1" + "0" * (size - v - 1)
+
+    yield ((0, _text(cur)),), True, lambda v=value: one_hot(v)
+    while True:
+        at = _flips(rng, cur, flips)
+        for i in at:
+            value ^= 1 << (n - 1 - i)
+        yield _sets(cur, at), True, lambda v=value: one_hot(v)
+
+
+# ---- adder ---------------------------------------------------------------------------
+
+
+def _full_adder(b: _Board, a: int, x: int, c: int, c_out: int = 0) -> tuple[int, int]:
+    """Gates for one bit: (sum, carry out). `c_out`: the carry's output pin."""
+    half = b.gate("XOR", a, x)
+    s = b.gate("XOR", half, c, b_out=c_out)
+    carry = b.gate("OR", b.gate("AND", a, x), b.gate("AND", half, c, b_out=c_out))
+    return s, carry
+
+
+def full_adder() -> Snapshot:
+    """a, b, c -> s, co."""
+    b = _Board()
+    a, x, c = _ins(b, ["a", "b", "c"])
+    s, co = _full_adder(b, a, x, c)
+    out_s, out_co = _outs(b, ["s", "co"])
+    b.wire(s, out_s), b.wire(co, out_co)
+    return b.snapshot()
+
+
+def adder(n: int, nest: bool) -> Snapshot:
+    """a0 .. a(n-1), b0 .. b(n-1), cin -> s0 .. s(n-1), cout (bit 0 the lowest)."""
+    b = _Board()
+    ins = _ins(b, [f"a{i}" for i in range(n)] + [f"b{i}" for i in range(n)] + ["cin"])
+    outs = _outs(b, [f"s{i}" for i in range(n)] + ["cout"])
+    carry, carry_out = ins[-1], 0
+    for i in range(n):
+        if nest:
+            fa = b.add(MACRO + "fa")
+            b.wire(ins[i], fa, 0), b.wire(ins[n + i], fa, 1), b.wire(carry, fa, 2, carry_out)
+            b.wire(fa, outs[i], 0, 0)
+            carry, carry_out = fa, 1
+        else:
+            s, carry = _full_adder(b, ins[i], ins[n + i], carry)
+            b.wire(s, outs[i])
+    b.wire(carry, outs[-1], 0, carry_out)
+    return b.snapshot()
+
+
+def adder_script(n: int, rng: np.random.Generator, flips: int) -> Iterator[Step]:
+    cur = _random_bits(rng, 2 * n + 1)
+    a = int(_text(cur[:n])[::-1] or "0", 2)
+    x = int(_text(cur[n : 2 * n])[::-1] or "0", 2)
+    c = int(cur[-1])
+
+    def total(a: int, x: int, c: int) -> str:
+        return format(a + x + c, f"0{n + 1}b")[::-1]  # s0 .. s(n-1), cout
+
+    yield ((0, _text(cur)),), True, lambda a=a, x=x, c=c: total(a, x, c)
+    while True:
+        at = _flips(rng, cur, flips)
+        for i in at:
+            if i < n:
+                a ^= 1 << i
+            elif i < 2 * n:
+                x ^= 1 << (i - n)
+            else:
+                c ^= 1
+        yield _sets(cur, at), True, lambda a=a, x=x, c=c: total(a, x, c)
+
+
+# ---- the kinds -----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Kind:
+    name: str
+    build: Callable[[int, bool], Snapshot]  # depth, nest -> the macro
+    script: Callable[[int, np.random.Generator, int], Iterator[Step]]  # depth, rng, flips
+    work: Callable[[int], int]  # per clock / vector
+    path: Callable[[int], int] | None  # ticks the longest path needs (None: measure it)
+    depths: tuple[int, ...]  # the default
+    most: int  # the deepest it'll build
+    edges: int = 1  # edges (runs) per clock
+
+
+KINDS = {
+    k.name: k
+    for k in (
+        Kind("sipo", lambda n, _: sipo(n), sipo_script, lambda n: n, None, (8, 64, 512, 4096), 1 << 20, 2),
+        Kind("piso", lambda n, _: piso(n), piso_script, lambda n: n, None, (8, 64, 512, 4096), 1 << 20, 2),
+        Kind("tree-and", lambda n, nest: tree("AND", n, nest), tree_script("AND"), lambda n: 2**n - 1, lambda n: n + 1, (4, 8, 12, 16), 22),
+        Kind("tree-xor", lambda n, nest: tree("XOR", n, nest), tree_script("XOR"), lambda n: 2**n - 1, lambda n: n + 1, (4, 8, 12, 16), 22),
+        Kind("decoder", lambda n, _: decoder(n), decoder_script, _decoder_gates, lambda n: _decoder_depth(n) + 1, (4, 8, 12, 16), 18),
+        Kind("adder", adder, adder_script, lambda n: 5 * n, lambda n: 2 * n + 3, (8, 64, 512), 1 << 16),
+    )
+}
+ALIASES = {"tree": ("tree-and", "tree-xor"), "shift": ("sipo", "piso")}
+
+
+def make_project(root: Path, plan: list[tuple[str, int]], nest: bool = False) -> Engine:
+    """A throwaway project under data root `root` with the circuits in `plan` (kind,
+    depth) in it, as macros "<kind> <depth>", plus the macros they're made of."""
     path = root / "projects" / PROJECT
     (path / "macros").mkdir(parents=True)
     (path / "project.json").write_text('{"pijl": 1}\n', encoding="utf-8")
     eng = Engine(path)
-    eng.store.save("dff", dff())
-    eng.store.save("pstage", stage(), eng.catalog)
-    for kind in kinds:
-        for n in depths:
-            eng.store.save(f"{kind} {n}", (sipo if kind == "sipo" else piso)(n), eng.catalog)
+    save = eng.store.save
+    kinds = {k for k, _ in plan}
+    if kinds & {"sipo", "piso"}:
+        save("dff", dff())
+        save("pstage", stage(), eng.catalog)
+    if nest and "adder" in kinds:
+        save("fa", full_adder())
+    for gate in ("and", "xor"):
+        deepest = max((n for k, n in plan if k == f"tree-{gate}"), default=0)
+        if nest:  # every level, from the bottom: each is made of the one below
+            for n in range(1, deepest):
+                save(f"tree-{gate} {n}", tree(gate.upper(), n, True), eng.catalog)
+    for kind, n in plan:
+        save(f"{kind} {n}", KINDS[kind].build(n, nest), eng.catalog)
     return eng
-
-
-# ---- the stimulus: one script, run by every layer ------------------------------------
-
-
-def script(kind: str, n: int, seed: int) -> Iterator[Step]:
-    """Edges to apply (input bits from the first input on: a short string leaves the
-    rest as they are), each with whether to read after it and what must come out."""
-    rng = np.random.default_rng(seed)
-    if kind == "sipo":  # inputs D, C; outputs q1..qn
-        fed = bytearray()  # every bit so far
-
-        def window(k: int) -> str:
-            """q1..qn after k bits went in: the last n, newest first; X where none got yet."""
-            got = fed[max(0, k - n) : k][::-1].decode()
-            return got + "X" * (n - len(got))
-
-        while True:
-            for b in rng.integers(0, 2, 4096).tolist():
-                d = "01"[b]
-                yield d + "0", False, None  # C low: the masters take D
-                fed.append(48 + b)
-                k = len(fed)
-                yield d + "1", True, lambda k=k: window(k)  # C high: all move one along
-    else:  # inputs SI, L, C, p1..pn; output: the last stage
-        while True:
-            word = "".join("01"[b] for b in rng.integers(0, 2, n).tolist())
-            yield "010" + word, False, None  # L high: the masters take p1..pn
-            yield "011", True, lambda w=word: w[-1]  # the load clock: out = pn
-            for k in range(1, n):
-                yield "000", False, None
-                yield "001", True, lambda w=word, k=k: w[n - 1 - k]  # shifted: out = p(n-k)
 
 
 # ---- the layers ----------------------------------------------------------------------
@@ -206,12 +448,14 @@ class Failed(Exception):
 
 
 def _drive(h: Harness, steps: Iterator[Step], ticks: int | None, seconds: float, ticks_seen: list[int]) -> float:
-    """Clocks per second, in-process: fixed `ticks` per edge, or settle (None)."""
+    """Reads (clocks, vectors) per second, in-process: fixed `ticks` per run, or
+    settle (None)."""
     clocks, t0, warm = 0, 0.0, 8
-    for bits, read, expect in steps:
-        h.set_bits(bits)
+    for sets, read, expect in steps:
+        for start, bits in sets:
+            h.set_bits(bits, start)
         if ticks is None:
-            if not h.settle(1000):
+            if not h.settle(1 << 20):
                 raise Failed("never settled")
             ticks_seen.append(h.last_ticks)
         else:
@@ -219,14 +463,12 @@ def _drive(h: Harness, steps: Iterator[Step], ticks: int | None, seconds: float,
         if read:
             got = h.bits()
             if clocks % CHECK_EVERY == 0 and got != (want := expect()):
-                raise Failed(f"clock {clocks}: read {_short(got)}, expected {_short(want)}")
+                raise Failed(f"read {clocks}: got {_short(got)}, expected {_short(want)}")
             clocks += 1
             if clocks == warm:
                 t0 = time.perf_counter()
-            elif clocks > warm and clocks % 16 == 0:
-                elapsed = time.perf_counter() - t0
-                if elapsed >= seconds:
-                    return (clocks - warm) / elapsed
+            elif clocks > warm and (elapsed := time.perf_counter() - t0) >= seconds:
+                return (clocks - warm) / elapsed
     raise AssertionError("scripts don't end")
 
 
@@ -237,9 +479,24 @@ def _command() -> list[str]:
     return [sys.executable, "-m", "pijl"]
 
 
+def encode(sets: tuple[tuple[int, str], ...], n_in: int) -> bytes:
+    """One step as --raw stream bytes: a whole vector as is (it runs by itself);
+    anything else as a prefix and/or @n=L addresses, then ";" to run."""
+    if len(sets) == 1 and sets[0][0] == 0 and len(sets[0][1]) == n_in:
+        return sets[0][1].encode()
+    out = bytearray()
+    for start, bits in sets:
+        if start == 0:
+            out += bits.encode()
+        else:
+            for j, c in enumerate(bits):
+                out += b"@%d=%s" % (start + j + 1, c.encode())
+    return bytes(out + b";")
+
+
 def _pipe(root: Path, macro: str, n_in: int, n_out: int, steps: Iterator[Step], ticks: int, seconds: float) -> float:
-    """Clocks per second through a child `pijl run --raw`: vectors down stdin, a "?"
-    after each clock, the answers read back on a thread and (every 64th) checked at
+    """Reads per second through a child `pijl run --raw`: steps down stdin, a "?"
+    after each read, the answers read back on a thread and (every 64th) checked at
     the end."""
     cmd = _command() + ["--data", str(root), "-p", PROJECT, "run", macro, "--raw", "--ticks", str(ticks), "--noise", "0"]
     with tempfile.TemporaryFile() as errors:
@@ -269,12 +526,12 @@ def _talk(cmd: list[str], errors, n_in: int, n_out: int, steps: Iterator[Step], 
     reads = 0
 
     def clocks_of(k: int) -> bytes:
-        """The next k clocks of the script, as raw stream bytes."""
+        """The next k reads' worth of the script, as raw stream bytes."""
         nonlocal reads
         out = bytearray()
         while k:
-            bits, is_read, expect = next(steps)
-            out += bits.encode() + (b";" if len(bits) < n_in else b"")
+            sets, is_read, expect = next(steps)
+            out += encode(sets, n_in)
             if is_read:
                 out += b"?"
                 if reads % CHECK_EVERY == 0:
@@ -313,63 +570,103 @@ def _talk(cmd: list[str], errors, n_in: int, n_out: int, steps: Iterator[Step], 
 
 
 def main(args) -> int:
-    kinds = _pick(args.kind, KINDS, "kind")
+    kinds = _kinds(args.kind)
     layers = _pick(args.layers, LAYERS, "layer")
+    if kinds is None or layers is None:
+        return 2
     try:
-        depths = [int(d) for d in args.depth.split(",") if d.strip()]
-        if not depths or min(depths) < 1:
+        given = [int(d) for d in args.depth.split(",") if d.strip()] if args.depth else None
+        if given is not None and (not given or min(given) < 1):
             raise ValueError
     except ValueError:
         print(f"pijl: --depth: {args.depth!r} isn't a list of depths (8,64,...)", file=sys.stderr)
         return 2
-    if kinds is None or layers is None:
+    if args.flips < 1:
+        print("pijl: --flips must be at least 1", file=sys.stderr)
+        return 2
+    plan = [(k, n) for k in kinds for n in (given or KINDS[k].depths)]
+    too_deep = [f"{k} {n} (at most {KINDS[k].most})" for k, n in plan if n > KINDS[k].most]
+    if too_deep:
+        print(f"pijl: too deep: {', '.join(too_deep)}", file=sys.stderr)
         return 2
     print(f"bogobips: BIt-shifts Per Second ({_versions()})", flush=True)
+    if args.nest:
+        print("trees and adders built from nested macros", flush=True)
     root = Path(tempfile.mkdtemp(prefix="pijl-bogobips-"))
-    status, peak = 0, (0.0, "")
+    status, peak = 0, {}
     try:
-        eng = make_project(root, kinds, depths)
-        print(f"{'kind':5} {'depth':>6} {'build':>8} {'ticks/clock':>11}" + "".join(f" {lay:>9}" for lay in layers), flush=True)
-        for kind in kinds:
-            for n in depths:
-                macro = f"{kind} {n}"
-                t0 = time.perf_counter()
-                h = eng.harness(macro, settle_ticks=0)
-                built = time.perf_counter() - t0
-                steps = script(kind, n, args.seed)
-                seen: list[int] = []
-                cells: dict[str, str] = {}
-                try:  # settle first: it measures the ticks the fixed-tick layers use
-                    rate = _drive(h, steps, None, args.seconds if "settle" in layers else 0, seen)
-                    if "settle" in layers:
-                        cells["settle"] = _si(rate * n)
-                except Failed as e:
-                    cells["settle"] = "FAIL"
-                    print(f"  {macro}, settle: {e}", file=sys.stderr)
-                ticks = max(seen, default=0) or 1
-                for layer in ("engine", "pipe"):
-                    if layer not in layers or cells.get("settle") == "FAIL":
-                        continue
-                    try:
-                        if layer == "engine":
-                            rate = _drive(h, steps, ticks, args.seconds, [])
-                        else:
-                            rate = _pipe(root, macro, len(h.inputs), len(h.outputs), script(kind, n, args.seed), ticks, args.seconds)
-                        cells[layer] = _si(rate * n)
-                        if rate * n > peak[0]:
-                            peak = (rate * n, f"{kind} {n}, {layer}")
-                    except Failed as e:
-                        cells[layer] = "FAIL"
-                        print(f"  {macro}, {layer}: {e}", file=sys.stderr)
-                if "FAIL" in cells.values():
-                    status = 1
-                row = f"{kind:5} {n:>6} {built * 1000:>6.0f}ms {2 * ticks:>11}"
-                print(row + "".join(f" {cells.get(lay, '-'):>9}" for lay in layers), flush=True)
+        t0 = time.perf_counter()
+        eng = make_project(root, plan, args.nest)
+        print(f"(generated in {time.perf_counter() - t0:.1f}s)", flush=True)
+        head = f"{'kind':8} {'depth':>6} {'work':>8} {'build':>8} {'ticks/clock':>11}"
+        print(head + "".join(f" {lay:>9}" for lay in layers), flush=True)
+        for kind, n in plan:
+            row, rates = _measure(eng, root, KINDS[kind], n, layers, args)
+            print(row, flush=True)
+            if rates is None:
+                status = 1
+                continue
+            for layer, bips in rates.items():
+                if bips > peak.get(kind, (0.0, ""))[0]:
+                    peak[kind] = (bips, f"{n}, {layer}")
     finally:
         shutil.rmtree(root, ignore_errors=True)
-    if peak[0]:
-        print(f"peak: {_si(peak[0])} BogoBIPS ({peak[1]})")
+    for kind, (bips, where) in peak.items():
+        print(f"peak {kind}: {_si(bips)} BogoBIPS (depth {where})")
     return status
+
+
+def _measure(eng: Engine, root: Path, k: Kind, n: int, layers: list[str], args) -> tuple[str, dict[str, float] | None]:
+    """One row of the table, and BIPS by layer (None if a cell failed)."""
+    macro = f"{k.name} {n}"
+    t0 = time.perf_counter()
+    h = eng.harness(macro, settle_ticks=0)
+    built = time.perf_counter() - t0
+    work = k.work(n)
+    rng = np.random.default_rng(args.seed)
+    steps = k.script(n, rng, args.flips)
+    seen: list[int] = []
+    cells: dict[str, str] = {}
+    rates: dict[str, float] = {}
+    try:  # settle first: it measures the ticks the fixed-tick layers use
+        rate = _drive(h, steps, None, args.seconds if "settle" in layers else 0, seen)
+        if "settle" in layers:
+            cells["settle"] = _si(rate * work)
+            rates["settle"] = rate * work
+    except Failed as e:
+        cells["settle"] = "FAIL"
+        print(f"  {macro}, settle: {e}", file=sys.stderr)
+    ticks = max(max(seen, default=0), k.path(n) if k.path else 0) or 1
+    for layer in ("engine", "pipe"):
+        if layer not in layers or cells.get("settle") == "FAIL":
+            continue
+        try:
+            if layer == "engine":
+                rate = _drive(h, steps, ticks, args.seconds, [])
+            else:
+                fresh = k.script(n, np.random.default_rng(args.seed), args.flips)
+                rate = _pipe(root, macro, len(h.inputs), len(h.outputs), fresh, ticks, args.seconds)
+            cells[layer] = _si(rate * work)
+            rates[layer] = rate * work
+        except Failed as e:
+            cells[layer] = "FAIL"
+            print(f"  {macro}, {layer}: {e}", file=sys.stderr)
+    row = f"{k.name:8} {n:>6} {_si(work):>8} {built * 1000:>6.0f}ms {k.edges * ticks:>11}"
+    row += "".join(f" {cells.get(lay, '-'):>9}" for lay in layers)
+    return row, (None if "FAIL" in cells.values() else rates)
+
+
+def _kinds(text: str) -> list[str] | None:
+    picked: list[str] = []
+    for t in (t.strip() for t in text.split(",")):
+        if t:
+            picked += ALIASES.get(t, (t,))
+    bad = [t for t in picked if t not in KINDS]
+    if bad or not picked:
+        known = ", ".join([*KINDS, *ALIASES])
+        print(f"pijl: unknown kind {', '.join(bad) or '(none)'}; pick from {known}", file=sys.stderr)
+        return None
+    return [k for k in KINDS if k in picked]
 
 
 def _pick(text: str, known: tuple[str, ...], what: str) -> list[str] | None:
