@@ -17,8 +17,10 @@ TAKES_POKES = False  # (doesn't need to know what was written from outside)
 def step(c: Circuit) -> None:
     if c._nets_dirty:
         c._rebuild_nets()
-    # Phase 1: every part computes outputs from current inputs (see sim/batches.py).
+    # Phase 1: every part computes outputs from current inputs (see sim/batches.py),
+    # every compiled macro takes its tick (sim/compile.py)
     c._run_all()
+    c._unsettled = c._run_programs()[1]  # (a compiled macro's state still moving)
     # Phase 2: every net resolves its drivers and hands the value to its readers.
     c._carry()
     c.tick += 1
@@ -32,6 +34,6 @@ def run_until_stable(c: Circuit, limit: int) -> int | None:
     for n in range(limit + 1):
         before = c._pins.states.copy()
         c.step()
-        if not c._settling and np.array_equal(before, c._pins.states):
+        if not c._settling and not c._unsettled and np.array_equal(before, c._pins.states):
             return n
     return None

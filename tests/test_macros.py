@@ -366,7 +366,10 @@ def test_wrapping_parts_in_macros_never_changes_behavior(seed):
     body2, body_inner, inst2 = wrap(body, inner_set, "inner")
     cat = catalog({"outer": body2, "inner": body_inner})
 
-    c_flat, c_wrap = Circuit(), Circuit(cat)
+    from pijl.sim.config import EngineConfig, default
+
+    flat_config = EngineConfig.parse("compile=off", default())  # (compiled: timing changes)
+    c_flat, c_wrap = Circuit(config=flat_config), Circuit(cat, config=flat_config)
     p_flat = build_any(c_flat, flat)
     p_wrap = build_any(c_wrap, outer)
 

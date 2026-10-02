@@ -115,11 +115,18 @@ def test_nested_macros_and_files_outside_the_project(project, tmp_path):
     assert h.macro.title == "loose one" and h.apply({"a": 1}) ["sum"] in (ONE, X)
 
 
-def test_oscillation_gives_up():
-    quiet = Engine("bench").harness("ring", settle_ticks=0)
+@pytest.mark.parametrize("compile", ["off", "mixed", "zero"])
+def test_oscillation_gives_up(compile):
+    from pijl.sim.config import EngineConfig, default
+
+    config = EngineConfig.parse(f"compile={compile}", default())
+    quiet = Engine("bench").harness("ring", settle_ticks=0, config=config)
     assert quiet.settle() and quiet.read() == {"y": X}  # no noise: X forever, which is stable
-    h = Engine("bench").harness("ring")  # noise picks 0s and 1s: then it runs around
-    assert not h.settle(limit=200) and h.last_ticks is None
+    h = Engine("bench").harness("ring", config=config)  # noise picks 0s and 1s ...
+    if compile == "zero":  # ... and a compiled loop that won't settle within a tick goes X
+        assert h.settle(limit=200) and h.read() == {"y": X}
+        return
+    assert not h.settle(limit=200) and h.last_ticks is None  # ... then it runs around
     h.step(3)  # exact ticks still work
     assert h.tick > 200
 
@@ -167,7 +174,11 @@ def test_cli_stream_keeps_state_and_mixes_formats(capsys, monkeypatch):
 
 
 def test_cli_unstable_exit_status(capsys, monkeypatch):
-    status, out, err = cli(capsys, monkeypatch, "run", "ring", "--max-ticks", "200")
+    # (compile=zero would settle the ring to X: see test_oscillation_gives_up)
+    from pijl.sim import config
+
+    monkeypatch.setattr(config, "_default", config.default())  # (--engine sets it)
+    status, out, err = cli(capsys, monkeypatch, "--engine", "compile=off", "run", "ring", "--max-ticks", "200")
     assert status == 3 and "not stable" in err and out.startswith("y=")
 
 
