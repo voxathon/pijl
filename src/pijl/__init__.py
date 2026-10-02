@@ -1,6 +1,6 @@
 import logging
 
-__version__ = "0.3.4"  # (also in pyproject.toml; a test keeps them equal)
+__version__ = "0.3.4.post1"  # (also in pyproject.toml; a test keeps them equal)
 
 # pijl logs to the "pijl.*" loggers (pijl.app, .mods, .files, .edit, .ui, .sim) and
 # attaches no handlers: a mod (or a program using pijl) decides where it goes. The
