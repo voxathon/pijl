@@ -1,24 +1,16 @@
 """Dragging through a real editor: the drop is recorded as a move (a delta in the undo
 history, not a copy of every part), and undo / redo put everything back exactly.
-Needs a GL window; skipped where one can't be made."""
-
-import os
+Needs GL (a hidden window, see hidden_editor.py); skipped where there's none."""
 
 import numpy as np
 
 import pytest
+from hidden_editor import hidden_editor
 
 
 @pytest.fixture(scope="module")
 def ed(tmp_path_factory):
-    os.environ["PIJL_DATA"] = str(tmp_path_factory.mktemp("pijl-data"))
-    try:
-        from pijl.ui.editor import Editor
-
-        editor = Editor()
-    except Exception as e:  # (no display / GL)
-        pytest.skip(f"no editor window here: {e}")
-    editor._enable_event_queue = False  # dispatch synthetic events right away
+    editor = hidden_editor(tmp_path_factory)
     editor._clear_board()
     editor._reset_history(None)
     yield editor

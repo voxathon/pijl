@@ -1,10 +1,10 @@
 """Looking inside placed macros (right-click -> View, see ui/inside.py): the views show
 the instance's own hidden parts, live; nothing inside can be edited; backing out
-puts the board back exactly. Needs a GL window; skipped where one can't be made."""
-
-import os
+puts the board back exactly. Needs GL (a hidden window, see hidden_editor.py); skipped
+where there's none."""
 
 import pytest
+from hidden_editor import hidden_editor
 
 from pijl.logic import ONE, ZERO
 from pijl.snapshot import Snapshot
@@ -14,14 +14,7 @@ from test_macros import half_adder, w
 
 @pytest.fixture(scope="module")
 def ed(tmp_path_factory):
-    os.environ["PIJL_DATA"] = str(tmp_path_factory.mktemp("pijl-data"))
-    try:
-        from pijl.ui.editor import Editor
-
-        editor = Editor()
-    except Exception as e:  # (no display / GL)
-        pytest.skip(f"no editor window here: {e}")
-    editor._enable_event_queue = False  # dispatch synthetic events right away
+    editor = hidden_editor(tmp_path_factory)
     editor.store.save("ha", half_adder(), editor.catalog, "ha")
     wrap = Snapshot(
         {

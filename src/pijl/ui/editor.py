@@ -262,16 +262,26 @@ def _direction(
 
 class Editor(pyglet.window.Window):
     def __init__(
-        self, project: str | None = None, settle_ticks: int = SETTLE_TICKS
+        self,
+        project: str | None = None,
+        settle_ticks: int = SETTLE_TICKS,
+        visible: bool = True,
     ) -> None:
-        """`project`: the one to open (default: the one open last)."""
+        """`project`: the one to open (default: the one open last). `visible=False`: a
+        window that never shows (the tests drive it with synthetic events)."""
         self.settle_ticks = settle_ticks
         self.relaunch = False  # closed with "Back to launcher" (see run)
         self.history: History | None = (
             None  # set up by _start_document; checked by dispatch_event
         )
         super().__init__(
-            1280, 720, caption="pijl", resizable=True, vsync=True, config=_make_config()
+            1280,
+            720,
+            caption="pijl",
+            resizable=True,
+            vsync=visible,
+            visible=visible,
+            config=_make_config(),
         )
         # the open document: a macro, or an untitled board (set early: the picker asks about it)
         self.doc: str | None = None  # its macro's id (see storage.py); None = untitled

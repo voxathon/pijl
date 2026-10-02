@@ -1,25 +1,18 @@
 """Free wire ends through a real editor: ending a wire on nothing, unplugging by
 deleting a part, carrying a free end onto a pin, and undo / save of all that.
-Needs a GL window; skipped where one can't be made."""
+Needs GL (a hidden window, see hidden_editor.py); skipped where there's none."""
 
 import json
-import os
 
 import pytest
+from hidden_editor import hidden_editor
 
 from pijl.sim import FREE
 
 
 @pytest.fixture(scope="module")
 def ed(tmp_path_factory):
-    os.environ["PIJL_DATA"] = str(tmp_path_factory.mktemp("pijl-data"))
-    try:
-        from pijl.ui.editor import Editor
-
-        editor = Editor()
-    except Exception as e:  # (no display / GL)
-        pytest.skip(f"no editor window here: {e}")
-    editor._enable_event_queue = False  # dispatch synthetic events right away
+    editor = hidden_editor(tmp_path_factory)
     yield editor
     editor.close()
 
