@@ -118,6 +118,9 @@ PIN_RADIUS = 6
 GRID = 10
 GRID_MAJOR_EVERY = 4
 SUBGRID_DIVISIONS = 2  # Ctrl+Shift snaps to GRID / this (off the pin grid, on purpose)
+# Snap points are never closer than this on screen: zoomed out, Ctrl snaps to the
+# first grid level (GRID, x GRID_MAJOR_EVERY, ...) that's at least this far apart.
+GRID_SNAP_MIN_PX = 8
 PIN_SPACING = 20
 PART_WIDTH = 80
 IO_WIDTH = 40

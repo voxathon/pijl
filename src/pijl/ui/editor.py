@@ -85,8 +85,9 @@ Controls
                            Every finished edit is recorded automatically; see document.py.
   right-drag empty space   pan (middle-drag pans in any mode)
   W A S D                  move the view (slower than dragging; speed in theme.py)
-  hold Ctrl                snap parts and wire bends to the grid
-  hold Ctrl+Shift          snap to the finer subgrid instead
+  hold Ctrl                snap parts and wire bends to the grid (zoomed out: to the coarser
+                           lines on screen; holding Ctrl draws exactly the snap lines)
+  hold Ctrl+Shift          snap one level finer instead (at the pin grid: the subgrid)
   scroll                   zoom
   Home                     reset the camera
   Ctrl+Home                fit the camera to the parts (with a margin)
@@ -146,7 +147,7 @@ from .document import (
     rewire,
 )
 from .duplicate import DOWN, RIGHT, Cell, Tiling, tiled
-from .grid import Grid
+from .grid import Grid, snap_step
 from .inside import Level, PinProbe, build_scene, free_scene, put_scene, take_scene
 from .library import Library, LibraryHistory, Step
 from .line_edit import LineEdit
@@ -2671,11 +2672,19 @@ class Editor(pyglet.window.Window):
         shift = self.keys[key.LSHIFT] or self.keys[key.RSHIFT]
         return T.SUBGRID_DIVISIONS if self.snapping and shift else 1
 
-    def snapped(self, wx: float, wy: float) -> Point:
-        """Round to the nearest grid (or, with Ctrl+Shift, subgrid) point while Ctrl is held."""
+    @property
+    def snap_step(self) -> float:
+        """World units between snap points right now: grows as you zoom out, following
+        the grid lines on screen (see grid.snap_step). 0 while not snapping."""
         if not self.snapping:
+            return 0.0
+        return snap_step(self.camera.zoom, self.grid_divisions)
+
+    def snapped(self, wx: float, wy: float) -> Point:
+        """Round to the nearest snap point (see snap_step) while Ctrl is held."""
+        step = self.snap_step
+        if not step:
             return wx, wy
-        step = T.GRID / self.grid_divisions
         return round(wx / step) * step, round(wy / step) * step
 
     def _follow_cursor(self) -> None:
@@ -2931,8 +2940,7 @@ class Editor(pyglet.window.Window):
         self.grid.draw(
             self,
             self.camera,
-            emphasized=self.snapping,  # also paints the background
-            divisions=self.grid_divisions,
+            snapping=self.snap_step,  # also paints the background
             inside=bool(self.inside),
         )
         self.view = self.camera.matrix()

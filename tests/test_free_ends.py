@@ -350,3 +350,38 @@ def test_ctrl_double_click_starts_on_the_grid_ctrl_shift_on_the_subgrid(board):
             ed.dispatch_event("on_key_release", k, mods)
         ed._cancel()
         ed.empty_click = (0.0, (0.0, 0.0))
+
+
+def test_snapping_follows_the_grid_lines_on_screen():
+    from pijl.ui import theme as T
+    from pijl.ui.grid import snap_step
+
+    big = T.GRID * T.GRID_MAJOR_EVERY
+    assert snap_step(1.0) == T.GRID and snap_step(1.0, T.SUBGRID_DIVISIONS) == T.GRID / 2
+    zoom = 0.5  # GRID is 5 px apart on screen: too fine, the next level is used
+    assert T.GRID * zoom < T.GRID_SNAP_MIN_PX <= big * zoom
+    assert snap_step(zoom) == big and snap_step(zoom, T.SUBGRID_DIVISIONS) == T.GRID
+    assert snap_step(4.0) == T.GRID  # never finer than the pin grid without Shift
+
+
+def test_ctrl_double_click_zoomed_out_starts_on_the_coarser_grid(board):
+    from pyglet.window import key
+
+    from pijl.ui import theme as T
+
+    ed = board
+    level = ed.camera.level
+    ed.camera.level = -8  # zoom 0.5
+    try:
+        big = T.GRID * T.GRID_MAJOR_EVERY
+        off = (403.0, 397.0)
+        ed.dispatch_event("on_key_press", key.LCTRL, key.MOD_CTRL)
+        click(ed, off, modifiers=key.MOD_CTRL)
+        click(ed, off, modifiers=key.MOD_CTRL)
+        assert ed.mode.name == "WIRING" and ed.wire_start_pos == (400, 400)
+        assert all(c % big == 0 for c in ed.wire_start_pos)
+        ed.dispatch_event("on_key_release", key.LCTRL, 0)
+        ed._cancel()
+        ed.empty_click = (0.0, (0.0, 0.0))
+    finally:
+        ed.camera.level = level

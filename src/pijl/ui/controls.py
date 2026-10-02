@@ -109,7 +109,7 @@ CONTROLS: list[tuple[str, list[tuple[str, str]]]] = [
             ("W A S D", "pan, slower"),
             ("Home", "reset the camera"),
             ("Ctrl+Home", "fit the camera to the parts"),
-            ("hold Ctrl", "snap to the grid (Ctrl+Shift: the finer subgrid)"),
+            ("hold Ctrl", "snap to the grid lines on screen (Ctrl+Shift: one level finer)"),
             ("Tab", "pin names + hovered pin levels: hidden -> hover -> always"),
             ("right-click a placed macro", "View: look inside, live and read-only"),
             ("  Esc / Backspace", "back out of it (one level)"),

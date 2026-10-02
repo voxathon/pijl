@@ -138,7 +138,7 @@ def frame_hash(ed):
     ed.switch_to()
     # the board only: the HUD shows live timings
     ed.clear()
-    ed.grid.draw(ed, ed.camera, emphasized=ed.snapping, divisions=ed.grid_divisions)
+    ed.grid.draw(ed, ed.camera, snapping=ed.snap_step)
     ed.view = ed.camera.matrix()
     ed.world.draw()
     from pyglet.math import Mat4
