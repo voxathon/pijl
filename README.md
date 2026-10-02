@@ -6,6 +6,10 @@ package circuits into reusable macros.
 ## Performance
 See [BENCH.md](BENCH.md). More benchmarks coming.
 
+## Headless
+Macros run without the editor too: from Python, the command line, or as a
+co-process over a pipe. See [HEADLESS.md](HEADLESS.md).
+
 ## Install
 
 ```bash

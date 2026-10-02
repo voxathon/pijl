@@ -17,6 +17,7 @@ never import pyglet.
     pijl run "half adder" --table      every 0/1 combination
     pijl run counter -                 a stream: one line in, one line out
     pijl run counter --raw             a raw stream, for speed (see _raw)
+    pijl run counter --bin             the binary pipe, for programs (see pijl.pipe)
 
 A stream reads stdin line by line, keeping the circuit's state from line to line,
 and flushes every answer, so another program can hold the macro as a co-process.
@@ -24,6 +25,9 @@ A line is "a=1 b=X" (only those inputs change), a string of bits for all of them
 a JSON object ({"a": 1, "b": "Z"}, answered in JSON), "step N" to just let N ticks
 pass, or "#..." / blank (ignored). After each line the circuit runs until it's
 stable (or --ticks N, exactly N ticks) and the outputs are printed.
+
+--bin speaks framed binary on stdin / stdout instead: batches of packed vectors
+in, packed samples out (see pijl.pipe, and HEADLESS.md for all of headless pijl).
 
 Levels are 0 / 1 / X / Z. In JSON, 0 and 1 are numbers and X and Z strings.
 Exit status: 0 fine, 1 couldn't run, 2 bad arguments or input, 3 something
@@ -128,6 +132,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--noise", type=int, default=64, help="power-on settling ticks, 0 for none (default 64, as the editor)")
     run.add_argument("--seed", type=int, default=0, help="seed for the power-on noise")
     run.add_argument("--raw", action="store_true", help="a raw stream on stdin: vectors of level characters, ? to read (see pydoc pijl.cli)")
+    run.add_argument("--bin", action="store_true", help="the binary pipe on stdin / stdout: framed, packed, batched (see pydoc pijl.pipe)")
     bench = sub.add_parser(
         "bench",
         parents=[common],
@@ -137,7 +142,7 @@ def _parser() -> argparse.ArgumentParser:
     bench.add_argument("name", choices=["bogobips"])
     bench.add_argument("--kind", default="sipo,piso,counter,lfsr,tree,decoder,adder", help="any of sipo, piso (shift: both), counter, lfsr (loop: both), tree-and, tree-xor (tree: both), decoder, adder (default: all)")
     bench.add_argument("--depth", help="depths, comma separated (default: each kind's own; see pydoc pijl.bogobips)")
-    bench.add_argument("--layers", default="engine,settle,pipe", help="which of engine, settle, pipe")
+    bench.add_argument("--layers", default="engine,settle,pipe,bin", help="which of engine, settle, pipe, bin")
     bench.add_argument("--seconds", type=float, default=0.5, help="time spent per measurement (default 0.5)")
     bench.add_argument("--seed", type=int, default=0, help="seed for the random stimulus")
     bench.add_argument("--flips", type=int, default=1, help="inputs flipped per vector, for trees, decoders and adders (default 1)")
@@ -200,6 +205,17 @@ def _run(engine, args) -> int:
 
     out = sys.stdout
     try:
+        if args.bin:
+            if args.values not in ([], ["-"]) or args.table or args.raw or args.json or args.ticks is not None:
+                raise _BadInput("--bin takes no input values, --table, --raw, --json or --ticks (frames say all that)")
+            from .pipe import serve
+
+            first = [h]
+
+            def make(noise: int, seed: int) -> Harness:
+                return first.pop() if first else engine.harness(args.macro, settle_ticks=noise, seed=seed)
+
+            return serve(make, args.noise, args.seed, sys.stdin.buffer, sys.stdout.buffer, args.max_ticks)
         if args.table:
             if args.values:
                 raise _BadInput("--table takes no input values")

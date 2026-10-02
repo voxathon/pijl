@@ -1,7 +1,7 @@
 """bogobips: BIt-shifts Per Second. A play on bogomips, and about as scientific.
 
     pijl bench bogobips [--kind sipo,piso,counter,lfsr,tree,decoder,adder] [--depth ...]
-                        [--layers engine,settle,pipe] [--seconds 0.5] [--seed 0]
+                        [--layers engine,settle,pipe,bin] [--seconds 0.5] [--seed 0]
                         [--flips 1] [--nest] [--engines "dirty=off;dirty=adaptive"]
 
 Circuits built from gates are driven with a seeded random stimulus and read back,
@@ -50,6 +50,9 @@ Three layers, each a column:
     not knowing the timing costs -- or saves, where most of a circuit is idle.
   - pipe:   a child `pijl run --raw` process fed over stdin, answers read back
     from stdout. The whole external I/O round trip.
+  - bin:    a child `pijl run --bin` (the binary pipe, see pipe.py) through
+    pipe.Client: BATCH vectors a RUN frame, two frames in flight, only the reads
+    sampled (a mask).
 
 --engines runs every circuit once per engine config (see pijl/sim/config.py), a row
 each, so code paths can be compared in one run; the pipe's child gets the same one.
@@ -79,12 +82,14 @@ from pathlib import Path
 import numpy as np
 
 from .engine import Engine, Harness
+from .pipe import Client, PipeError, command
 from .sim.config import EngineConfig, default
 from .snapshot import MACRO, Snapshot
 
 PROJECT = "bogo"
-LAYERS = ("engine", "settle", "pipe")
+LAYERS = ("engine", "settle", "pipe", "bin")
 CHECK_EVERY = 64  # reads; the rest are read but not compared
+BATCH = 256  # bin: vectors a RUN frame
 
 # what to drive (input index, levels from there on), read now?, what must come out (made
 # when asked)
@@ -544,13 +549,6 @@ def _drive(h: Harness, steps: Iterator[Step], ticks: int | None, seconds: float,
     raise AssertionError("scripts don't end")
 
 
-def _command() -> list[str]:
-    """How to start pijl again: this interpreter -m pijl, or a frozen build itself."""
-    if "__compiled__" in globals() or getattr(sys, "frozen", False):
-        return [sys.executable]
-    return [sys.executable, "-m", "pijl"]
-
-
 def encode(sets: tuple[tuple[int, str], ...], n_in: int) -> bytes:
     """One step as --raw stream bytes: a whole vector as is (it runs by itself);
     anything else as a prefix and/or @n=L addresses, then ";" to run."""
@@ -572,7 +570,7 @@ def _pipe(
     """Reads per second through a child `pijl run --raw`: steps down stdin, a "?"
     after each read, the answers read back on a thread and (every 64th) checked at
     the end."""
-    cmd = _command() + ["--data", str(root), "-p", PROJECT, "--engine", str(config)]
+    cmd = command() + ["--data", str(root), "-p", PROJECT, "--engine", str(config)]
     cmd += ["run", macro, "--raw", "--ticks", str(ticks), "--noise", "0"]
     with tempfile.TemporaryFile() as errors:
         return _talk(cmd, errors, n_in, n_out, steps, seconds)
@@ -639,6 +637,67 @@ def _talk(cmd: list[str], errors, n_in: int, n_out: int, steps: Iterator[Step], 
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+def _bin(root: Path, macro: str, n_in: int, steps: Iterator[Step], ticks: int, seconds: float, config: EngineConfig) -> float:
+    """Reads per second through a child `pijl run --bin`: the steps as whole
+    vectors, BATCH a frame, the reads picked out by a sample mask; two frames kept
+    in flight; every 64th read checked as its answer comes."""
+    with tempfile.TemporaryFile() as errors:
+        try:
+            p = Client(macro, data=str(root), project=PROJECT, engine=str(config), noise=0, stderr=errors)
+        except PipeError as e:
+            raise Failed(f"the child didn't start: {e}") from None
+        try:
+            return _batches(p, n_in, steps, ticks, seconds)
+        except PipeError as e:
+            errors.seek(0)
+            raise Failed(f"{e} {errors.read().decode(errors='replace').strip()}") from None
+        finally:
+            p.close()
+
+
+def _batches(p: Client, n_in: int, steps: Iterator[Step], ticks: int, seconds: float) -> float:
+    cur = bytearray(b"?" * n_in)  # the inputs as driven: the first step sets them all
+    reads = 0
+
+    def batch() -> tuple[int, list[tuple[int, str]]]:
+        """Send the next BATCH vectors; (how many reads, (sample, expected) checks)."""
+        nonlocal reads
+        rows, mask, checks = [], [], []
+        while len(rows) < BATCH:
+            sets, is_read, expect = next(steps)
+            for start, bits in sets:
+                cur[start : start + len(bits)] = bits.encode()
+            if not reads and not rows and b"?" in cur:
+                raise Failed("the script's first step doesn't drive every input")
+            rows.append(cur.decode())
+            mask.append(is_read)
+            if is_read:
+                if reads % CHECK_EVERY == 0:
+                    checks.append((sum(mask) - 1, expect()))
+                reads += 1
+        p.submit(rows, ticks=ticks, sample=mask)
+        return sum(mask), checks
+
+    def answer(checks: list[tuple[int, str]]) -> None:
+        got = p.receive().strings()
+        for i, want in checks:
+            if got[i] != want:
+                raise Failed(f"a read is {_short(got[i])}, expected {_short(want)}")
+
+    answer(batch()[1])  # warm-up: also waits out the child's start
+    t0, clocks = time.perf_counter(), 0
+    flying: list[list[tuple[int, str]]] = []
+    while time.perf_counter() - t0 < seconds:
+        n, checks = batch()
+        clocks += n
+        flying.append(checks)
+        if len(flying) > 2:
+            answer(flying.pop(0))
+    for checks in flying:
+        answer(checks)
+    return clocks / (time.perf_counter() - t0)
 
 
 # ---- the run -------------------------------------------------------------------------
@@ -723,7 +782,7 @@ def _measure(
         cells["settle"] = "FAIL"
         print(f"  {macro}, settle: {e}", file=sys.stderr)
     ticks = max(max(seen, default=0), k.path(n) if k.path else 0) or 1
-    for layer in ("engine", "pipe"):
+    for layer in ("engine", "pipe", "bin"):
         if layer not in layers or cells.get("settle") == "FAIL":
             continue
         try:
@@ -731,7 +790,10 @@ def _measure(
                 rate = _drive(h, steps, ticks, args.seconds, [])
             else:
                 fresh = k.script(n, np.random.default_rng(args.seed), args.flips)
-                rate = _pipe(root, macro, len(h.inputs), len(h.outputs), fresh, ticks, args.seconds, config)
+                if layer == "pipe":
+                    rate = _pipe(root, macro, len(h.inputs), len(h.outputs), fresh, ticks, args.seconds, config)
+                else:
+                    rate = _bin(root, macro, len(h.inputs), fresh, ticks, args.seconds, config)
             cells[layer] = _si(rate * work)
             rates[layer] = rate * work
         except Failed as e:
