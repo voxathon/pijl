@@ -75,7 +75,7 @@ how to read the gaps:
 - settle way ahead of engine (tree-and, adder): most of the circuit is idle most of the time. the adder at 512 bits is the extreme: engine pays for a carry across all 512 bits on every step, settle only for the few bits that actually rippled, so it's over 100× faster.
 - settle behind engine (tree-xor, decoder, shift registers): there's nothing idle to skip, so the checking is pure cost.
 - pipe about level with engine: talking to pijl from outside costs almost nothing.
-- the engine column flattens out past a few thousand gates (or cells): that's the simulator's real per-gate speed limit. the planned "only re-run gates whose inputs changed" work should lift it a lot for tree-and and the adder, and barely at all for tree-xor. if tree-xor jumps too, something's off.
+- the engine column flattens out past a few thousand gates (or cells): that's the simulator's real per-gate speed limit.
 
 the output is checked against what it should be: a shift register gives back what went in, just later; a tree is an AND or a parity of its inputs; a decoder lights exactly one output; an adder adds. if something breaks, the cell says FAIL instead of showing a number. a FAIL means your engine is cooked.
 
