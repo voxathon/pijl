@@ -79,7 +79,7 @@ Ran with: `uv run pijl bench bogobips --kind counter,lfsr --depth 64,512,4096 --
 
 Ran with: `uv run pijl bench bogobips --kind <kind> --depth <depth> --seconds 3 --layers settle --engines "dirty=off,eval=batches;dirty=off,eval=lut;dirty=adaptive,eval=batches;dirty=adaptive,eval=lut"`, one run per row group (so rows from different runs vary a bit: compare across a row, not down a column)
 
-All on an Intel i5-9600K overclocked to 4.28 GHz, on Windows 10. With Chromium open and Twitch streaming on another window, most likely.
+All on an Intel i5-9600K overclocked to 4.28 GHz, on Windows 10. With Chromium open and Twitch streaming on another window.
 
 ---
 
