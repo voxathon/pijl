@@ -873,6 +873,8 @@ class LauncherWindow(pyglet.window.Window):
             self.edit.line.motion(motion)
             self._show_edit()
 
+    on_text_motion_select = on_text_motion  # (Shift held; no selection: plain motion)
+
     def on_close(self) -> None:
         self.result = None
         super().on_close()

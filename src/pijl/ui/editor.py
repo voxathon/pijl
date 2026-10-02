@@ -1608,6 +1608,10 @@ class Editor(pyglet.window.Window):
         elif self.mode is Mode.RENAMING:
             self.picker.rename_motion(motion)
 
+    # pyglet sends a motion with Shift held (Shift+Backspace too) here instead. There's
+    # no text selection, so it does the plain motion.
+    on_text_motion_select = on_text_motion
+
     # ---- helpers -----------------------------------------------------------
 
     def _open_menu(self, x: float, y: float, items: list[MenuItem]) -> None:
