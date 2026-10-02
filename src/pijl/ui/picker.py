@@ -2,7 +2,9 @@
 
 Screen space (HUD batch), so it ignores the camera. Shows the Library: each
 collection as an expandable section listing its parts, then the loose parts
-(in no collection) below a divider. The editor decides what clicks mean (see
+(in no collection) below a divider. A search field under the header filters
+the list: while it has text, only matching parts show, every collection with
+a match expanded. The editor decides what clicks mean (see
 the controls in editor.py); this module lays out, draws, hit-tests, and
 carries out drags and renames.
 
@@ -30,10 +32,15 @@ from pyglet.gl import GL_SCISSOR_TEST, glDisable, glEnable, glScissor
 from . import theme as T
 from .library import Collection, Library
 from .line_edit import LineEdit
+from .text_field import FieldCursor, TextTarget
 from .views import Box
 
 S = T.UI_SCALE
 HEADER_H, SECTION_H, ROW_H = 36 * S, 26 * S, 24 * S
+SEARCH_H = 30 * S  # the search strip under the header
+SEARCH_MAX = 32
+ARC_R = 5.5 * S  # the refresh button's circle
+ARC_START = 60  # where it starts, degrees (its arrow tip is there)
 BUTTON = 24 * S  # header buttons are squares this big
 BUTTON_GAP = 4 * S  # around the toggle button, which sits at the panel's right edge
 PANEL_W = round(190 * S)
@@ -67,7 +74,8 @@ def approach(value: float, target: float, k: float, eps: float) -> float:
 class Row:
     """One line of the layout: where a row should be, not what's drawn (that's Widget)."""
 
-    what: str  # "section", "part", or "empty" (placeholder in an empty open collection)
+    what: str  # "section", "part", "empty" (placeholder in an empty open collection),
+    # or "none" (nothing matches the search)
     collection: (
         Collection | None
     )  # the section's collection, or the part's (None: loose)
@@ -101,11 +109,13 @@ class ClipGroup(pyglet.graphics.Group):
 
 
 class Layer:
-    """(background, foreground, text) groups: one set per kind of row, one for dragged rows."""
+    """(background, foreground, text) groups: one set per kind of row, one for dragged
+    rows. (`sel`, between foreground and text: a rename field's selected text.)"""
 
     def __init__(self, order: int, parent: pyglet.graphics.Group | None) -> None:
         self.bg = pyglet.graphics.Group(order=order, parent=parent)
         self.fg = pyglet.graphics.Group(order=order + 1, parent=parent)
+        self.sel = pyglet.graphics.Group(order=order + 1.5, parent=parent)
         self.text = pyglet.graphics.Group(order=order + 2, parent=parent)
 
 
@@ -135,7 +145,7 @@ class Widget:
         self.shapes: list = [self.bg]
         self.labels: list[pyglet.text.Label] = []
         self.field: Box | None = None  # rename text field
-        self.caret: shapes.Rectangle | None = None
+        self.cursor: FieldCursor | None = None  # its caret + selection
 
         def label(text, color=T.PART_TEXT, size=FONT_SIZE, anchor_x="left"):
             lb = pyglet.text.Label(
@@ -168,7 +178,9 @@ class Widget:
             self.shapes += [self.chip_border, self.chip]
             self.name = label(picker.name_of(row.part))
         elif self.what == "section":
-            self.angle = self.target_angle = 90.0 if row.collection.open else 0.0
+            self.angle = self.target_angle = (
+                90.0 if picker.expanded(row.collection) else 0.0
+            )
             self.tri = shapes.Triangle(
                 0, 0, 0, 0, 0, 0, color=T.HELP_TEXT[:3], batch=b, group=layer.fg
             )
@@ -179,7 +191,9 @@ class Widget:
             )
         else:
             self.name = label(
-                "drop parts here", color=T.PICKER_DIM_TEXT, size=SMALL_SIZE
+                "drop parts here" if self.what == "empty" else "no parts match",
+                color=T.PICKER_DIM_TEXT,
+                size=SMALL_SIZE,
             )
         self.refresh()
 
@@ -197,7 +211,7 @@ class Widget:
         if self.field is not None:
             for r in (self.field.fill, *self.field.edges):
                 r.group = layer.fg
-            self.caret.group = layer.text
+            self.cursor.set_groups(layer.text, layer.sel)
 
     def refresh(self) -> None:
         """Bring text + rename field up to date with the row's data."""
@@ -214,8 +228,8 @@ class Widget:
         if self.what != "section":
             return
         p, c = self.p, self.row.collection
-        self.target_angle = 90.0 if c.open else 0.0
-        self.count.text = str(len(c.parts))
+        self.target_angle = 90.0 if p.expanded(c) else 0.0
+        self.count.text = str(len(p.shown(c.parts)))
         if c is p.renaming:
             text = p.edit.text
             self.name.text = text or c.name  # empty: the default name as a placeholder
@@ -230,14 +244,8 @@ class Widget:
                     p.batch,
                     self.layer.fg,
                 )
-                self.caret = shapes.Rectangle(
-                    0,
-                    0,
-                    1.5 * S,
-                    16 * S,
-                    color=T.CARET,
-                    batch=p.batch,
-                    group=self.layer.text,
+                self.cursor = FieldCursor(
+                    p.batch, self.layer.text, self.layer.sel, FONT, FONT_SIZE, 16 * S
                 )
             self.count.visible = False
         else:
@@ -246,8 +254,8 @@ class Widget:
             self.count.visible = True
             if self.field is not None:
                 self.field.delete()
-                self.caret.delete()
-                self.field = self.caret = None
+                self.cursor.delete()
+                self.field = self.cursor = None
         self.shown_alpha = -1  # label colors were reset: re-apply the opacity
 
     @staticmethod
@@ -320,9 +328,7 @@ class Widget:
             self.count.position = (x + PANEL_W - PAD - 2 * S, cy, 0)
             if self.field is not None:
                 self.field.position = (nx - 4 * S, y + 3 * S)
-                self.p.measure.text = self.p.edit.text[: self.p.edit.caret]
-                self.caret.position = (nx + self.p.measure.content_width, cy - 8 * S)
-                self.caret.visible = self.p.caret_on
+                self.cursor.place(self.p.edit, nx, cy, self.p.caret_on)
         else:
             self.name.position = (x + PAD + self.indent, cy, 0)
         a = round(255 * self.alpha)
@@ -340,7 +346,7 @@ class Widget:
             lb.delete()
         if self.field is not None:
             self.field.delete()
-            self.caret.delete()
+            self.cursor.delete()
 
 
 class PartPicker:
@@ -385,6 +391,9 @@ class PartPicker:
         self.renaming: Collection | None = None
         self.edit: LineEdit | None = None
         self.caret_on, self._blink_t = True, 0.0
+        # searching: the filter's text, and whether it's being typed in
+        self.query = LineEdit("", SEARCH_MAX)
+        self.searching = False
 
         self.clip = ClipGroup(order=3)
         self.part_layer = Layer(0, self.clip)
@@ -427,6 +436,33 @@ class PartPicker:
         ] = []  # the toggle's «, turning into » as the panel tucks away
         self.buttons: dict[str, tuple[float, float, float, float]] = {}
         self.button_bgs: dict[str, shapes.Rectangle] = {}
+        self.arrowhead: shapes.Triangle | None = None  # the refresh button's arrow tip
+        self.search_box: Box | None = None
+        self._search_alpha = -1
+        self.clear_at = (0.0, 0.0, 0.0, 0.0)  # the search field's "x": (x, y, w, h)
+        self.search_text = pyglet.text.Label(
+            "",
+            font_name=FONT,
+            font_size=FONT_SIZE,
+            anchor_y="center",
+            batch=batch,
+            group=self.header_fg,
+        )
+        self.search_x = pyglet.text.Label(
+            "\u00d7",
+            font_name=FONT,
+            font_size=FONT_SIZE,
+            color=T.PICKER_DIM_TEXT,
+            anchor_x="center",
+            anchor_y="center",
+            batch=batch,
+            group=self.header_fg,
+        )
+        # caret + selected text's highlight: over the field's fill (header_bg), under the text
+        self.search_cursor = FieldCursor(
+            batch, self.header_fg, pyglet.graphics.Group(order=5.5), FONT, FONT_SIZE, 16 * S
+        )
+        self._filtered = ""  # the query the list was last filtered by
         self._build_chrome()
         self.refresh()
         for w in self.widgets.values():  # the first layout doesn't animate in
@@ -449,8 +485,8 @@ class PartPicker:
 
     @property
     def list_top(self) -> float:
-        """Screen y of the top of the list area (the bottom of the header)."""
-        return self.win_h - HEADER_H
+        """Screen y of the top of the list area (the bottom of the search strip)."""
+        return self.win_h - HEADER_H - SEARCH_H
 
     def contains(self, sx: float, sy: float) -> bool:
         return 0 <= sx < self.width and 0 <= sy <= self.win_h
@@ -466,17 +502,23 @@ class PartPicker:
         return next((r for r in self.rows if r.top <= ly < r.top + r.h), None)
 
     def hit(self, sx: float, sy: float) -> Row | str | None:
-        """What's under a screen point: a Row, "toggle" / "new" (header buttons),
-        "header", "blank" (list space without a row), or None (not over the picker)."""
+        """What's under a screen point: a Row, "toggle" / "new" / "refresh" (header
+        buttons), "header", "search" (the search field), "clear" (its "x"), "blank"
+        (list space without a row), or None (not over the picker)."""
         if not self.contains(sx, sy):
             return None
         if not self.open:
             return "toggle"  # the whole tucked-away edge opens it
-        if sy >= self.list_top:
+        if sy >= self.win_h - HEADER_H:
             for name, (x, y, w, h) in self.buttons.items():
                 if x + self.x_off <= sx <= x + self.x_off + w and y <= sy <= y + h:
                     return name
             return "header"
+        if sy >= self.list_top:
+            x, y, w, h = self.clear_at
+            if self.query.text and x + self.x_off <= sx <= x + self.x_off + w:
+                return "clear"
+            return "search"
         return self.row_at(sy) or "blank"
 
     def fit(self, text: str, max_w: float) -> str:
@@ -533,6 +575,72 @@ class PartPicker:
             c.open = open_
         self.refresh()
 
+    # ---- searching -----------------------------------------------------------------
+
+    @property
+    def filtering(self) -> bool:
+        return bool(self.query.text.strip())
+
+    def shown(self, parts: list[str]) -> list[str]:
+        """The parts of `parts` the search lets through (all of them without one)."""
+        q = self.query.text.strip().casefold()
+        if not q:
+            return parts
+        return [p for p in parts if q in self.name_of(p).casefold()]
+
+    def expanded(self, c: Collection) -> bool:
+        """Whether `c` shows its parts: while searching, every collection does."""
+        return c.open or self.filtering
+
+    def first_match(self) -> str | None:
+        """The topmost part in the list (what Enter in the search field picks)."""
+        return next((r.part for r in self.rows if r.what == "part"), None)
+
+    def start_search(self) -> None:
+        self.searching, self.open = True, True
+        self.caret_on, self._blink_t = True, 0.0
+        self.search_box.border_color = T.SELECT
+        self._place_all()
+
+    def stop_search(self, clear: bool = False) -> None:
+        """Stop typing in the search field; `clear`: and empty it (show everything)."""
+        self.searching = False
+        self.query.anchor = None  # (a selection only shows while typing)
+        self.search_box.border_color = T.PICKER_BORDER
+        if clear:
+            self.clear_search()
+        self._place_all()
+
+    def clear_search(self) -> None:
+        self.query = LineEdit("", SEARCH_MAX)
+        self.search_edited()
+
+    def search_input(self, text: str) -> None:
+        self.query.insert(text)
+        self.search_edited()
+
+    def search_motion(self, motion: int, select: bool = False) -> None:
+        self.query.motion(motion, select)
+        self.search_edited()
+
+    def search_target(self) -> TextTarget:
+        """The search field, for the mouse and Ctrl+A / C / X / V (see text_field.py)."""
+        return TextTarget(
+            lambda: self.query,
+            lambda x, y: self.hit(x, y) == "search",
+            lambda x, y: self.search_cursor.index_at(self.query, x),
+            self.search_edited,
+        )
+
+    def search_edited(self) -> None:
+        """After any change to the query or its caret: filter again if the text changed."""
+        self.caret_on, self._blink_t = True, 0.0
+        if self.query.text != self._filtered:
+            self._filtered = self.query.text
+            self.scroll_target = 0.0  # the best matches are at the top
+            self.refresh()
+        self._place_all()
+
     # ---- renaming a collection ----------------------------------------------------
 
     def start_rename(self, c: Collection, fresh: bool = False) -> None:
@@ -549,16 +657,33 @@ class PartPicker:
             self.scroll_target = row.top + row.h - self.list_top
 
     def rename_text(self, text: str) -> None:
-        self.edit.insert(
-            text.upper()
-        )  # collection names are all caps, like the built-in ones
-        self._rename_changed()
+        self.edit.insert(text)
+        self.rename_changed()
 
-    def rename_motion(self, motion: int) -> None:
-        self.edit.motion(motion)
-        self._rename_changed()
+    def rename_motion(self, motion: int, select: bool = False) -> None:
+        self.edit.motion(motion, select)
+        self.rename_changed()
 
-    def _rename_changed(self) -> None:
+    def rename_target(self) -> TextTarget:
+        """The name field, for the mouse and Ctrl+A / C / X / V (see text_field.py)."""
+
+        def widget() -> Widget:
+            return self.widgets[("section", self.renaming)]
+
+        return TextTarget(
+            lambda: self.edit,
+            lambda x, y: widget().field.contains(x, y),
+            lambda x, y: widget().cursor.index_at(self.edit, x),
+            self.rename_changed,
+        )
+
+    def rename_changed(self) -> None:
+        e, old = self.edit, self.edit.text
+        e.text = old.upper()  # collection names are all caps, like the built-in ones
+        # (upper() can lengthen: "ß" -> "SS"; the caret stays after the same letters)
+        e.caret = len(old[: e.caret].upper())
+        if e.anchor is not None:
+            e.anchor = len(old[: e.anchor].upper())
         self.caret_on, self._blink_t = True, 0.0  # keep the caret visible while typing
         self.widgets[("section", self.renaming)].refresh()
         self._place_all()
@@ -647,7 +772,7 @@ class PartPicker:
             ):  # on a header: first in an open collection, into a closed one
                 return (
                     (row.collection, 0)
-                    if row.collection.open
+                    if self.expanded(row.collection)
                     else (row.collection, None)
                 )
             if row.what == "empty":
@@ -705,10 +830,17 @@ class PartPicker:
     def _layout(self) -> list[Row]:
         cols, loose = self._order()
         rows, top = [], 4 * S
+        if self.filtering:  # only matches, and only the collections that have some
+            cols = [(c, self.shown(parts)) for c, parts in cols]
+            cols = [(c, parts) for c, parts in cols if parts]
+            loose = self.shown(loose)
+            if not cols and not loose:
+                rows.append(Row("none", None, top=top))
+                top += ROW_H
         for c, parts in cols:
             rows.append(Row("section", c, top=top, h=SECTION_H))
             top += SECTION_H
-            if c.open:
+            if self.expanded(c):
                 if not parts:
                     rows.append(Row("empty", c, top=top))
                     top += ROW_H
@@ -763,14 +895,18 @@ class PartPicker:
             if w.what != "section" and owner in section_top:
                 w.target_top = section_top[owner]
         self.divider_target = self.loose_top - LOOSE_GAP / 2
-        self.divider.visible = bool(self.lib.loose and self.lib.collections)
+        self.divider.visible = any(r.what == "section" for r in self.rows) and any(
+            r.what == "part" and r.collection is None for r in self.rows
+        )
         drag = self.dragging
         self._drop_c = (
             self.drop[0]
             if drag and drag.what == "part" and self.drop[1] is None
             else None
         )
-        self.drop_box.visible = self._drop_c is not None and not self._drop_c.open
+        self.drop_box.visible = self._drop_c is not None and not self.expanded(
+            self._drop_c
+        )
 
     # ---- animation + drawing ----------------------------------------------------------
 
@@ -778,7 +914,7 @@ class PartPicker:
         """Advance the tweens one frame."""
         k = 1 - math.exp(-SPEED * dt)
         moving = False
-        if self.renaming is not None:
+        if self.renaming is not None or self.searching:
             self._blink_t += dt
             if self._blink_t >= 0.5:
                 self._blink_t, self.caret_on = 0.0, not self.caret_on
@@ -819,6 +955,8 @@ class PartPicker:
         for shape, base_x in self.chrome:
             shape.x = base_x + x_off
         self._place_chevron()
+        self._place_arrowhead()
+        self._place_search()
         for w in self.widgets.values():
             w.place(self.cursor)
         self.divider.position = (
@@ -866,14 +1004,55 @@ class PartPicker:
         rect(0, h - HEADER_H, PANEL_W, line, T.PICKER_BORDER, self.header_fg)
         rect(PANEL_W - line, 0, line, h, T.PICKER_BORDER, self.header_fg)
         label("PARTS", PAD + 2 * S, h - HEADER_H / 2, self.header_fg, color=T.HELP_TEXT)
+        # the search strip, under the header
+        sy = h - HEADER_H - SEARCH_H
+        rect(0, sy, PANEL_W, SEARCH_H, T.PICKER_HEADER, self.header_bg)
+        rect(0, sy, PANEL_W, line, T.PICKER_BORDER, self.header_fg)
+        fx, fh = 6 * S, SEARCH_H - 10 * S
+        fw = PANEL_W - 2 * fx
+        if self.search_box is not None:
+            self.search_box.delete()
+        self.search_box = Box(
+            fw,
+            fh,
+            round(S),
+            T.PICKER_BG,
+            T.SELECT if self.searching else T.PICKER_BORDER,
+            b,
+            self.header_bg,
+        )
+        self.search_box.position = (fx, sy + 5 * S)
+        self._search_alpha = -1  # (a new box: opaque)
+        for r in (self.search_box.fill, *self.search_box.edges):
+            self.chrome.append((r, r.x))
+        self.clear_at = (fx + fw - fh, sy + 5 * S, fh, fh)
         by = h - HEADER_H + (HEADER_H - BUTTON) / 2
-        for i, name in enumerate(("toggle", "new")):
+        for i, name in enumerate(("toggle", "new", "refresh")):
             bx = PANEL_W - BUTTON_GAP - (i + 1) * BUTTON - i * 2 * S
             self.buttons[name] = (bx, by, BUTTON, BUTTON)
             self.button_bgs[name] = rect(
                 bx, by, BUTTON, BUTTON, T.PICKER_HEADER, self.header_bg
             )
         label("+", *self._button_center("new"), self.header_fg, anchor_x="center")
+        # refresh: a circle with a gap at the top right; its arrow tip is placed in _place_arrowhead
+        cx, cy = self._button_center("refresh")
+        arc = shapes.Arc(
+            cx,
+            cy,
+            ARC_R,
+            angle=290,
+            start_angle=ARC_START,
+            thickness=1.25 * S,
+            color=T.PART_TEXT[:3],
+            batch=b,
+            group=self.header_fg,
+        )
+        self.chrome.append((arc, cx))
+        if self.arrowhead is not None:
+            self.arrowhead.delete()
+        self.arrowhead = shapes.Triangle(
+            0, 0, 0, 0, 0, 0, color=T.PART_TEXT[:3], batch=b, group=self.header_fg
+        )
         # The toggle's « is drawn, not typed, so it can turn around its own center (see _place_all).
         for s in self.chevron:
             s.delete()
@@ -916,3 +1095,50 @@ class PartPicker:
                     (cx + px * ca - py * sa, cy + px * sa + py * ca)
                     for px, py in (tip, end)
                 )
+
+    def _place_arrowhead(self) -> None:
+        """The refresh button's arrow tip, where its arc starts, pointing clockwise."""
+        cx, cy = self._button_center("refresh")
+        cx += self.x_off
+        a = math.radians(ARC_START)
+        nx, ny = math.cos(a), math.sin(a)  # outward
+        tx, ty = ny, -nx  # clockwise along the circle
+        ex, ey = cx + ARC_R * nx, cy + ARC_R * ny
+        half, length = 3 * S, 3.5 * S
+        t = self.arrowhead
+        t.x, t.y = ex + tx * length, ey + ty * length
+        t.x2, t.y2 = ex + nx * half, ey + ny * half
+        t.x3, t.y3 = ex - nx * half, ey - ny * half
+
+    def _place_search(self) -> None:
+        """The search field's text (or placeholder), caret and "x"."""
+        fx, fy = self.search_box.position
+        x, cy = fx + 6 * S, fy + self.search_box.h / 2
+        text = self.query.text
+        shown = self.search_cursor.place(
+            self.query,
+            x,
+            cy,
+            caret_on=self.searching and self.caret_on,
+            max_w=self.clear_at[0] + self.x_off - x,
+            selection=self.searching,
+        )
+        shown = shown if text else "search"
+        if self.search_text.text != shown:
+            self.search_text.text = shown
+        color = T.PART_TEXT if text else T.PICKER_DIM_TEXT
+        if tuple(self.search_text.color) != tuple(color):
+            self.search_text.color = color
+            self._search_alpha = -1  # the color reset the opacity: re-apply it
+        self.search_text.position = (x, cy, 0)
+        self.search_x.visible = bool(text)
+        bx, _, bw, _ = self.clear_at
+        self.search_x.position = (bx + self.x_off + bw / 2, cy, 0)
+        # fades as the panel tucks away: its end would stick out next to the »
+        a = round(255 * self.open_t)
+        if a != self._search_alpha:
+            self._search_alpha = a
+            box = self.search_box
+            for s in (box.fill, *box.edges, self.search_text, self.search_x):
+                s.opacity = a
+            self.search_cursor.set_opacity(a)

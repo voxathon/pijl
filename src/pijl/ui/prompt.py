@@ -17,6 +17,7 @@ from pyglet import shapes
 
 from . import theme as T
 from .line_edit import LineEdit
+from .text_field import FieldCursor, TextTarget
 from .views import Box
 
 S = T.UI_SCALE
@@ -44,15 +45,19 @@ class Prompt:
         message: str = "",
         danger: bool = False,
     ) -> None:
-        """`message`: a few lines under the title (wrapped); `danger` draws it red."""
+        """`message`: a few lines under the title (wrapped); `danger` draws it red.
+        A prefilled `text` starts selected: typing replaces it, an arrow keeps it."""
         self.batch = batch
         self.edit = LineEdit(text, max_len) if text is not None else None
+        if self.edit is not None:
+            self.edit.select_all()
         self.items = items
         self.shown: list[str] = []  # items matching the field, best first
         self.selected = 0  # index into shown
         self.offset = 0  # first shown item on screen (the list scrolls)
         self.empty = empty  # what the list says when nothing matches
         self.caret_on, self._blink_t = True, 0.0
+        self._filtered: str | None = None  # the text the list was last filtered by
 
         shade_g, bg, fg, text_g = (
             pyglet.graphics.Group(order=o) for o in (20, 21, 22, 23)
@@ -103,15 +108,14 @@ class Prompt:
             )
 
         self.title = label(title)
-        self.field = self.field_text = self.caret = None
+        self.field = self.field_text = self.cursor = None
         if self.edit is not None:
             self.field = Box(
                 W - 2 * PAD, FIELD_H, max(1, round(S)), T.PICKER_BG, T.SELECT, batch, fg
             )
             self.field_text = label()
-            self.caret = shapes.Rectangle(
-                0, 0, 1.5 * S, 16 * S, color=T.CARET, batch=batch, group=text_g
-            )
+            sel_g = pyglet.graphics.Group(order=22.5)  # over the field, under the text
+            self.cursor = FieldCursor(batch, text_g, sel_g, FONT, SIZE, 16 * S)
         self.rows = [
             (
                 shapes.Rectangle(
@@ -160,15 +164,9 @@ class Prompt:
     def _show(self) -> None:
         """Bring the field, caret and list rows up to date."""
         if self.edit is not None:
-            self.field_text.text = self.edit.text
-            before = pyglet.text.Label(
-                self.edit.text[: self.edit.caret], font_name=FONT, font_size=SIZE
+            self.field_text.text = self.cursor.place(
+                self.edit, self.field_text.x, self.field_text.y, self.caret_on
             )
-            self.caret.position = (
-                self.field_text.x + before.content_width,
-                self.field_text.y - self.caret.height / 2,
-            )
-            self.caret.visible = self.caret_on
         visible = self.shown[self.offset : self.offset + len(self.rows)]
         for i, (row, text) in enumerate(self.rows):
             if i < len(visible):
@@ -199,19 +197,34 @@ class Prompt:
             self.edit.insert(text)
             self._typed()
 
-    def motion(self, motion: int) -> None:
+    def motion(self, motion: int, select: bool = False) -> None:
         if self.edit is not None:
-            self.edit.motion(motion)
+            self.edit.motion(motion, select)
             self._typed()
+
+    def target(self) -> TextTarget | None:
+        """The field, for the mouse and Ctrl+A / C / X / V (see text_field.py)."""
+        if self.edit is None:
+            return None
+        return TextTarget(
+            lambda: self.edit,
+            self.field.contains,
+            lambda x, y: self.cursor.index_at(self.edit, x),
+            self._typed,
+        )
 
     def _typed(self) -> None:
         self.caret_on, self._blink_t = True, 0.0
-        self._refilter()
+        if self.items is None or self.text == self._filtered:
+            self._show()  # (just the caret: the list keeps its highlight)
+        else:
+            self._refilter()
 
     def _refilter(self) -> None:
         if self.items is None:
             self._show()
             return
+        self._filtered = self.text
         q = self.text.strip().casefold()
         hits = [i for i in self.items if q in i.casefold()]
         self.shown = sorted(
@@ -263,7 +276,7 @@ class Prompt:
         if self._blink_t >= 0.5:
             self._blink_t = 0.0
             self.caret_on = not self.caret_on
-            self.caret.visible = self.caret_on
+            self.cursor.caret.visible = self.caret_on
 
     def delete(self) -> None:
         self.shade.delete()
@@ -275,7 +288,7 @@ class Prompt:
         if self.field is not None:
             self.field.delete()
             self.field_text.delete()
-            self.caret.delete()
+            self.cursor.delete()
         for row, text in self.rows:
             row.delete()
             text.delete()

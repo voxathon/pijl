@@ -35,6 +35,7 @@ from ..launcher import Launcher, ModRow, has_console, open_console, version
 from ..parts.settings import Choice, Number, Toggle
 from . import theme as T
 from .line_edit import LineEdit
+from .text_field import FieldCursor, TextMouse, TextTarget, shortcut
 
 W, H = 520, 440  # the window, at UI scale 1
 PAD, GAP = 24, 10
@@ -73,7 +74,7 @@ class _Hit:
 class _Edit:
     line: LineEdit
     label: pyglet.text.Label
-    caret: shapes.Rectangle
+    cursor: FieldCursor
     enter: Callable[[str], None]
     box: tuple[float, float, float, float]  # x, y, w, h
 
@@ -108,6 +109,7 @@ class LauncherWindow(pyglet.window.Window):
         self.hits: list[_Hit] = []
         self.hovered: _Hit | None = None
         self.edit: _Edit | None = None
+        self.text_mouse = TextMouse()  # clicking / dragging in the field
         self.editing: str | None = (
             None  # which row's being edited (a project or a pref)
         )
@@ -215,27 +217,34 @@ class LauncherWindow(pyglet.window.Window):
         )
         self.drawn.append(field)
         label = self._label("", x + 8 * self.s, y + h / 2, anchor_y="center")
-        caret = shapes.Rectangle(
-            0,
-            0,
-            1.5 * self.s,
+        cursor = FieldCursor(
+            self.batch,
+            self._text,
+            self._sel,
+            FONT,
+            11 * self.s,
             h * 0.55,
-            color=T.CARET,
-            batch=self.batch,
-            group=self._text,
+            caret_w=1.5 * self.s,
         )
-        self.edit = _Edit(LineEdit(text, max_len), label, caret, enter, (x, y, w, h))
+        line = LineEdit(text, max_len)
+        line.select_all()  # typing replaces what's there
+        self.edit = _Edit(line, label, cursor, enter, (x, y, w, h))
+        self.text_mouse.forget()
         self._show_edit()
 
     def _show_edit(self) -> None:
         e = self.edit
-        e.label.text = e.line.text
-        before = pyglet.text.Label(
-            e.line.text[: e.line.caret] + "|", font_name=FONT, font_size=11 * self.s
+        e.label.text = e.cursor.place(e.line, e.label.x, e.label.y)
+
+    def _edit_target(self) -> TextTarget:
+        """The field, for the mouse and Ctrl+A / C / X / V (see text_field.py)."""
+        e = self.edit
+        return TextTarget(
+            lambda: e.line,
+            e.contains,
+            lambda x, y: e.cursor.index_at(e.line, x),
+            self._show_edit,
         )
-        bar = pyglet.text.Label("|", font_name=FONT, font_size=11 * self.s)
-        e.caret.x = e.label.x + before.content_width - bar.content_width
-        e.caret.y = e.label.y - e.caret.height / 2
 
     def say(self, text: str, danger: bool = False) -> None:
         """A message on the status line (problems in red), until the next one."""
@@ -269,6 +278,7 @@ class LauncherWindow(pyglet.window.Window):
             self.page, self.scroll, self.editing, self.message = page, 0, None, ""
         self.batch = pyglet.graphics.Batch()
         self._back = pyglet.graphics.Group(0)
+        self._sel = pyglet.graphics.Group(0.5)  # a field's selected text: under the text
         self._text = pyglet.graphics.Group(1)
         self.hits, self.hovered, self.edit = [], None, None
         # what's drawn on the page (pyglet takes a label or shape out of the batch
@@ -815,6 +825,8 @@ class LauncherWindow(pyglet.window.Window):
     def on_mouse_press(self, x, y, button, modifiers) -> None:
         self.keys_shift = bool(modifiers & key.MOD_SHIFT)
         if self.edit is not None and self.edit.contains(x, y):
+            if button == mouse.LEFT:
+                self.text_mouse.press(self._edit_target(), x, y, self.keys_shift)
             return
         hit = self._hit(x, y)
         if self.editing is not None:  # a click outside the field drops the edit
@@ -845,8 +857,20 @@ class LauncherWindow(pyglet.window.Window):
             self.scroll = max(0, min(self.scroll - notches, self._rows - self._fits))
             self.show()
 
+    def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers) -> None:
+        if self.text_mouse.dragging and self.edit is not None:
+            self.text_mouse.drag(self._edit_target(), x, y)
+
+    def on_mouse_release(self, x, y, button, modifiers) -> None:
+        if button == mouse.LEFT:
+            self.text_mouse.release()
+
     def on_key_press(self, symbol, modifiers) -> None:
         self.keys_shift = bool(modifiers & key.MOD_SHIFT)
+        if self.edit is not None and shortcut(
+            self._edit_target(), symbol, modifiers, self
+        ):
+            return  # Ctrl+A / C / X / V in the field
         if self.edit is not None and symbol in (key.ENTER, key.NUM_ENTER):
             self.edit.enter(self.edit.line.text)
         elif symbol == key.ESCAPE:
@@ -868,12 +892,13 @@ class LauncherWindow(pyglet.window.Window):
             self.edit.line.insert(text)
             self._show_edit()
 
-    def on_text_motion(self, motion: int) -> None:
+    def on_text_motion(self, motion: int, select: bool = False) -> None:
         if self.edit is not None:
-            self.edit.line.motion(motion)
+            self.edit.line.motion(motion, select)
             self._show_edit()
 
-    on_text_motion_select = on_text_motion  # (Shift held; no selection: plain motion)
+    def on_text_motion_select(self, motion: int) -> None:  # (Shift held)
+        self.on_text_motion(motion, select=True)
 
     def on_close(self) -> None:
         self.result = None

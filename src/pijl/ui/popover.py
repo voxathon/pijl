@@ -15,6 +15,7 @@ from pyglet import shapes
 from ..parts import Number
 from . import theme as T
 from .line_edit import LineEdit
+from .text_field import FieldCursor, TextTarget
 from .views import Box
 
 S = T.UI_SCALE
@@ -87,9 +88,8 @@ class NumberPopover:
         )
         self.field_text = label()
         self.unit = label(setting.unit, color=T.PICKER_DIM_TEXT, anchor_x="right")
-        self.caret = shapes.Rectangle(
-            0, 0, 1.5 * S, 16 * S, color=T.CARET, batch=batch, group=top
-        )
+        sel = pyglet.graphics.Group(order=22.5)  # over the field, under the text
+        self.cursor = FieldCursor(batch, top, sel, FONT, SIZE, 16 * S)
         self.hint = label(hint, color=T.HELP_TEXT, size=SMALL)
         self.value = value
         self.layout(win_w, win_h)
@@ -134,22 +134,18 @@ class NumberPopover:
         )
 
     def _show_field(self) -> None:
-        self.field_text.text = self.edit.text
-        before = pyglet.text.Label(
-            self.edit.text[: self.edit.caret], font_name=FONT, font_size=SIZE
+        self.field_text.text = self.cursor.place(
+            self.edit, self.field_text.x, self.field_text.y, self.caret_on
         )
-        self.caret.position = (
-            self.field_text.x + before.content_width,
-            self.field_text.y - self.caret.height / 2,
-        )
-        self.caret.visible = self.caret_on
 
     # ---- state -----------------------------------------------------------------
 
     def set_value(self, value) -> None:
-        """Show `value` (None: mixed) on the slider and in the field."""
+        """Show `value` (None: mixed) on the slider and in the field, selected (typing
+        replaces it)."""
         self.value = value
         self.edit = LineEdit(self.shown_text, 40)
+        self.edit.select_all()
         self._show_knob()
         self._show_field()
 
@@ -169,9 +165,18 @@ class NumberPopover:
         self.edit.insert(text)
         self._typed()
 
-    def motion(self, motion: int) -> None:
-        self.edit.motion(motion)
+    def motion(self, motion: int, select: bool = False) -> None:
+        self.edit.motion(motion, select)
         self._typed()
+
+    def target(self) -> TextTarget:
+        """The field, for the mouse and Ctrl+A / C / X / V (see text_field.py)."""
+        return TextTarget(
+            lambda: self.edit,
+            self.field.contains,
+            lambda x, y: self.cursor.index_at(self.edit, x),
+            self._typed,
+        )
 
     def _typed(self) -> None:
         self.caret_on, self._blink_t = True, 0.0
@@ -206,7 +211,7 @@ class NumberPopover:
         if self._blink_t >= 0.5:
             self._blink_t = 0.0
             self.caret_on = not self.caret_on
-            self.caret.visible = self.caret_on
+            self.cursor.caret.visible = self.caret_on
 
     def delete(self) -> None:
         self.panel.delete()
@@ -217,7 +222,7 @@ class NumberPopover:
             self.knob,
             self.field_text,
             self.unit,
-            self.caret,
+            self.cursor,
             self.hint,
         ):
             s.delete()

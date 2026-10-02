@@ -20,6 +20,14 @@ Controls
                            rows slide apart to show where it lands
     drag a collection      reorder the collections
     "+" button             new collection; type its name, Enter commits, Esc keeps the default
+    refresh button         pick up macros added / renamed / removed on disk outside the editor
+    search field (Ctrl+F)  type to filter the list by name (matching collections open up);
+                           Enter picks up the top match, Esc clears it, a click elsewhere
+                           stops typing but keeps the filter ("x" clears it)
+  text fields (search, names, labels, prompts, numbers): Shift+arrows / Home / End select,
+                           Ctrl+A all; click / Shift+click / drag, double-click: all;
+                           Ctrl+arrows by word; Ctrl+C / X / V. Prefilled text starts
+                           selected, so typing replaces it
     right-click            menus: rename / delete / collapse-or-expand-all collections, take a part
                            out of its collection or into a new one
     scroll                 scroll the list (smoothly; dragging near its edges scrolls too)
@@ -165,6 +173,7 @@ from .sdf_text import SDFText
 from .selection import Selection
 from .spatial import SpatialIndex, ordered
 from .status_bar import BAR_H, StatusBar
+from .text_field import SELECTION_ALPHA, TextMouse, TextTarget, shortcut
 from .sync import ViewSync
 from .views import (
     PartTable,
@@ -232,6 +241,7 @@ class Mode(Enum):
     )  # mouse down on a picker row: a click picks / toggles it, a drag moves it
     PICKER_DRAG = auto()  # carrying a picker row to another spot in the list
     RENAMING = auto()  # typing a collection's name in the picker
+    SEARCHING = auto()  # typing in the picker's search field
     PROMPT = (
         auto()
     )  # a Prompt box is up (save as / open / unsaved changes); see _open_prompt
@@ -241,7 +251,14 @@ class Mode(Enum):
 # Modes where the keys belong to something else (typing, a list), or the board should
 # hold still (a menu is open on it): no moving the view with them
 KEYS_TYPE = frozenset(
-    {Mode.EDITING_LABEL, Mode.RENAMING, Mode.PROMPT, Mode.POPOVER, Mode.MENU}
+    {
+        Mode.EDITING_LABEL,
+        Mode.RENAMING,
+        Mode.SEARCHING,
+        Mode.PROMPT,
+        Mode.POPOVER,
+        Mode.MENU,
+    }
 )
 
 
@@ -379,6 +396,7 @@ class Editor(pyglet.window.Window):
         self.grab = (0.0, 0.0)  # part origin minus cursor, world units
         self.press_at = (0, 0)  # screen pos of the press on a part / wire / picker row
         self.picker_row: Row | None = None  # picker row pressed / being dragged
+        self.text_mouse = TextMouse()  # clicking / dragging in whichever field is typed in
         self.picker_bounce = (
             False  # that press is a double-click's 2nd half: its click does nothing
         )
@@ -414,6 +432,7 @@ class Editor(pyglet.window.Window):
         self.edit_view: PartView | None = None
         self.edit: LineEdit | None = None
         self.caret: shapes.Rectangle | None = None
+        self.edit_sel: shapes.Rectangle | None = None  # its selected text
         self.wire_edit: WireEditSession | None = None
         # placing (new part or paste): ghosts that follow the cursor until a click
         self.placing_views: list[PartView] = []
@@ -893,6 +912,10 @@ class Editor(pyglet.window.Window):
 
     def on_mouse_press(self, x, y, button, modifiers):
         self.mouse = (x, y)
+        target = self._text_target()
+        if button == mouse.LEFT and target is not None and target.contains(x, y):
+            self.text_mouse.press(target, x, y, bool(modifiers & key.MOD_SHIFT))
+            return
         wx, wy = self.camera.screen_to_world(x, y)
         in_picker = self.picker.hit(x, y)  # None unless the cursor is over the picker
         tool = (
@@ -942,6 +965,10 @@ class Editor(pyglet.window.Window):
         if self.mode is Mode.RENAMING:
             self._finish_rename(commit=True)  # same for collection names
             return
+        if self.mode is Mode.SEARCHING:
+            if in_picker == "search":
+                return  # (a left press went to the text above)
+            self._stop_search()  # the filter stays; the click goes on to do what it does
 
         if button == mouse.MIDDLE:
             self.panning = True
@@ -1340,6 +1367,10 @@ class Editor(pyglet.window.Window):
 
     def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers):
         self.mouse = (x, y)
+        if self.text_mouse.dragging:
+            if (target := self._text_target()) is not None:
+                self.text_mouse.drag(target, x, y)  # selecting text in a field
+            return
         if self.mode is Mode.POPOVER:
             self._popover_drag(x)
             return
@@ -1388,7 +1419,12 @@ class Editor(pyglet.window.Window):
                 self.set_mouse_cursor(
                     self.get_system_mouse_cursor(self.CURSOR_HAND) if over else None
                 )
-        hover_ok = self.mode in (Mode.IDLE, Mode.PLACING_PART, Mode.WIRING)
+        hover_ok = self.mode in (
+            Mode.IDLE,
+            Mode.PLACING_PART,
+            Mode.WIRING,
+            Mode.SEARCHING,
+        )
         self.picker.set_hover(self.picker.hit(x, y) if hover_ok else None)
         if self.mode is Mode.MENU:
             self.menu.hover(x, y)
@@ -1407,6 +1443,9 @@ class Editor(pyglet.window.Window):
         self.mouse_in = False
 
     def on_mouse_release(self, x, y, button, modifiers):
+        if button == mouse.LEFT and self.text_mouse.dragging:
+            self.text_mouse.release()
+            return
         if self.mode is Mode.POPOVER:
             if button == mouse.LEFT:
                 self._popover_release()
@@ -1450,7 +1489,7 @@ class Editor(pyglet.window.Window):
                 pass  # a quick second click on the same row: mouse bounce
             elif row.what == "part":
                 self._start_placing(row.part)
-            else:
+            elif not self.picker.filtering:  # (searching: all show their matches)
                 row.collection.open = not row.collection.open
                 self.picker.refresh()
         elif button == mouse.LEFT and self.mode is Mode.PICKER_DRAG:
@@ -1501,6 +1540,9 @@ class Editor(pyglet.window.Window):
 
     def on_key_press(self, symbol, modifiers):
         # Deliberately NOT calling super(): pyglet's default closes the window on Esc.
+        target = self._text_target()
+        if target is not None and shortcut(target, symbol, modifiers, self):
+            return  # Ctrl+A / C / X / V in a text field
         if self.mode is Mode.POPOVER:
             # Typing goes through on_text / on_text_motion. No editor shortcuts while it's up.
             if symbol in (key.ENTER, key.NUM_ENTER):
@@ -1535,6 +1577,22 @@ class Editor(pyglet.window.Window):
                 self._finish_rename(commit=True)
             elif symbol == key.ESCAPE:
                 self._finish_rename(commit=False)
+            return
+        if self.mode is Mode.SEARCHING:
+            if symbol in (key.ENTER, key.NUM_ENTER):
+                part = self.picker.first_match()
+                self._stop_search()
+                if part is not None:
+                    self._start_placing(part)
+            elif symbol == key.ESCAPE:
+                self._stop_search(clear=True)
+            return
+        if symbol == key.F and modifiers & key.MOD_CTRL:
+            if self.inside:
+                self._leave_inside(everything=True)
+            elif self.mode is not Mode.IDLE:
+                self._cancel()
+            self._start_search()
             return
         if self.inside:
             self._inside_key(symbol, modifiers)
@@ -1614,21 +1672,39 @@ class Editor(pyglet.window.Window):
             self._update_edit()
         elif self.mode is Mode.RENAMING:
             self.picker.rename_text(text)
+        elif self.mode is Mode.SEARCHING:
+            self.picker.search_input(text)
 
-    def on_text_motion(self, motion):
+    def on_text_motion(self, motion, select=False):
         if self.mode is Mode.POPOVER:
-            self.popover.motion(motion)
+            self.popover.motion(motion, select)
         elif self.mode is Mode.PROMPT:
-            self.prompt.motion(motion)
+            self.prompt.motion(motion, select)
         elif self.mode is Mode.EDITING_LABEL:
-            self.edit.motion(motion)
+            self.edit.motion(motion, select)
             self._update_edit()
         elif self.mode is Mode.RENAMING:
-            self.picker.rename_motion(motion)
+            self.picker.rename_motion(motion, select)
+        elif self.mode is Mode.SEARCHING:
+            self.picker.search_motion(motion, select)
 
-    # pyglet sends a motion with Shift held (Shift+Backspace too) here instead. There's
-    # no text selection, so it does the plain motion.
-    on_text_motion_select = on_text_motion
+    # pyglet sends a motion with Shift held (Shift+Backspace too) here instead.
+    def on_text_motion_select(self, motion):
+        self.on_text_motion(motion, select=True)
+
+    def _text_target(self) -> TextTarget | None:
+        """The text field being typed in, if any (see text_field.py)."""
+        if self.mode is Mode.SEARCHING:
+            return self.picker.search_target()
+        if self.mode is Mode.RENAMING:
+            return self.picker.rename_target()
+        if self.mode is Mode.PROMPT:
+            return self.prompt.target()
+        if self.mode is Mode.POPOVER:
+            return self.popover.target()
+        if self.mode is Mode.EDITING_LABEL:
+            return self._label_target()
+        return None
 
     # ---- helpers -----------------------------------------------------------
 
@@ -1930,9 +2006,15 @@ class Editor(pyglet.window.Window):
         self.mode = Mode.EDITING_LABEL
         self.edit_view = view
         self.edit = LineEdit(view.part.label, LABEL_MAX)
+        self.edit.select_all()  # typing replaces the old label
         self.caret = shapes.Rectangle(
             0, 0, 1, 1, color=T.CARET, batch=self.world.batch, group=self.layers.overlay
         )
+        self.edit_sel = shapes.Rectangle(
+            0, 0, 0, 1, color=T.SELECT, batch=self.world.batch, group=self.layers.overlay
+        )
+        self.edit_sel.opacity = round(255 * SELECTION_ALPHA)
+        self.text_mouse.forget()
         pyglet.clock.schedule_interval(self._blink_caret, 0.5)
         self._update_edit()
 
@@ -1945,6 +2027,30 @@ class Editor(pyglet.window.Window):
         self.caret.position = (name.caret_x(self.edit.caret) - 0.6, name.y - h / 2)
         self.caret.width, self.caret.height = 1.2, h
         self.caret.visible = True  # restart the blink so the caret shows while typing
+        sel = self.edit.selection
+        self.edit_sel.visible = sel is not None
+        if sel is not None:
+            x0, x1 = name.caret_x(sel[0]), name.caret_x(sel[1])
+            self.edit_sel.position = (x0, name.y - h / 2)
+            self.edit_sel.width, self.edit_sel.height = x1 - x0, h
+
+    def _label_target(self) -> TextTarget:
+        """The label being typed, for the mouse and Ctrl+A / C / X / V. Screen points
+        in, like every field; it's on the board, so they're worked out in world units."""
+        name = self.edit_view.name
+
+        def contains(x: float, y: float) -> bool:
+            wx, wy = self.camera.screen_to_world(x, y)
+            h = name.cap_height * 1.6
+            left, right = name.caret_x(0), name.caret_x(len(self.edit.text))
+            return left - h / 2 <= wx <= right + h / 2 and abs(wy - name.y) <= h / 2
+
+        def index_at(x: float, y: float) -> int:
+            wx, _ = self.camera.screen_to_world(x, y)
+            advance = name.caret_x(1) - name.caret_x(0)  # (monospace)
+            return round((wx - name.caret_x(0)) / advance)  # (LineEdit clamps it)
+
+        return TextTarget(lambda: self.edit, contains, index_at, self._update_edit)
 
     def _blink_caret(self, dt: float) -> None:
         if self.caret is not None:
@@ -1958,7 +2064,8 @@ class Editor(pyglet.window.Window):
         view.name.move_to(*view.name_pos())
         pyglet.clock.unschedule(self._blink_caret)
         self.caret.delete()
-        self.caret = None
+        self.edit_sel.delete()
+        self.caret = self.edit_sel = None
         self.edit_view, self.edit = None, None
         self.mode = Mode.IDLE
 
@@ -1967,6 +2074,14 @@ class Editor(pyglet.window.Window):
             self.picker.toggle()
         elif hit == "new":
             self._start_rename(self.library.new_collection(), fresh=True)
+        elif hit == "refresh":
+            self._refresh_library()
+        elif hit == "search":
+            self._start_search()
+            self.text_mouse.forget()
+            self.text_mouse.press(self.picker.search_target(), x, y, False)
+        elif hit == "clear":
+            self.picker.clear_search()
         elif isinstance(hit, Row) and hit.what in ("part", "section"):
             last_key, last_time = self.last_picker_click
             bounce = last_key == hit.key and time.monotonic() - last_time < DOUBLE_CLICK
@@ -2349,6 +2464,14 @@ class Editor(pyglet.window.Window):
 
     def _finish_rename(self, commit: bool) -> None:
         self.picker.finish_rename(commit)
+        self.mode = Mode.IDLE
+
+    def _start_search(self) -> None:
+        self.picker.start_search()
+        self.mode = Mode.SEARCHING
+
+    def _stop_search(self, clear: bool = False) -> None:
+        self.picker.stop_search(clear)
         self.mode = Mode.IDLE
 
     def _warp(self, sx: float, sy: float) -> None:
@@ -2895,6 +3018,8 @@ class Editor(pyglet.window.Window):
             self.picker.cancel_drag()
         elif self.mode is Mode.RENAMING:
             self._finish_rename(commit=False)
+        elif self.mode is Mode.SEARCHING:
+            self._stop_search()
         elif self.mode is Mode.PROMPT:
             self._close_prompt()
         elif self.mode is Mode.POPOVER:
@@ -3642,6 +3767,21 @@ class Editor(pyglet.window.Window):
             self.lib_history.rebase(self.library.to_dict())
         self.picker.refresh()
         self._save_library()
+
+    def _refresh_library(self) -> None:
+        """The picker's refresh button: catch up with macro files added, changed or
+        removed outside the editor (another window, the headless tools, a copy).
+        Part scripts stay as they were loaded: parts on the board are made from them."""
+        lib = self.library
+        before = {p for c in lib.collections for p in c.parts} | set(lib.loose)
+        after = {entry for entry, _ in self._library_entries()}
+        self.catalog.book.forget()
+        self._sync_library()
+        new, gone = len(after - before), len(before - after)
+        if new or gone:
+            self._notice(f"library refreshed: {new} new, {gone} gone")
+        else:
+            self._notice("library refreshed")
 
     def _save_library(self) -> None:
         data = self.library.to_dict()

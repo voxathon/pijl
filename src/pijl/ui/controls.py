@@ -115,6 +115,9 @@ CONTROLS: list[tuple[str, list[tuple[str, str]]]] = [
             ("right-click a placed macro", "View: look inside, live and read-only"),
             ("  Esc / Backspace", "back out of it (one level)"),
             ("«  (picker header)", "tuck the part picker away"),
+            ("Ctrl+F", "search the picker; Enter picks the top match, Esc clears"),
+            ("in a text field", "Shift+arrows / drag select; Ctrl+A / C / X / V"),
+            ("refresh (picker header)", "pick up macros changed outside the editor"),
         ],
     ),
 ]
