@@ -53,7 +53,7 @@ CONTROLS: list[tuple[str, list[tuple[str, str]]]] = [
             ("  ...same spot again", "end the wire there, free (attached to nothing)"),
             ("  click a pin / wire", "connect (ending on a wire makes a junction)"),
             ("  right-click / Bksp", "remove the last bend point, or cancel"),
-            ("press+drag on a wire", "start a branch from that spot (also Alt+click)"),
+            ("press+drag on a wire", "start a branch from that spot (also double-click, Alt+click)"),
             ("right-click a wire", "edit bends, branch, unplug an end, recolor, delete"),
             ("drag a free end (square)", "move it; drop it on a pin / wire to plug it in"),
             ("delete a part", "its wires to other things stay, with free ends"),

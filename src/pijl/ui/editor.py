@@ -25,7 +25,8 @@ Controls
     scroll                 scroll the list (smoothly; dragging near its edges scrolls too)
   click a pin              start a wire; it follows the cursor
   press+drag on a wire     start a branch from that spot, like from a pin (a plain click
-                           selects the wire; Alt+click or right-click -> Branch also work)
+                           selects the wire; double-click, Alt+click or right-click ->
+                           Branch also work; Ctrl / Ctrl+Shift snap as usual)
     click empty space      add a bend point
     click a pin or wire    connect (green preview = valid target); ending on a wire
                            makes a junction. Wires joined this way form one net; if its
@@ -386,6 +387,8 @@ class Editor(pyglet.window.Window):
         # the last left press on empty board (time, screen point): a second one there
         # soon after is a double-click, which starts a wire from nothing
         self.empty_click: tuple[float, Point] = (0.0, (0.0, 0.0))
+        # the same for a click on a wire: a double-click starts a branch from there
+        self.wire_click: tuple[float, Point] = (0.0, (0.0, 0.0))
         # a right press on empty board (screen point, world point): let go without
         # dragging (that pans) and it opens the board menu
         self.empty_right: tuple[Point, Point] | None = None
@@ -977,7 +980,13 @@ class Editor(pyglet.window.Window):
             elif button == mouse.LEFT:
                 target = self.wire_target(wx, wy)
                 end, end_pos = target if target else (None, None)
-                if end is self.wire_start:
+                if (
+                    not isinstance(self.wire_start, Pin)
+                    and not self.wire_bends
+                    and math.dist(self.snapped(wx, wy), self.wire_start_pos) <= self.slop
+                ):
+                    pass  # (a third click of the double-click that started it)
+                elif end is self.wire_start:
                     self._cancel()
                 elif self.can_wire_to(end):
                     start_pos = (
@@ -1007,12 +1016,6 @@ class Editor(pyglet.window.Window):
                     p = self.snapped(wx, wy)
                     if self.wire_bends and math.dist(p, self.wire_bends[-1]) <= self.slop:
                         self._end_wire_free()  # the same spot again: end it there
-                    elif (
-                        self.wire_start is FREE
-                        and not self.wire_bends
-                        and math.dist(p, self.wire_start_pos) <= self.slop
-                    ):
-                        pass  # (a third click of the double-click that started it)
                     else:
                         self.wire_bends.append(p)
                         self._update_preview()
@@ -1065,8 +1068,12 @@ class Editor(pyglet.window.Window):
                 self.press_at = (x, y)
                 self.mode = Mode.PRESSING_PART
             elif wire := self.wire_at(wx, wy):
-                if modifiers & key.MOD_SHIFT:
-                    self.selection.toggle(wire)
+                if modifiers & key.MOD_SHIFT and not modifiers & key.MOD_CTRL:
+                    self.selection.toggle(wire)  # (Ctrl+Shift: subgrid snapping, as below)
+                elif self._double_click_wire(x, y):
+                    self._start_wiring(
+                        wire.wire, project_onto(wire.points, self.snapped(wx, wy))
+                    )
                 else:
                     self.pressed_wire, self.press_world, self.press_at = (
                         wire,
@@ -1105,6 +1112,16 @@ class Editor(pyglet.window.Window):
         )
         if double:
             self.empty_click = (0.0, (0.0, 0.0))  # (a third click starts afresh)
+        return double
+
+    def _double_click_wire(self, x: float, y: float) -> bool:
+        """Is a left press on a wire here the second half of a double-click?"""
+        t, (px, py) = self.wire_click
+        double = (
+            time.monotonic() - t < DOUBLE_CLICK
+            and abs(x - px) + abs(y - py) < T.DRAG_THRESHOLD_PX
+        )
+        self.wire_click = (0.0, (0.0, 0.0))
         return double
 
     def _board_menu(self, x: float, y: float, wx: float, wy: float) -> None:
@@ -1395,6 +1412,7 @@ class Editor(pyglet.window.Window):
             self._end_box()
         elif button == mouse.LEFT and self.mode is Mode.PRESSING_WIRE:
             self.selection.set(wires=[self.pressed_wire])  # a click, not a drag: select
+            self.wire_click = (time.monotonic(), (x, y))
             self.pressed_wire, self.mode = None, Mode.IDLE
         elif button == mouse.LEFT and self.mode is Mode.DRAGGING_PART:
             self._end_move()
