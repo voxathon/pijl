@@ -81,6 +81,7 @@ from pathlib import Path
 
 import numpy as np
 
+from . import mods
 from .engine import Engine, Harness
 from .pipe import Client, PipeError, command
 from .sim.config import EngineConfig, default
@@ -730,6 +731,7 @@ def main(args) -> int:
         print(f"pijl: too deep: {', '.join(too_deep)}", file=sys.stderr)
         return 2
     print(f"bogobips: BIt-shifts Per Second ({_versions()})", flush=True)
+    print(mods.report().summary(), flush=True)
     if args.nest:
         print("trees and adders built from nested macros", flush=True)
     root = Path(tempfile.mkdtemp(prefix="pijl-bogobips-"))
@@ -839,10 +841,6 @@ def _short(bits: str) -> str:
 
 
 def _versions() -> str:
-    from importlib.metadata import PackageNotFoundError, version
+    from . import __version__
 
-    try:
-        pijl = version("pijl")
-    except PackageNotFoundError:
-        pijl = "?"
-    return f"pijl {pijl}, numpy {np.__version__}, Python {sys.version.split()[0]}"
+    return f"pijl {__version__}, numpy {np.__version__}, Python {sys.version.split()[0]}"

@@ -8,10 +8,12 @@
     pijl run MACRO [VALUES...]    run a macro headless (see below)
 
 Global: --project NAME|PATH (default: the one the editor had open last),
---data DIR (the data root, like PIJL_DATA) and --engine OPTIONS (the engine's code
-paths, like PIJL_ENGINE: "dirty=off"; see pijl/sim/config.py). The engine options
-come from --engine, else PIJL_ENGINE, else the preferences. Headless commands
-never import pyglet.
+--data DIR (the data root, like PIJL_DATA), --engine OPTIONS (the engine's code
+paths, like PIJL_ENGINE: "dirty=off"; see pijl/sim/config.py) and --safe (no mods,
+like PIJL_SAFE=1; see pijl/mods.py). The engine options come from --engine, else
+PIJL_ENGINE, else the preferences. Headless commands never import pyglet.
+
+Every command but launch and prefs loads the enabled mods first.
 
 `pijl run` drives the macro's inputs from outside and prints its outputs:
 
@@ -58,6 +60,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv if _has_command(argv) else ["launch", *argv])
     if args.data:
         os.environ["PIJL_DATA"] = args.data
+    if args.safe:
+        os.environ["PIJL_SAFE"] = "1"  # (in the environment: for what's started from here)
     from . import prefs
     from .sim.config import EngineConfig, set_default
 
@@ -75,7 +79,10 @@ def main(argv: list[str] | None = None) -> int:
         return _prefs(args)
     if args.command == "launch":
         start = _launch(args)
-        return 0 if start is None else main(start)
+        if start is None:
+            return 0
+        os.environ.pop("PIJL_SAFE", None)  # (the launcher decided: --safe or not)
+        return main(start)
     values, problems = prefs.load()
     for problem in problems:
         print(f"pijl: warning: {problem}", file=sys.stderr)
@@ -84,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as e:
         print(f"pijl: PIJL_ENGINE: {e}", file=sys.stderr)
         return 2
+    _load_mods(settle=args.command != "gui")  # (the editor says when it's up)
     if args.command == "gui":
         from .ui import theme
 
@@ -110,6 +118,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "list":
         return _list(engine, args)
     return _run(engine, args)
+
+
+def _load_mods(settle: bool) -> None:
+    from . import mods
+
+    os.environ.setdefault("PIJL_MODS", str(mods.mods_dir()))
+    report = mods.load()
+    for problem in report.problems:
+        print(f"pijl: mod {problem}", file=sys.stderr)
+    if settle:
+        mods.settled()
 
 
 def _launch(args) -> list[str] | None:
@@ -188,6 +207,7 @@ def _parser() -> argparse.ArgumentParser:
         c.add_argument("-p", "--project", default=default, help="project name or folder (default: the last one open)")
         c.add_argument("--data", default=default, help="data root folder (default: PIJL_DATA, else the per-user one)")
         c.add_argument("--engine", default=default, help='engine options, e.g. "dirty=off" (default: PIJL_ENGINE, else the fastest)')
+        c.add_argument("--safe", action="store_true", default=default, help="don't load any mods (like PIJL_SAFE=1)")
         return c
 
     p = argparse.ArgumentParser(

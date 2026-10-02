@@ -96,7 +96,8 @@ class Engine:
         # shipped templates into it; read those from the package instead)
         parts = self.project.parts_dir
         self.parts: Registry = load_parts(parts if parts.is_dir() else TEMPLATES)
-        self.problems: list[str] = [f"part script {m}" for m in self.parts.errors]
+        self.problems: list[str] = self.project.mod_problems()
+        self.problems += [f"part script {m}" for m in self.parts.errors]
         self.store = MacroStore(self.project.macros_dir)
         self.catalog = Catalog(
             self.parts,

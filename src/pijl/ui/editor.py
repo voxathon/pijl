@@ -112,6 +112,7 @@ from pyglet import shapes
 from pyglet.math import Mat4
 from pyglet.window import key, mouse
 
+from .. import mods
 from ..macros import Catalog
 from ..parts import Choice, Number, Toggle
 from ..parts import load as load_parts
@@ -274,7 +275,7 @@ class Editor(pyglet.window.Window):
         # the open document: a macro, or an untitled board (set early: the picker asks about it)
         self.doc: str | None = None  # its macro's id (see storage.py); None = untitled
         self.saved_state = 0  # history.state of what's on disk (dirty = it differs)
-        self.load_problems: list[str] = []
+        self.load_problems: list[str] = [f"mod {m}" for m in mods.report().problems]
         try:
             project = Project.open(
                 project or last_project()
@@ -3289,6 +3290,10 @@ class Editor(pyglet.window.Window):
         self.catalog.book.forget()  # definitions changed; boards opened later see the new version
         self.doc, self.saved_state = id, self.history.state
         self.project.remember_open(self.doc)
+        try:
+            self.project.remember_mods(mods.active())
+        except (OSError, ValueError):
+            pass  # (only a record)
         self._sync_library()
         self._notice(f"saved {self.doc_title}")
         return True
@@ -3411,6 +3416,7 @@ class Editor(pyglet.window.Window):
         self.parts = load_parts(
             project.parts_dir
         )  # the project's part scripts (see pijl.parts)
+        self.load_problems += self.project.mod_problems()
         self.load_problems += [f"part script {msg}" for msg in self.parts.errors]
         self.store = MacroStore(project.macros_dir)
         # Part scripts plus macros. A macro's definition is read from its file when first needed.
@@ -3698,5 +3704,6 @@ def _pin_part_uids(wire_data) -> set[int]:
 def run(project: str | None = None, settle_ticks: int = SETTLE_TICKS) -> bool:
     """Open the editor until it's closed. True: it asked for the launcher back."""
     editor = Editor(project, settle_ticks)
+    mods.settled()  # (it's up: no crash to blame on the mods)
     pyglet.app.run()
     return editor.relaunch

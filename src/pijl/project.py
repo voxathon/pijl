@@ -160,6 +160,31 @@ class Project:
             return None
         return value if isinstance(value, str) else None
 
+    def recorded_mods(self) -> list[str]:
+        """The mods loaded when a macro in it was last saved (see pijl.mods.active)."""
+        try:
+            value = json.loads(self.meta_file.read_text(encoding="utf-8")).get("mods", [])
+        except (OSError, ValueError):
+            return []
+        ok = isinstance(value, list) and all(isinstance(m, str) for m in value)
+        return value if ok else []
+
+    def mod_problems(self) -> list[str]:
+        """What's off between recorded_mods() and the mods loaded now."""
+        from .mods import recorded_problems
+
+        return [f"project: {p}" for p in recorded_problems(self.recorded_mods())]
+
+    def remember_mods(self, mods: list[str]) -> None:
+        """Record the mods loaded now (on saving a macro); [] removes the record."""
+        meta = json.loads(self.meta_file.read_text(encoding="utf-8"))
+        if meta.get("mods", []) != mods:
+            if mods:
+                meta["mods"] = mods
+            else:
+                meta.pop("mods", None)
+            write_atomic(self.meta_file, json.dumps(meta, indent=2) + "\n")
+
     def remember_open(self, name: str | None) -> None:
         meta = json.loads(self.meta_file.read_text(encoding="utf-8"))
         if meta.get("open") != name:
@@ -198,4 +223,11 @@ def write_atomic(path: Path, text: str) -> None:
     """Write via a temp file + rename, so a crash mid-save never leaves half a file."""
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def write_atomic_bytes(path: Path, data: bytes) -> None:
+    """write_atomic, byte for byte (no newline translation)."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
     os.replace(tmp, path)

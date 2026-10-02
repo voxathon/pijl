@@ -5,14 +5,15 @@
     default
     [            START             ]
     [ LOAD PROJECT ] [ NEW PROJECT ]
-    [   HEADLESS   ] [  SETTINGS   ]
+    [HEADLESS] [  MODS  ] [SETTINGS]
                               [QUIT]
 
 LOAD PROJECT lists the projects (click one to pick it, "rename" to rename it),
 NEW PROJECT makes one, SETTINGS edits the preferences (click a value to change
 it; numbers are typed, or nudged with the wheel), and HEADLESS runs one of the
 project's macros without the editor: in this terminal if pijl has one, else in a
-console window of its own.
+console window of its own. MODS turns mods on and off, orders them, and has the
+safe start switch (start without mods; shown on the main page when it's on).
 
 This module imports only theme (colors) and line_edit from pijl.ui: the editor's
 modules read theme.UI_SCALE when they're imported, which happens after this
@@ -30,7 +31,7 @@ from pyglet import shapes
 from pyglet.window import key, mouse
 
 from .. import prefs
-from ..launcher import Launcher, has_console, open_console, version
+from ..launcher import Launcher, ModRow, has_console, open_console, version
 from ..parts.settings import Choice, Number, Toggle
 from . import theme as T
 from .line_edit import LineEdit
@@ -357,6 +358,16 @@ class LauncherWindow(pyglet.window.Window):
         )
         y = self.top - 70 * s
         self._label("PROJECT", x, y, 9.5, T.PICKER_DIM_TEXT)
+        if la.safe:
+            self._label(
+                "SAFE START: NO MODS",
+                self.width - x,
+                y,
+                9.5,
+                T.MENU_DANGER,
+                anchor_x="right",
+                bold=True,
+            )
         y -= 30 * s
         self._label(la.project, x, y, 18, ACCENT, bold=True)
         y -= (24 + BIG_H) * s
@@ -390,20 +401,30 @@ class LauncherWindow(pyglet.window.Window):
             lambda: self.show("new"),
         )
         y -= (GAP + BTN_H) * s
+        third = (w - 2 * GAP * s) / 3
         self._button(
             "HEADLESS",
             x,
             y,
-            half,
+            third,
             BTN_H * s,
             lambda: self.show("headless"),
             hint="run a macro without the editor",
         )
         self._button(
-            "SETTINGS",
-            x + half + GAP * s,
+            "MODS",
+            x + third + GAP * s,
             y,
-            half,
+            third,
+            BTN_H * s,
+            lambda: self.show("mods"),
+            hint="turn mods on and off, order them; safe start",
+        )
+        self._button(
+            "SETTINGS",
+            x + 2 * (third + GAP * s),
+            y,
+            third,
             BTN_H * s,
             lambda: self.show("settings"),
         )
@@ -566,7 +587,82 @@ class LauncherWindow(pyglet.window.Window):
         self._list(macros, draw)
         self._bottom()
 
+    def _page_mods(self) -> None:
+        s, la = self.s, self.launcher
+        self._title("MODS")
+        try:
+            on, off = la.mods()
+        except OSError as e:
+            on, off = [], []
+            self.say(f"can't read the mods folder: {e}", danger=True)
+        if not on and not off:
+            self._label(
+                "No mods. Put a mod's .py file or folder in",
+                PAD * s,
+                self.top,
+                10,
+                T.HELP_TEXT,
+                anchor_y="top",
+            )
+            self._label(
+                la.mods_folder(),
+                PAD * s,
+                self.top - 20 * s,
+                9.5,
+                T.PICKER_DIM_TEXT,
+                anchor_y="top",
+            )
+        rows: list = (["LOAD ORDER", *on] if on else []) + (["DISABLED", *off] if off else [])
+
+        def draw(row, x, y, w) -> None:
+            h = ROW_H * s - 2 * s
+            if not isinstance(row, ModRow):  # a heading
+                self._label(row, x, y + 8 * s, 9.5, T.PICKER_DIM_TEXT, bold=True)
+                return
+            hint = "; ".join(filter(None, [row.description, *row.notes]))
+            self._box(x, y, w, h, ROW, lambda: None, hint=hint or row.name)
+            color = T.MENU_DANGER if row.notes else ACCENT if row.on else T.PART_TEXT
+            self._label(
+                f"{row.title} {row.tags}".rstrip(),
+                x + 8 * s,
+                y + h / 2,
+                color=color,
+                anchor_y="center",
+            )
+            bw = 54 * s
+            buttons = (
+                [("up", lambda: self._mod(la.mod_move, row.name, -1)),
+                 ("down", lambda: self._mod(la.mod_move, row.name, 1)),
+                 ("off", lambda: self._mod(la.mod_off, row.name))]
+                if row.on
+                else [("on", lambda: self._mod(la.mod_on, row.name))]
+            )
+            bx = x + w - 3 * s
+            for text, click in reversed(buttons):
+                bx -= bw
+                self._button(
+                    text, bx, y + 3 * s, bw, h - 6 * s, click, ROW, size=9.5, color=T.HELP_TEXT
+                )
+                bx -= 3 * s
+
+        self._list(rows, draw)
+        self._bottom(
+            (
+                f"SAFE START: {'ON' if la.safe else 'OFF'}",
+                self._toggle_safe,
+            )
+        )
+
     # ---- what the buttons do -----------------------------------------------------
+
+    def _mod(self, action: Callable, *args) -> None:
+        if self._try(lambda: action(*args)):
+            self.show()
+
+    def _toggle_safe(self) -> None:
+        self.launcher.safe = not self.launcher.safe
+        self.show()
+        self.say("starts without mods" if self.launcher.safe else "starts with the mods in the load order")
 
     def _finish(self, result: list[str] | None) -> None:
         self.result = result

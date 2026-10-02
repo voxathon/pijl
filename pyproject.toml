@@ -1,6 +1,6 @@
 [project]
 name = "pijl"
-version = "0.2.3"
+version = "0.3.0"
 description = "A visual logic circuit editor and simulator"
 readme = "README.md"
 authors = [

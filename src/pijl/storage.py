@@ -23,6 +23,9 @@ nicely in git:
       ]
     }
 
+  - "mods" (after the title; left out when there were none) lists the mods that
+    were loaded when it was saved, as "name@version" (see pijl.mods.active).
+    Loading warns about the ones that aren't loaded now.
   - "kind" names a part type (pijl.parts); a placed macro has "macro": its name
     instead, so the two can never collide.
   - "label", "props", "bends" and a wire's "color" (a name, see ui/theme.py
@@ -51,6 +54,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import mods
+from .mods import active as active_mods
 from .parts import Registry, check_props
 from .project import write_atomic
 from .snapshot import MACRO, EndRef, Point, Snapshot
@@ -77,6 +82,7 @@ class Loaded:
     snapshot: Snapshot
     warnings: list[str] = field(default_factory=list)
     title: str | None = None  # None: the file doesn't have one
+    mods: list[str] = field(default_factory=list)  # loaded when it was saved
 
 
 # ---- names ---------------------------------------------------------------------
@@ -105,9 +111,13 @@ def check_name(name: str) -> str:
 
 
 def encode(
-    snap: Snapshot, types: Registry | None = None, title: str | None = None
+    snap: Snapshot,
+    types: Registry | None = None,
+    title: str | None = None,
+    mods: list[str] = (),
 ) -> dict[str, Any]:
-    """`types` is needed only if the board has macros on it (for their pin uids)."""
+    """`types` is needed only if the board has macros on it (for their pin uids).
+    `mods`: see the module docstring."""
     parts = []
     for uid in sorted(snap.parts):
         kind, label, x, y, props = snap.parts[uid]
@@ -138,6 +148,8 @@ def encode(
     head: dict[str, Any] = {"pijl": FORMAT}
     if title is not None:
         head["title"] = title
+    if mods:
+        head["mods"] = list(mods)
     return {**head, "parts": parts, "wires": wires}
 
 
@@ -154,6 +166,12 @@ def decode(data: Any, types: Registry) -> Loaded:
         )
     out = Loaded(Snapshot({}, {}), title=_title(data))
     warn = out.warnings.append
+    recorded = data.get("mods", [])
+    if isinstance(recorded, list) and all(isinstance(m, str) for m in recorded):
+        out.mods = recorded
+        out.warnings += mods.recorded_problems(recorded)  # (first: they explain the rest)
+    else:
+        warn("unreadable list of mods, ignored")
 
     kinds: dict[int, Any] = {}  # part uid -> its PartType, for checking pin indices
     for d in _list(data, "parts"):
@@ -251,6 +269,11 @@ def dumps(data: dict[str, Any]) -> str:
             if "title" in data
             else ""
         )
+        + (
+            f'  "mods": {json.dumps(data["mods"], ensure_ascii=False)},\n'
+            if data.get("mods")
+            else ""
+        )
         + block("parts")
         + ",\n"
         + block("wires")
@@ -336,8 +359,10 @@ class MacroStore:
         snap: Snapshot,
         types: Registry | None = None,
         title: str | None = None,
+        mods: list[str] | None = None,
     ) -> None:
-        """Write macro `id`; `title` None keeps the one it has (a new one: its id)."""
+        """Write macro `id`; `title` None keeps the one it has (a new one: its id).
+        `mods` None: the ones loaded now (pijl.mods.active)."""
         id = check_name(id)
         title = check_name(title) if title is not None else self.title(id)
         old = self.find_id(id)
@@ -346,7 +371,9 @@ class MacroStore:
                 old
             ).unlink()  # same id, new capitalization: rename, don't keep the old spelling
         self.folder.mkdir(parents=True, exist_ok=True)
-        write_atomic(self.path(id), dumps(encode(snap, types, title)))
+        if mods is None:
+            mods = active_mods()
+        write_atomic(self.path(id), dumps(encode(snap, types, title, mods)))
         self._titles.pop(id, None)
 
     def retitle(self, id: str, title: str) -> None:

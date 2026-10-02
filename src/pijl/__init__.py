@@ -1,3 +1,6 @@
+__version__ = "0.3.0"  # (also in pyproject.toml; a test keeps them equal)
+
+
 def main() -> None:
     import sys
 

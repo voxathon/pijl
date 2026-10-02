@@ -1,6 +1,8 @@
 """The launcher: what `pijl` shows before anything starts. It's where projects are
-picked, made and renamed and where the preferences (prefs.py) are changed, and it
-starts either the editor or a macro run headless.
+picked, made and renamed, where the preferences (prefs.py) are changed and mods
+(mods.py) turned on and off and ordered, and it starts either the editor or a
+macro run headless -- with or without mods ("safe start", which is on by itself
+after a start that died while loading mods).
 
 There are two faces on one model (Launcher): a window (ui/launcher.py) and a text
 menu in the terminal (terminal() below, for `pijl --tui`, or when no window can
@@ -16,9 +18,10 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from typing import TextIO
 
-from . import prefs
+from . import mods, prefs
 from .project import (
     DEFAULT_PROJECT,
     Project,
@@ -32,12 +35,9 @@ from .storage import MacroStore, check_name
 
 
 def version() -> str:
-    from importlib.metadata import PackageNotFoundError, version
+    from . import __version__
 
-    try:
-        return version("pijl")
-    except PackageNotFoundError:  # (a Nuitka build has no package metadata)
-        return ""
+    return __version__
 
 
 class Launcher:
@@ -48,6 +48,19 @@ class Launcher:
         if not project_names():
             Project.open(DEFAULT_PROJECT)  # first run: there's always one to start
         self.project = last_project()
+        self.safe = mods.safe_mode()  # start without mods (--safe)
+        self.crashed = mods.crashed()
+        if self.crashed and not self.safe:
+            self.safe = True
+            self.problems.append(
+                "the last start died while loading mods: safe start is on (no mods)"
+            )
+        mods.settled()  # (asked about; the next start makes a new marker)
+        try:
+            self.new_mods = {m.name for m in mods.plan().new}  # (now in disabled.txt)
+        except OSError as e:
+            self.new_mods = set()
+            self.problems.append(f"can't read the mods folder: {e}")
 
     # ---- projects ----------------------------------------------------------------
 
@@ -91,14 +104,75 @@ class Launcher:
         self.prefs = prefs.defaults()
         prefs.save(self.prefs)
 
+    # ---- mods --------------------------------------------------------------------
+
+    def mods(self) -> tuple[list[ModRow], list[ModRow]]:
+        """The enabled mods in load order (missing ones too), and the disabled ones."""
+        p = mods.plan()
+        notes = mods.notes(p)
+
+        def row(m: mods.Mod, on: bool) -> ModRow:
+            key = m.name.casefold()
+            return ModRow(m.name, on, m, m.name in self.new_mods, notes.get(key, []))
+
+        on, keys = [], {m.name.casefold() for m in p.enabled}
+        for name in mods._dedup(mods.read_list(p.folder / mods.LOADORDER)):
+            key = name.casefold()
+            if key in keys:
+                on.append(row(p.mods[key], True))
+            elif name in p.missing:
+                on.append(ModRow(name, True, None, False, ["not in the mods folder"]))
+        return on, [row(m, False) for m in p.disabled]
+
+    def mod_on(self, name: str) -> None:
+        mods.enable(name)
+
+    def mod_off(self, name: str) -> None:
+        mods.disable(name)
+
+    def mod_move(self, name: str, by: int) -> None:
+        mods.move(name, by)
+
+    def mods_folder(self) -> str:
+        return str(mods.mods_dir())
+
     # ---- what to start -----------------------------------------------------------
 
+    def _flags(self) -> list[str]:
+        return ["--safe"] if self.safe else []
+
     def editor(self) -> list[str]:
-        return ["gui", "-p", self.project]
+        return ["gui", "-p", self.project, *self._flags()]
 
     def headless(self, macro: str, table: bool = False) -> list[str]:
         """`macro`: an id. Interactive: a stream on stdin; table: the truth table."""
-        return ["run", macro, "--table" if table else "-", "-p", self.project]
+        return ["run", macro, "--table" if table else "-", "-p", self.project, *self._flags()]
+
+
+@dataclass
+class ModRow:
+    """A mod as the launcher lists it."""
+
+    name: str
+    on: bool
+    mod: mods.Mod | None  # None: listed in loadorder.txt, not on disk
+    new: bool
+    notes: list[str]  # what's wrong with it
+
+    @property
+    def title(self) -> str:
+        return self.mod.title if self.mod else self.name
+
+    @property
+    def description(self) -> str:
+        return str(self.mod.manifest.get("description", "")) if self.mod else ""
+
+    @property
+    def tags(self) -> str:
+        """(new), (missing), (!): shown after the title."""
+        if self.mod is None:
+            return "(missing)"
+        return " ".join(t for t in ("(new)" * self.new, "(!)" * bool(self.notes)) if t)
 
 
 STREAM_HELP = (
@@ -183,11 +257,13 @@ def terminal(
         say()
         say(f"pijl {version()}".rstrip())
         say(f"project: {launcher.project}")
+        if launcher.safe:
+            say("safe start: no mods")
         say()
         say("  Enter  start the editor")
         say("  l      load project      n  new project")
         say("  h      headless          s  settings")
-        say("  q      quit")
+        say("  m      mods              q  quit")
         answer = ask("> ")
         if answer is None or answer.lower() in ("q", "quit", "exit"):
             return None
@@ -212,6 +288,8 @@ def terminal(
                 return start
         elif choice == "s":
             _settings_page(launcher, say, ask)
+        elif choice == "m":
+            _mods_page(launcher, say, ask)
         else:
             say(f"{answer!r}? pick one of the letters")
 
@@ -285,6 +363,57 @@ def _settings_page(launcher: Launcher, say, ask) -> None:
                 launcher.set_pref(key, prefs.parse_text(key, text))
             except (OSError, ValueError) as e:
                 say(f"can't: {e}")
+
+
+def _mods_page(launcher: Launcher, say, ask) -> None:
+    while True:
+        try:
+            on, off = launcher.mods()
+        except OSError as e:
+            say(f"can't read the mods folder: {e}")
+            return
+        rows = on + off
+        say()
+        say(f"  mods in {launcher.mods_folder()}")
+        say(f"  safe start (no mods): {'on' if launcher.safe else 'off'}")
+        for i, r in enumerate(rows, 1):
+            if i == 1 and on:
+                say("  LOAD ORDER")
+            if i == len(on) + 1:
+                say("  DISABLED")
+            line = f"  {i:>2}  {r.title} {r.tags}".rstrip()
+            if r.description:
+                line += f"  - {r.description}"
+            say(line[:100])
+            for note in r.notes:
+                say(f"        {note}")
+        if not rows:
+            say("  (none: put a mod's .py file or folder in there)")
+        answer = ask("number: on/off, u/d + number: move up/down, s: safe start, Enter: back > ")
+        if not answer:
+            return
+        a = answer.lower()
+        if a == "s":
+            launcher.safe = not launcher.safe
+            continue
+        by = {"u": -1, "d": 1}.get(a[:1], 0)
+        i = _number(a[1:].strip() if by else a, len(rows))
+        if i is None:
+            say(f"{answer!r}? no such mod")
+            continue
+        r = rows[i]
+        try:
+            if by:
+                if not r.on:
+                    say(f"{r.name} isn't on")
+                else:
+                    launcher.mod_move(r.name, by)
+            elif r.on:
+                launcher.mod_off(r.name)
+            else:
+                launcher.mod_on(r.name)
+        except (OSError, ValueError) as e:
+            say(f"can't: {e}")
 
 
 def _headless_page(launcher: Launcher, say, ask) -> list[str] | None:
