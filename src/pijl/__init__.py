@@ -1,4 +1,4 @@
-__version__ = "0.3.2"  # (also in pyproject.toml; a test keeps them equal)
+__version__ = "0.3.3"  # (also in pyproject.toml; a test keeps them equal)
 
 
 def main() -> None:
