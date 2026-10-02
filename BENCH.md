@@ -62,6 +62,8 @@ BIPS = clocks (or input changes) per second × the work each one does. higher is
 the kinds, and what depth means for each:
 - SIPO (one bit in, every cell read out; depth = cells): tests how fast we can *read* a big circuit.
 - PISO (load every cell at once, shift one bit out; depth = cells): tests how fast we can *drive* a big circuit. each cell has extra logic in front of it, so it's about half SIPO's speed.
+- counter (depth = bits): a counter that adds 1 on clocks where its enable input (random) is on. each bit's next value is worked out from the bits themselves, so the logic feeds back into the flip-flops: the shape of most real circuits with memory. few bits change per clock, but a carry can run the whole width, and the engine column has to leave room for that every clock.
+- lfsr (depth = stages): a shift register whose first stage gets the XNOR of its last two stages. the feedback loops through every stage, and every stage is busy.
 - tree-and / tree-xor (depth = levels, so 2^depth inputs merging into one output): each step flips one random input. in an AND tree a single 0 decides a gate, so most changes die out after a level or two: the quiet case. in an XOR tree every change runs all the way to the top: the busy case. together they bracket how busy a real circuit is.
 - decoder (depth = inputs, 2^depth outputs, exactly one of them on): every input fans out to lots of gates. tests spreading changes out.
 - adder (depth = bits, ripple carry): a carry can run the whole width, but with random inputs it usually stops after a few bits. tests timing that depends on the data.

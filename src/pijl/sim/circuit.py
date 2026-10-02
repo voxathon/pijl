@@ -80,6 +80,12 @@ from ..parts import Ctx, PartType, Registry, builtin_registry, fresh_props
 from ..parts.registry import flat
 
 _FAILED = object()  # what Circuit._guard returns when the hook raised
+# What a step costs, roughly (microseconds; measured with bogobips on an i5-9600K), for
+# choosing between running every pure part and only the dirty ones (Circuit.step).
+# Only the ratios matter. Picking parts out costs much more per part than running a
+# whole kind at once, and every kind touched costs its share of numpy calls.
+FULL_FIXED, FULL_PER_PART = 75.0, 0.019
+PICK_FIXED, PICK_PER_KIND, PICK_PER_PART = 20.0, 43.0, 0.1
 
 
 class _PinStates:
@@ -274,7 +280,9 @@ class Pin:
     @state.setter
     def state(self, value) -> None:
         """A Level, or a bool / 0 / 1."""
-        self._store.states[self.slot] = codes(value)
+        s = self._store
+        s.states[self.slot] = codes(value)
+        s.circuit._poked.append(self.slot)
 
     @property
     def passive(self) -> bool:
@@ -566,6 +574,26 @@ class Circuit:
         self._wire_net = np.zeros(0, np.intp)  # per wire slot: its net (-1: gone)
         self.net_value = np.zeros(0, CODE)  # logic codes (see pijl.logic)
         self.net_conflict = np.zeros(0, bool)  # drivers fighting: one says 0, another 1
+        # Dirty-set evaluation (see step): a pure part whose inputs didn't change since it
+        # last ran would give the same outputs again, so only the others run.
+        self.incremental = True  # False: every step runs every part (the reference)
+        self._full = True  # the next step runs everything (something changed wholesale)
+        self._dirty = np.empty(0, np.intp)  # else: the part slots it must run
+        self._poked: list = []  # pin slots written from outside step() (see write_pins)
+        self._quiet = False  # the last step changed no pin
+        self._batch_of = np.zeros(0, np.intp)  # per part slot: its batch (-1: none) ...
+        self._batch_pos = np.zeros(0, np.intp)  # ... and its place in it
+        self._n_pure = 0  # parts in pure batches
+        # Nets by number, for carrying only some (see _carry_some); -1 where none
+        self._pin_net = np.zeros(0, np.intp)  # per pin slot
+        self._solo_of = np.zeros(0, np.intp)  # per net: its only driver
+        self._multi_at = np.zeros(0, np.intp)  # per net: its group in _drivers
+        self._drv_count = np.zeros(0, np.intp)  # per group: how many drivers
+        self._weak_at = np.zeros(0, np.intp)  # per net: its group in _weak
+        self._weak_count = np.zeros(0, np.intp)
+        self._rd_sorted = np.zeros(0, np.intp)  # reader pin slots grouped by net ...
+        self._rd_start = np.zeros(1, np.intp)  # ... where each net's start (n_nets + 1)
+        self._rd_count = np.zeros(0, np.intp)  # ... and how many it has
         # What the UI was shown last (take_changes), to tell it what changed since.
         self._changed_all = True
         self._shown = np.zeros(0, bool)
@@ -1348,6 +1376,22 @@ class Circuit:
         self._wire_net = net_of[n_pins:]
         self.net_value = np.zeros(n_nets, CODE)
         self.net_conflict = np.zeros(n_nets, bool)
+
+        # The same, by net number: what _carry_some looks up
+        self._pin_net = net_of[:n_pins].copy()
+        self._solo_of = np.full(n_nets, -1, np.intp)
+        self._solo_of[self._solo_net] = self._solo
+        self._multi_at, self._drv_count = _groups_by_net(
+            n_nets, self._driven, self._drv_starts, len(self._drivers)
+        )
+        self._weak_at, self._weak_count = _groups_by_net(
+            n_nets, self._weak_nets, self._weak_starts, len(self._weak)
+        )
+        order = np.argsort(self._reader_net, kind="stable")
+        self._rd_sorted = self._readers[order]
+        self._rd_start = np.searchsorted(self._reader_net[order], np.arange(n_nets + 1))
+        self._rd_count = np.diff(self._rd_start)
+        self._full = True
         self._nets_dirty = False
         self._nets_version += 1
         self._changed_all = True  # net numbers mean something else now; pins were reset
@@ -1455,49 +1499,128 @@ class Circuit:
     # ---- simulation ----------------------------------------------------
 
     def step(self) -> None:
+        """One tick: every part computes its outputs from its current inputs, then every
+        net hands its drivers' value to its readers.
+
+        Dirty-set: a pure part runs only when an input changed since it last ran (or a
+        pin of it was written from outside), since otherwise it would only say the same
+        again, and only nets with a changed driver are carried. Tick for tick the same
+        as running everything (incremental = False), which is what it's tested against."""
         if self._nets_dirty:
             self._rebuild_nets()
-        states = self._pins.states
+        batches = self._eval_batches()
+        store = self._pins
+        states = store.states
+        poked = self._take_poked()
+        faults = len(self.faults)
+        full = self._full or bool(self._settling) or not self.incremental
+        if not full:
+            dirty = self._dirty
+            if poked.size:
+                dirty = _distinct(np.concatenate((dirty, store.part[poked])), self._n_part_slots)
+            bid = self._batch_of[dirty]
+            dirty, bid = dirty[bid >= 0], bid[bid >= 0]
+            if dirty.size:  # (none: next to free) is picking them out worth it?
+                kinds = np.zeros(len(batches), bool)
+                kinds[bid] = True
+                pick = PICK_FIXED + PICK_PER_KIND * np.count_nonzero(kinds) + PICK_PER_PART * dirty.size
+                full = pick > FULL_FIXED + FULL_PER_PART * self._n_pure
 
-        # Phase 1: every part computes outputs from current inputs, one kind at a time.
+        # Phase 1: parts compute outputs from current inputs, one kind at a time.
         # Compute all first, then write, so evaluation order doesn't matter.
         now = time.monotonic()
-        results: list[tuple[_Batch, list[np.ndarray]]] = []
-        for batch in self._eval_batches():
+        results: list[tuple[_Batch, np.ndarray | None, list[np.ndarray]]] = []
+        for b, batch in enumerate(batches):
             t = batch.type
             if t.kind in self.faults:
                 continue
-            ctx = Ctx(batch.parts, self.tick, now)
+            pos = None  # (everyone)
+            parts, ins = batch.parts, batch.ins
+            if not full and t.pure:
+                pos = self._batch_pos[dirty[bid == b]]
+                if not pos.size:
+                    continue
+                parts, ins = _Handles(self, batch.slots[pos]), [idx[pos] for idx in ins]
+            ctx = Ctx(parts, self.tick, now)
             outs = self._guard(
-                t, "eval", lambda: _evaluate(t, ctx, [states[idx] for idx in batch.ins])
+                t, "eval", lambda: _evaluate(t, ctx, [states[idx] for idx in ins])
             )
             if outs is not _FAILED:
-                results.append((batch, outs))
-        for batch, outs in results:
-            if (
-                self._settling
-            ):  # settling parts take their new outputs only half the time
+                results.append((batch, pos, outs))
+        moved: list[np.ndarray] = []  # output pins whose state changed (picking only)
+        outs_moved = False
+        for batch, pos, outs in results:
+            keep = None
+            if self._settling:  # settling parts take their new outputs only half the time
                 keep = (self._settle[batch.slots] <= 0) | (
                     self.rng.random(len(batch.parts)) < 0.5
                 )
-                for idx, values in zip(batch.outs, outs):
-                    states[idx[keep]] = values[keep]
-            else:
-                for idx, values in zip(batch.outs, outs):
+            for idx, values in zip(batch.outs, outs):
+                if pos is not None:
+                    idx = idx[pos]
+                elif keep is not None:
+                    idx, values = idx[keep], values[keep]
+                if pos is None:  # (a full carry follows: just whether anything moved)
+                    outs_moved = outs_moved or not np.array_equal(states[idx], values)
                     states[idx] = values
+                    continue
+                diff = states[idx] != values
+                if diff.any():
+                    idx = idx[diff]
+                    moved.append(idx)
+                    states[idx] = values[diff]
 
-        # Phase 2: every net resolves its drivers and hands the value to its readers.
-        self._carry()
+        # Phase 2: nets resolve their drivers and hand the value to their readers. Many
+        # changed readers (past `most`, where picking out even one kind's parts would
+        # cost more than running everything): the next step runs everything, no list.
+        most = int(
+            (FULL_FIXED + FULL_PER_PART * self._n_pure - PICK_FIXED - PICK_PER_KIND) / PICK_PER_PART
+        )
+        if full or self._full:  # (a hook that failed just now set its outputs to X)
+            n, changed = self._carry(most, poked)
+        else:
+            touched = np.concatenate([poked, *moved]) if moved else poked
+            nets = self._pin_net[touched]
+            n, changed = self._carry_some(_distinct(nets[nets >= 0], len(self.net_value)), most)
+        self._quiet = not (outs_moved or moved or n) and len(self.faults) == faults
+        self._full = changed is None
+        if changed is not None:
+            self._dirty = _distinct(changed, self._n_part_slots)
+            self._full = len(self._dirty) > most
         self.tick += 1
         if self._settling:
             s = self._settle[: self._n_part_slots]
             s[s > 0] -= 1
             self._settling = int(np.count_nonzero(s))
+            if not self._settling:
+                self._full = True  # (some kept their old outputs: everyone runs once)
 
-    def _carry(self) -> None:
+    def _take_poked(self) -> np.ndarray:
+        """The pin slots written from outside step() since the last call."""
+        poked = self._poked
+        if not poked:
+            return np.empty(0, np.intp)
+        self._poked = []
+        return _distinct(
+            np.concatenate([np.atleast_1d(np.asarray(p, np.intp)) for p in poked]), self._pins.n
+        )
+
+    def write_pins(self, slots: np.ndarray, codes: np.ndarray) -> None:
+        """Pin.state for many pins at once (driving inputs from outside): the fast way."""
+        self._pins.states[slots] = codes
+        self._poked.append(slots)
+
+    def _carry(
+        self, most: int = -1, poked: np.ndarray | None = None
+    ) -> tuple[int, np.ndarray | None]:
         """Resolve every net from its drivers and hand the value to its readers. The
         value is the OR of the drivers' codes (logic.resolve): none or only Z -> Z,
-        disagreeing -> X. Nets the strong drivers leave at Z go to their pulls."""
+        disagreeing -> X. Nets the strong drivers leave at Z go to their pulls.
+
+        After a carry every reader holds its net's value, and only a write from outside
+        (`poked`) can change that, so only the readers of nets whose value changed, or
+        that were poked, are handed it again. most < 0: all of them (nets just rebuilt).
+        Returns how many readers changed and their parts (None: more than `most`)."""
         states = self._pins.states
         value = np.zeros(len(self.net_value), CODE)
         conflict = np.zeros(len(self.net_value), bool)
@@ -1512,8 +1635,62 @@ class Circuit:
             free = value[nets] == Z
             value[nets[free]] = resolve(w, self._weak_starts)[free]
             conflict[nets[free]] = fights(w, self._weak_starts)[free]
+        old = self.net_value
         self.net_value, self.net_conflict = value, conflict
-        states[self._readers] = value[self._reader_net]
+        if most < 0:
+            states[self._readers] = value[self._reader_net]
+            return 0, None
+        moved = value != old
+        n = int(np.dot(moved, self._rd_count))  # readers whose state changes
+        if n > most:  # (many: all of them at once is cheaper than picking them out)
+            states[self._readers] = value[self._reader_net]
+            return n, None
+        if poked is not None and poked.size:
+            more = self._pin_net[poked]
+            moved[more[more >= 0]] = True
+        nets = np.flatnonzero(moved)
+        return self._hand_out(nets, value[nets], most)
+
+    def _carry_some(self, nets: np.ndarray, most: int) -> tuple[int, np.ndarray | None]:
+        """_carry for just these nets (no repeats): no other net's drivers changed."""
+        if not nets.size:
+            return 0, nets
+        states = self._pins.states
+        value = np.zeros(len(nets), CODE)
+        conflict = np.zeros(len(nets), bool)
+        solo = self._solo_of[nets]
+        m = solo >= 0
+        value[m] = states[solo[m]]
+        g = self._multi_at[nets]
+        m = g >= 0
+        if m.any():
+            d, starts = _gather(self._drivers, self._drv_starts[g[m]], self._drv_count[g[m]], states)
+            value[m] = resolve(d, starts)
+            conflict[m] = fights(d, starts)
+        g = self._weak_at[nets]
+        m = (g >= 0) & (value == Z)
+        if m.any():
+            w, starts = _gather(self._weak, self._weak_starts[g[m]], self._weak_count[g[m]], states)
+            value[m] = resolve(w, starts)
+            conflict[m] = fights(w, starts)
+        self.net_value[nets] = value
+        self.net_conflict[nets] = conflict
+        return self._hand_out(nets, value, most)
+
+    def _hand_out(
+        self, nets: np.ndarray, value: np.ndarray, most: int
+    ) -> tuple[int, np.ndarray | None]:
+        """Give these nets' readers their net's new value. How many readers changed, and
+        their parts (None: more than `most`)."""
+        states = self._pins.states
+        first = self._rd_start[nets]
+        count = self._rd_start[nets + 1] - first
+        readers = self._rd_sorted[_segments(first, count)]
+        new = np.repeat(value, count)
+        diff = states[readers] != new
+        states[readers[diff]] = new[diff]
+        n = int(np.count_nonzero(diff))
+        return n, (None if n > most else self._pins.part[readers[diff]])
 
     def run_until_stable(self, limit: int) -> int | None:
         """Step until a step changes no pin and nothing is settling any more, at most
@@ -1522,9 +1699,8 @@ class Circuit:
         never got there (it oscillates, or just needs more). A part that isn't pure
         may change the world without changing a pin; it counts as stable all the same."""
         for n in range(limit + 1):
-            before = self._pins.states.copy()
             self.step()
-            if not self._settling and np.array_equal(before, self._pins.states):
+            if not self._settling and self._quiet:
                 return n
         return None
 
@@ -1568,7 +1744,17 @@ class Circuit:
                         slots,
                     )
                 )
+            n = self._n_part_slots
+            self._batch_of = np.full(n, -1, np.intp)
+            self._batch_pos = np.zeros(n, np.intp)
+            self._n_pure = 0
+            for b, batch in enumerate(self._batches):
+                self._batch_of[batch.slots] = b
+                self._batch_pos[batch.slots] = np.arange(len(batch.slots))
+                if batch.type.pure:
+                    self._n_pure += len(batch.slots)
             self._batches_dirty = False
+            self._full = True
         return self._batches
 
     def _by_kind(self) -> dict[PartType, np.ndarray]:
@@ -1607,6 +1793,7 @@ class Circuit:
                 self._changed_all = True
                 for s in self._by_kind().get(t, np.empty(0, np.intp)).tolist():
                     self._pins.states[self._drive_slots(s)] = X
+                self._full = True
             return _FAILED
 
 
@@ -1623,6 +1810,43 @@ def _by_uid(wires) -> list[Wire]:
     """Creation order: uids grow as wires are made, and a wire's parents are always older
     (a merge keeps the older wire), so this also puts parents before children."""
     return sorted(wires, key=lambda w: w.uid)
+
+
+def _groups_by_net(
+    n_nets: int, nets: np.ndarray, starts: np.ndarray, total: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """For _grouped's output: per net, its group (-1: none); per group, its size."""
+    at = np.full(n_nets, -1, np.intp)
+    at[nets] = np.arange(len(nets))
+    return at, np.diff(np.append(starts, total)).astype(np.intp)
+
+
+def _distinct(a: np.ndarray, size: int) -> np.ndarray:
+    """The values in `a` (all in range(size)), once each, ascending: by sorting when
+    they're few next to `size`, else by marking them in a mask. (np.unique is slow at
+    both ends: it hashes, and has a lot of overhead for a few.)"""
+    if len(a) < 2:
+        return a
+    if len(a) * 16 < size:
+        a = np.sort(a)
+        return a[np.concatenate(([True], a[1:] != a[:-1]))]
+    mask = np.zeros(size, bool)
+    mask[a] = True
+    return np.flatnonzero(mask)
+
+
+def _segments(first: np.ndarray, count: np.ndarray) -> np.ndarray:
+    """first[0], first[0] + 1, ... (count[0] of them), then the same for [1], ..."""
+    ends = np.cumsum(count)
+    total = int(ends[-1]) if len(ends) else 0
+    return np.repeat(first - (ends - count), count) + np.arange(total)
+
+
+def _gather(
+    slots: np.ndarray, first: np.ndarray, count: np.ndarray, states: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Some groups of a _grouped array: their pins' states, and where each group starts."""
+    return states[slots[_segments(first, count)]], np.cumsum(count) - count
 
 
 def _grouped(

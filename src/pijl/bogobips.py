@@ -1,6 +1,6 @@
 """bogobips: BIt-shifts Per Second. A play on bogomips, and about as scientific.
 
-    pijl bench bogobips [--kind sipo,piso,tree,decoder,adder] [--depth ...]
+    pijl bench bogobips [--kind sipo,piso,counter,lfsr,tree,decoder,adder] [--depth ...]
                         [--layers engine,settle,pipe] [--seconds 0.5] [--seed 0]
                         [--flips 1] [--nest]
 
@@ -18,6 +18,12 @@ Kinds, and what --depth means for each:
     readout. Flip-flops are NAND master-slave ones.
   - piso (parallel in, serial out; depth = stages): a word loaded at once (a mux in
     front of every stage), then shifted out a bit per clock. Stresses driving.
+  - counter (depth = bits): a synchronous binary counter, E random every clock.
+    Every bit's next value goes through logic that reads it back (a ripple of
+    ANDs), so the whole thing is one loop: the shape of real sequential logic.
+    Few bits change per clock, but a carry can run the whole width.
+  - lfsr (depth = stages): a shift register feeding the XNOR of its last two
+    stages back into the first. One loop through every stage, every stage busy.
   - tree-and, tree-xor (depth = levels: 2^depth inputs, one output): a binary tree
     of gates, everything merging into one. Each vector flips --flips random
     inputs. AND is where changes die out (one 0 settles a gate, so a random tree is
@@ -235,6 +241,66 @@ def piso_script(n: int, rng: np.random.Generator, flips: int) -> Iterator[Step]:
             yield ((0, "001"),), True, lambda w=word, k=k: w[n - 1 - k]  # out = p(n-k)
 
 
+# ---- state fed back through logic ----------------------------------------------------
+
+
+def counter(n: int) -> Snapshot:
+    """R, E, C -> q0 .. q(n-1) (q0 the lowest bit): a synchronous binary counter.
+    Bit i toggles when E and every bit below it are 1 (a ripple of ANDs, so a carry
+    can run the whole width); R high clears it on the clock. Every bit's next value
+    goes through logic that reads it: one loop through the whole thing."""
+    b = _Board()
+    r, e, c = _ins(b, ["R", "E", "C"])
+    outs = _outs(b, [f"q{i}" for i in range(n)])
+    keep = b.gate("NOT", r)
+    t = e
+    for out in outs:
+        ff = b.add(MACRO + "dff")
+        b.wire(b.gate("AND", b.gate("XOR", ff, t), keep), ff, 0)
+        b.wire(c, ff, 1), b.wire(ff, out)
+        t = b.gate("AND", t, ff)
+    return b.snapshot()
+
+
+def counter_script(n: int, rng: np.random.Generator, flips: int) -> Iterator[Step]:
+    """Inputs R, E, C. A clearing clock, then clocks with E random."""
+    yield ((0, "100"),), False, None
+    yield ((0, "101"),), True, lambda: "0" * n
+    value, mask = 0, (1 << n) - 1
+    while True:
+        for e in rng.integers(0, 2, 4096).tolist():
+            yield ((0, "0" + "01"[e] + "0"),), False, None
+            value = (value + e) & mask
+            yield ((2, "1"),), True, lambda v=value: format(v, f"0{n}b")[::-1]
+
+
+def lfsr(n: int) -> Snapshot:
+    """R, C -> q1 .. qn: a shift register whose first stage takes the XNOR of the last
+    two (Fibonacci style; all zeros is a fine state with XNOR). R high clears it on the
+    clock. The feedback closes a loop through every stage."""
+    b = _Board()
+    r, c = _ins(b, ["R", "C"])
+    outs = _outs(b, [f"q{j}" for j in range(1, n + 1)])
+    keep = b.gate("NOT", r)
+    ffs = [b.add(MACRO + "dff") for _ in outs]
+    feedback = b.gate("NOT", b.gate("XOR", ffs[-1], ffs[-2]))
+    for ff, prev, out in zip(ffs, [feedback] + ffs[:-1], outs):
+        b.wire(b.gate("AND", prev, keep), ff, 0)
+        b.wire(c, ff, 1), b.wire(ff, out)
+    return b.snapshot()
+
+
+def lfsr_script(n: int, rng: np.random.Generator, flips: int) -> Iterator[Step]:
+    """Inputs R, C. A clearing clock, then free running (no stimulus to draw)."""
+    yield ((0, "10"),), False, None
+    yield ((0, "11"),), True, lambda: "0" * n
+    state, mask = 0, (1 << n) - 1  # bit i = q(i+1)
+    while True:
+        yield ((0, "00"),), False, None
+        state = ((state << 1) | (1 ^ (state >> (n - 1) & 1) ^ (state >> (n - 2) & 1))) & mask
+        yield ((1, "1"),), True, lambda s=state: format(s, f"0{n}b")[::-1]
+
+
 # ---- trees ---------------------------------------------------------------------------
 
 
@@ -407,13 +473,15 @@ KINDS = {
     for k in (
         Kind("sipo", lambda n, _: sipo(n), sipo_script, lambda n: n, None, (8, 64, 512, 4096), 1 << 20, 2),
         Kind("piso", lambda n, _: piso(n), piso_script, lambda n: n, None, (8, 64, 512, 4096), 1 << 20, 2),
+        Kind("counter", lambda n, _: counter(n), counter_script, lambda n: n, lambda n: n + 6, (8, 64, 512, 4096), 1 << 16, 2),
+        Kind("lfsr", lambda n, _: lfsr(n), lfsr_script, lambda n: n, None, (8, 64, 512, 4096), 1 << 20, 2),
         Kind("tree-and", lambda n, nest: tree("AND", n, nest), tree_script("AND"), lambda n: 2**n - 1, lambda n: n + 1, (4, 8, 12, 16), 22),
         Kind("tree-xor", lambda n, nest: tree("XOR", n, nest), tree_script("XOR"), lambda n: 2**n - 1, lambda n: n + 1, (4, 8, 12, 16), 22),
         Kind("decoder", lambda n, _: decoder(n), decoder_script, _decoder_gates, lambda n: _decoder_depth(n) + 1, (4, 8, 12, 16), 18),
         Kind("adder", adder, adder_script, lambda n: 5 * n, lambda n: 2 * n + 3, (8, 64, 512), 1 << 16),
     )
 }
-ALIASES = {"tree": ("tree-and", "tree-xor"), "shift": ("sipo", "piso")}
+ALIASES = {"tree": ("tree-and", "tree-xor"), "shift": ("sipo", "piso"), "loop": ("counter", "lfsr")}
 
 
 def make_project(root: Path, plan: list[tuple[str, int]], nest: bool = False) -> Engine:
@@ -425,7 +493,7 @@ def make_project(root: Path, plan: list[tuple[str, int]], nest: bool = False) ->
     eng = Engine(path)
     save = eng.store.save
     kinds = {k for k, _ in plan}
-    if kinds & {"sipo", "piso"}:
+    if kinds & {"sipo", "piso", "counter", "lfsr"}:
         save("dff", dff())
         save("pstage", stage(), eng.catalog)
     if nest and "adder" in kinds:

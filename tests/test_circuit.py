@@ -441,3 +441,54 @@ def test_merge_onto_a_free_end_leaves_a_free_end():
     stub, _ = c.connect(trunk, FREE)
     c.merge(trunk, stub)
     assert trunk.dst is trunk and c.wires == [trunk]
+
+
+# ---- dirty-set evaluation --------------------------------------------------------------
+
+
+def test_dirty_set_matches_running_everything():
+    """Circuit.step only runs pure parts whose inputs changed and carries only nets
+    whose drivers did. It must match running everything (incremental = False) tick
+    for tick: random boards with loops, fights, tri-states and pulls, pins written from
+    outside (inputs and outputs alike, X and Z included), settling, and wiring edits
+    while it runs."""
+    import random
+
+    kinds = ["IN", "NAND", "AND", "OR", "NOT", "XOR", "BUF", "TRI", "PULLUP", "PULLDOWN", "OUT"]
+    levels = [ZERO, ONE, X, Z]
+
+    def build(seed: int, incremental: bool):
+        rng = random.Random(seed)
+        c = Circuit(settle_ticks=rng.choice([0, 0, 6]), seed=seed)
+        c.incremental = incremental
+        parts = [c.add_part(rng.choice(kinds)) for _ in range(rng.randint(4, 40))]
+        outs = [q for p in parts for q in p.outputs]
+        ins = [q for p in parts for q in p.inputs]
+        for pin in ins:
+            if outs and rng.random() < 0.9:
+                c.connect(rng.choice(outs), pin, check=False)
+        for _ in range(rng.randint(0, 4)):  # outputs wired together: fights
+            if len(outs) > 1:
+                c.connect(rng.choice(outs), rng.choice(outs), check=False)
+        return rng, c, parts, outs, ins
+
+    for seed in range(60):
+        ra, a, pa, oa, ia = build(seed, True)
+        rb, b, pb, ob, ib = build(seed, False)
+        for tick in range(80):
+            for rng, c, parts, outs, ins in ((ra, a, pa, oa, ia), (rb, b, pb, ob, ib)):
+                r = rng.random()
+                if r < 0.25:  # drive a switch, or poke any pin at all
+                    pins = [p.outputs[0] for p in parts if p.kind == "IN"] or outs
+                    if rng.random() < 0.3:
+                        pins = outs + ins
+                    if pins:
+                        rng.choice(pins).state = rng.choice(levels)
+                elif r < 0.27 and outs and ins:  # an edit while it runs
+                    c.connect(rng.choice(outs), rng.choice(ins), check=False)
+                c.step()
+            n = a._pins.n
+            assert np.array_equal(a._pins.states[:n], b._pins.states[:n]), (seed, tick)
+            assert np.array_equal(a.net_value, b.net_value), (seed, tick)
+            assert np.array_equal(a.net_conflict, b.net_conflict), (seed, tick)
+        assert a.run_until_stable(200) == b.run_until_stable(200), seed

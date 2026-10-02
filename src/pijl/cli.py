@@ -124,7 +124,7 @@ def _parser() -> argparse.ArgumentParser:
         description="bogobips: BIt-shifts Per Second through generated shift registers. See `pydoc pijl.bogobips`.",
     )
     bench.add_argument("name", choices=["bogobips"])
-    bench.add_argument("--kind", default="sipo,piso,tree,decoder,adder", help="any of sipo, piso, tree-and, tree-xor (tree: both), decoder, adder (default: all)")
+    bench.add_argument("--kind", default="sipo,piso,counter,lfsr,tree,decoder,adder", help="any of sipo, piso (shift: both), counter, lfsr (loop: both), tree-and, tree-xor (tree: both), decoder, adder (default: all)")
     bench.add_argument("--depth", help="depths, comma separated (default: each kind's own; see pydoc pijl.bogobips)")
     bench.add_argument("--layers", default="engine,settle,pipe", help="which of engine, settle, pipe")
     bench.add_argument("--seconds", type=float, default=0.5, help="time spent per measurement (default 0.5)")

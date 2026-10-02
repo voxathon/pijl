@@ -208,7 +208,7 @@ class Harness:
             )
         if (codes == 255).any():
             raise ValueError(f"{bytes(raw).decode(errors='replace')!r}: levels are 0, 1, X and Z")
-        self.circuit._pins.states[self._in_slots[start : start + len(codes)]] = codes
+        self.circuit.write_pins(self._in_slots[start : start + len(codes)], codes)
 
     def bits(self) -> str:
         """Every output as one string of 0 / 1 / X / Z, in pin order (the fast read)."""

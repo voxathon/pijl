@@ -227,7 +227,7 @@ def test_raw_stream_refuses_junk(capsys):
 # ---- bogobips --------------------------------------------------------------------------
 
 
-SMALL = {"sipo": 5, "piso": 5, "tree-and": 4, "tree-xor": 4, "decoder": 5, "adder": 6}
+SMALL = {"sipo": 5, "piso": 5, "counter": 4, "lfsr": 5, "tree-and": 4, "tree-xor": 4, "decoder": 5, "adder": 6}
 
 
 @pytest.mark.parametrize("nest", [False, True])
