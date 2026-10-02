@@ -99,6 +99,7 @@ CONTROLS: list[tuple[str, list[tuple[str, str]]]] = [
                 "in the picker: Rename... (boards using it keep it)",
             ),
             ("cogwheel -> Projects", "switch to another project, or make a new one"),
+            ("cogwheel -> Back to launcher", "close the editor; settings live there"),
         ],
     ),
     (

@@ -92,6 +92,37 @@ def remember_project(name: str) -> None:
         write_atomic(_settings_file(), json.dumps(settings, indent=2) + "\n")
 
 
+def rename_project(old: str, new: str) -> str:
+    """Rename a project's folder (and its trash folder), keeping it the last one open
+    if it was. Returns the new name; ValueError if it can't be called that."""
+    from .storage import check_name
+
+    new = check_name(new)
+    src, dst = projects_dir() / old, projects_dir() / new
+    if not (src / "project.json").is_file():
+        raise ValueError(f"there's no project {old!r}")
+    if new == old:
+        return new
+    if new.casefold() != old.casefold() and dst.exists():
+        raise ValueError(f"there's already a project called {new!r}")
+    was_last = last_project() == old
+    # (via a temporary name, so changing only the case works on Windows too)
+    def move(src: Path, dst: Path) -> None:
+        tmp = src.with_name(src.name + ".renaming")
+        os.replace(src, tmp)
+        os.replace(tmp, dst)
+
+    move(src, dst)
+    trash = data_root() / ".trashbin"
+    if (trash / old).is_dir() and (
+        new.casefold() == old.casefold() or not (trash / new).exists()
+    ):
+        move(trash / old, trash / new)
+    if was_last:
+        remember_project(new)
+    return new
+
+
 @dataclass(frozen=True)
 class Project:
     path: Path

@@ -80,7 +80,8 @@ Controls
                            nothing. Open definition opens the macro itself. See inside.py.
                            (opening, new and closing the window ask first if there are unsaved changes)
   cogwheel (bottom right)  Controls (the short version of this list, see controls.py: keep them in
-                           step), Open macro..., Projects: switch to another project or make a new one
+                           step), Open macro..., Projects: switch to another project or make a new one,
+                           Back to launcher (closes the editor; settings live in the launcher)
   Ctrl+Z / Ctrl+Y          undo / redo (also Ctrl+Shift+Z). During an action, Ctrl+Z cancels it.
                            Every finished edit is recorded automatically; see document.py.
   right-drag empty space   pan (middle-drag pans in any mode)
@@ -258,7 +259,12 @@ def _direction(
 
 
 class Editor(pyglet.window.Window):
-    def __init__(self) -> None:
+    def __init__(
+        self, project: str | None = None, settle_ticks: int = SETTLE_TICKS
+    ) -> None:
+        """`project`: the one to open (default: the one open last)."""
+        self.settle_ticks = settle_ticks
+        self.relaunch = False  # closed with "Back to launcher" (see run)
         self.history: History | None = (
             None  # set up by _start_document; checked by dispatch_event
         )
@@ -271,11 +277,11 @@ class Editor(pyglet.window.Window):
         self.load_problems: list[str] = []
         try:
             project = Project.open(
-                last_project()
+                project or last_project()
             )  # created on first run (see project.py)
         except (OSError, ValueError) as e:
             self.load_problems.append(
-                f"can't open the last project ({e}); opened the default one"
+                f"can't open project {project or last_project()!r} ({e}); opened the default one"
             )
             project = Project.open()
         self._bind_project(project)
@@ -3157,7 +3163,7 @@ class Editor(pyglet.window.Window):
         # A fresh circuit and view tables: their slots are never reused (a stale handle
         # mustn't see a newer part), so without this every board opened since start
         # would still take up its rows.
-        self.circuit = Circuit(self.catalog, settle_ticks=SETTLE_TICKS)
+        self.circuit = Circuit(self.catalog, settle_ticks=self.settle_ticks)
         self.wire_index.clear()
         self.part_index.clear()
         self.wire_table = WireTable(self.world, self.layers, self.wire_index)
@@ -3414,7 +3420,7 @@ class Editor(pyglet.window.Window):
             self.store.title,
             self.store.uses,
         )
-        self.circuit = Circuit(self.catalog, settle_ticks=SETTLE_TICKS)
+        self.circuit = Circuit(self.catalog, settle_ticks=self.settle_ticks)
 
     def _cog_menu(self) -> None:
         current = self.project.name
@@ -3431,8 +3437,19 @@ class Editor(pyglet.window.Window):
                 MenuItem("Controls", self._show_controls),
                 MenuItem("Open macro...", self._open_dialog),
                 MenuItem("Projects", submenu=projects),
+                MenuItem("Back to launcher", self._back_to_launcher),
             ],
         )
+
+    def _back_to_launcher(self) -> None:
+        """Close the editor; run() then says to start a fresh pijl with the launcher
+        (a fresh one, because settings like the UI scale only apply at startup)."""
+
+        def go() -> None:
+            self.relaunch = True
+            self._quit()
+
+        self._unsaved_then(go)
 
     def _show_controls(self) -> None:
         sheet = ControlsSheet(self.hud, self.width, self.height, self._pixel_ratio())
@@ -3678,6 +3695,8 @@ def _pin_part_uids(wire_data) -> set[int]:
     }
 
 
-def run() -> None:
-    Editor()
+def run(project: str | None = None, settle_ticks: int = SETTLE_TICKS) -> bool:
+    """Open the editor until it's closed. True: it asked for the launcher back."""
+    editor = Editor(project, settle_ticks)
     pyglet.app.run()
+    return editor.relaunch

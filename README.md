@@ -28,7 +28,13 @@ pip install pijl
 pijl
 ```
 
-On Windows, `pijl-gui` launches the editor without a console window.
+This opens the launcher: start the editor on the last project, pick, rename or
+make projects, change the settings, or run a macro headless. `pijl gui` skips
+the launcher and goes straight to the editor; `pijl --tui` shows the launcher in
+the terminal instead of a window; `pijl prefs` shows the settings, and
+`pijl prefs ui.scale=1.5` changes one.
+
+On Windows, `pijl-gui` launches without a console window.
 
 Projects are saved under `%APPDATA%\pijl` on Windows (set `PIJL_DATA` to use a
 different location).

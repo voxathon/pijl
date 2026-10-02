@@ -1,5 +1,6 @@
 """The bar along the bottom of the window: what's open, a few runtime numbers, and
-a cogwheel that opens the settings menu (projects, controls; see Editor._cog_menu).
+a cogwheel that opens the editor's menu (projects, controls, back to the launcher; see
+Editor._cog_menu).
 
 Screen space (HUD batch). It runs from the picker's edge to the right edge of the
 window, following the picker as it slides in and out. This module only lays out,

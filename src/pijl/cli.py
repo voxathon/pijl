@@ -1,13 +1,16 @@
-"""The launcher: what `pijl` (and main.py, and `python -m pijl`) does with its arguments.
+"""What `pijl` (and main.py, and `python -m pijl`) does with its arguments.
 
-    pijl                          the editor (same as `pijl gui`)
+    pijl                          the launcher (see launcher.py; --tui: in the terminal)
+    pijl gui                      the editor, skipping the launcher
+    pijl prefs [KEY=VALUE...]     show or change the preferences (see prefs.py)
     pijl list [--projects]        the project's macros and their pins
     pijl bench bogobips           the shift register benchmark (see bogobips.py)
     pijl run MACRO [VALUES...]    run a macro headless (see below)
 
 Global: --project NAME|PATH (default: the one the editor had open last),
 --data DIR (the data root, like PIJL_DATA) and --engine OPTIONS (the engine's code
-paths, like PIJL_ENGINE: "dirty=off"; see pijl/sim/config.py). Headless commands
+paths, like PIJL_ENGINE: "dirty=off"; see pijl/sim/config.py). The engine options
+come from --engine, else PIJL_ENGINE, else the preferences. Headless commands
 never import pyglet.
 
 `pijl run` drives the macro's inputs from outside and prints its outputs:
@@ -47,26 +50,50 @@ if TYPE_CHECKING:
     from .engine import Harness
     from .logic import Level
 
-COMMANDS = ("gui", "run", "list", "bench")
+COMMANDS = ("launch", "gui", "prefs", "run", "list", "bench")
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    args = _parser().parse_args(argv if _has_command(argv) else ["gui", *argv])
+    args = _parser().parse_args(argv if _has_command(argv) else ["launch", *argv])
     if args.data:
         os.environ["PIJL_DATA"] = args.data
-    if args.engine:
-        from .sim.config import EngineConfig, default, set_default
+    from . import prefs
+    from .sim.config import EngineConfig, set_default
 
+    if args.engine:
         try:
-            set_default(EngineConfig.parse(args.engine, default()))
+            EngineConfig.parse(args.engine)
         except ValueError as e:
             print(f"pijl: --engine: {e}", file=sys.stderr)
             return 2
+        # (in the environment, so whatever's started from here gets it too)
+        os.environ["PIJL_ENGINE"] = ",".join(
+            t for t in (os.environ.get("PIJL_ENGINE", ""), args.engine) if t
+        )
+    if args.command == "prefs":
+        return _prefs(args)
+    if args.command == "launch":
+        start = _launch(args)
+        return 0 if start is None else main(start)
+    values, problems = prefs.load()
+    for problem in problems:
+        print(f"pijl: warning: {problem}", file=sys.stderr)
+    try:
+        set_default(prefs.engine_config(values))
+    except ValueError as e:
+        print(f"pijl: PIJL_ENGINE: {e}", file=sys.stderr)
+        return 2
     if args.command == "gui":
-        from .ui import run  # (pyglet: only now)
+        from .ui import theme
 
-        run()
+        theme.UI_SCALE = values["ui.scale"]  # (before the editor's modules read it)
+        from .ui.editor import run  # (pyglet: only now)
+
+        if run(args.project, settle_ticks=values["editor.noise"]):
+            from .launcher import relaunch
+
+            return relaunch()
         return 0
     if args.command == "bench":
         from .bogobips import main as bogobips
@@ -85,8 +112,68 @@ def main(argv: list[str] | None = None) -> int:
     return _run(engine, args)
 
 
+def _launch(args) -> list[str] | None:
+    """Show the launcher (a window, else the terminal one); what to start, or None."""
+    from .launcher import STREAM_HELP, Launcher, has_console, terminal
+
+    try:
+        launcher = Launcher()
+        if args.project:
+            launcher.pick(args.project)
+    except (OSError, ValueError) as e:
+        _fail(str(e))
+        return None
+    start = None
+    if args.tui:
+        start = terminal(launcher)
+    else:
+        from .ui.launcher import NoWindow, run_window
+
+        try:
+            start = run_window(launcher)
+        except NoWindow as e:
+            if not has_console():
+                raise
+            print(f"pijl: no window ({e}); here's the terminal launcher", file=sys.stderr)
+            start = terminal(launcher)
+        else:
+            if start and start[0] == "run" and start[2] == "-":
+                print(STREAM_HELP, file=sys.stderr)
+    return start
+
+
+def _prefs(args) -> int:
+    from . import prefs
+
+    values, problems = prefs.load()
+    for problem in problems:
+        print(f"pijl: warning: {problem}", file=sys.stderr)
+    if args.reset:
+        values = prefs.defaults()
+    try:
+        for item in args.set:
+            key, eq, text = item.partition("=")
+            if not eq:
+                return _fail(f"{item!r}: expected KEY=VALUE", 2)
+            values[key.strip()] = prefs.parse_text(key.strip(), text)
+    except ValueError as e:
+        return _fail(str(e), 2)
+    if args.reset or args.set:
+        try:
+            prefs.save(values)
+        except OSError as e:
+            return _fail(f"can't save settings.json: {e}")
+    width = max(len(k) for k in prefs.PREFS)
+    for heading, group in prefs.SECTIONS:
+        print(f"# {heading}")
+        for key, setting in group.items():
+            mark = "" if values[key] == setting.initial else "  (changed)"
+            print(f"{key:<{width}}  {setting.show(values[key])}{mark}")
+    return 0
+
+
 def _has_command(argv: list[str]) -> bool:
-    """Is there a command among the arguments? (No command means the editor.)"""
+    """Is there a command among the arguments? (No command means the launcher.)"""
     for a in argv:
         if a in ("-h", "--help") or a in COMMANDS:
             return True
@@ -105,12 +192,17 @@ def _parser() -> argparse.ArgumentParser:
 
     p = argparse.ArgumentParser(
         prog="pijl",
-        description="A visual logic circuit editor and simulator. No command: the editor.",
+        description="A visual logic circuit editor and simulator. No command: the launcher.",
         parents=[common(None)],
     )
     common = common(argparse.SUPPRESS)
     sub = p.add_subparsers(dest="command", required=True)
-    sub.add_parser("gui", parents=[common], help="the editor (the default)")
+    launch = sub.add_parser("launch", parents=[common], help="the launcher (the default)")
+    launch.add_argument("--tui", action="store_true", help="in the terminal, not a window")
+    sub.add_parser("gui", parents=[common], help="the editor, skipping the launcher")
+    pr = sub.add_parser("prefs", parents=[common], help="show or change the preferences")
+    pr.add_argument("set", nargs="*", metavar="KEY=VALUE", help='e.g. ui.scale=1.5 "engine.dirty=off"')
+    pr.add_argument("--reset", action="store_true", help="everything back to its default (before any KEY=VALUE)")
     ls = sub.add_parser("list", parents=[common], help="the project's macros and their pins")
     ls.add_argument("--projects", action="store_true", help="list the projects instead")
     run = sub.add_parser(
