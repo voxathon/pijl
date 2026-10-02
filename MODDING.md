@@ -40,7 +40,7 @@ mods on and off, move them up and down the load order, see what's wrong with eac
 one, and switch safe start on or off. When the page rewrites a list, comment and
 blank lines stay where they are.
 
-## Official mods
+## Bundled mods
 
 Some mods ship with pijl. The first time pijl sees the mods folder without one,
 it copies the mod in. It's new, so it starts out disabled, like any other. If you

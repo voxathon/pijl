@@ -1,4 +1,4 @@
-"""Official mods (mods.OFFICIAL): installed into the mods folder, disabled, upgraded;
+"""Bundled mods (mods.BUNDLED): installed into the mods folder, disabled, upgraded;
 and manuscript, the logging one."""
 
 import json
@@ -12,7 +12,7 @@ import pytest
 from pijl import mods
 from pijl.project import data_root
 
-SHIPPED = Path(mods.__file__).parent / "official_mods"
+SHIPPED = Path(mods.__file__).parent / "bundled"
 LOGGERS = ("pijl", "pijl.edit", "pijl.sim", "pijl_mods", "pijl_mods.manuscript", "py.warnings")
 
 
@@ -21,7 +21,7 @@ def fresh(tmp_path, monkeypatch):
     monkeypatch.setenv("PIJL_DATA", str(tmp_path / "data"))
     monkeypatch.setenv("PIJL_MODS", "")
     monkeypatch.setenv("PIJL_SAFE", "")
-    monkeypatch.setattr(mods, "OFFICIAL", SHIPPED)
+    monkeypatch.setattr(mods, "BUNDLED", SHIPPED)
     monkeypatch.setattr(sys, "excepthook", sys.excepthook)
     monkeypatch.setattr(sys, "stderr", sys.stderr)
     monkeypatch.setattr(threading, "excepthook", threading.excepthook)
@@ -45,7 +45,7 @@ def folder() -> Path:
     return data_root() / "mods"
 
 
-def test_official_mods_are_installed_disabled():
+def test_bundled_mods_are_installed_disabled():
     p = mods.plan()
     assert "manuscript" in [m.name for m in p.new]
     assert (folder() / "manuscript" / "__init__.py").is_file()
@@ -53,7 +53,7 @@ def test_official_mods_are_installed_disabled():
     assert mods.load().loaded == []
 
 
-def test_a_deleted_official_mod_stays_deleted():
+def test_a_deleted_bundled_mod_stays_deleted():
     mods.plan()
     for f in (folder() / "manuscript").iterdir():
         f.unlink()
@@ -62,7 +62,7 @@ def test_a_deleted_official_mod_stays_deleted():
     assert not (folder() / "manuscript").exists()
 
 
-def test_a_newer_official_mod_is_copied_over_keeping_config_and_logs():
+def test_a_newer_bundled_mod_is_copied_over_keeping_config_and_logs():
     mods.plan()
     mine = folder() / "manuscript"
     (mine / "mod.json").write_text(json.dumps({"version": "0.1"}))

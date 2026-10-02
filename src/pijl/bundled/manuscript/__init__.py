@@ -1,4 +1,4 @@
-"""Manuscript: an official pijl mod that writes everything pijl logs into files.
+"""Manuscript: a bundled mod that writes everything pijl logs into files.
 
 pijl logs to the "pijl.*" loggers but attaches no handlers (see pijl/__init__.py).
 Manuscript attaches one: a file per run in logs/, next to this file, plus

@@ -15,7 +15,7 @@ patched name. Patch methods on classes rather than module-level functions: a
 
 (PIJL_MODS: another mods folder.)
 
-Official mods ship inside pijl (OFFICIAL) and are copied into the mods folder when
+Bundled mods ship inside pijl (BUNDLED) and are copied into the mods folder when
 it's planned, like any mod dropped in by hand: so they start out disabled. A name
 that's in either list but not on disk was deleted by the user and stays deleted.
 When pijl ships a newer version (mod.json's), its files are copied over the old
@@ -64,10 +64,8 @@ PACKAGE = "pijl_mods"
 LOADORDER = "loadorder.txt"
 DISABLED = "disabled.txt"
 MANIFEST = "mod.json"
-SENTINEL = "mods.loading"
-OFFICIAL = (
-    Path(__file__).parent / "official_mods"
-)  # in the data root, while mods load and pijl starts
+SENTINEL = "mods.loading"  # in the data root, while mods load and pijl starts
+BUNDLED = Path(__file__).parent / "bundled"  # mods that ship with pijl
 
 LOADORDER_HEAD = (
     "# Mods that load, in this order: one folder or script name per line.\n"
@@ -318,7 +316,7 @@ def plan(folder: Path | None = None, write: bool = True) -> Plan:
     and append new mods to disabled.txt."""
     folder = mods_dir() if folder is None else folder
     if write:
-        install_official(folder)
+        install_bundled(folder)
     mods = discover(folder)
     order, off = read_list(folder / LOADORDER), read_list(folder / DISABLED)
     off_keys = {n.casefold() for n in off}
@@ -347,13 +345,13 @@ def plan(folder: Path | None = None, write: bool = True) -> Plan:
     return Plan(folder, mods, enabled, disabled, new, missing, both)
 
 
-def install_official(folder: Path) -> list[str]:
-    """Copy the official mods into `folder`: the ones not there yet (unless a list
+def install_bundled(folder: Path) -> list[str]:
+    """Copy the bundled mods into `folder`: the ones not there yet (unless a list
     names them: then they were deleted), and newer versions over older ones (only
     the shipped files). Returns the names copied."""
     try:
         shipped = [
-            p for p in sorted(OFFICIAL.iterdir()) if (p / "__init__.py").is_file()
+            p for p in sorted(BUNDLED.iterdir()) if (p / "__init__.py").is_file()
         ]
     except OSError:
         return []
@@ -385,7 +383,7 @@ def install_official(folder: Path) -> list[str]:
                 ignore=shutil.ignore_patterns("__pycache__"),
             )
         except OSError as e:
-            log.warning("can't install the official mod %s: %s", src.name, e)
+            log.warning("can't install the bundled mod %s: %s", src.name, e)
             continue
         copied.append(src.name)
     return copied
