@@ -568,6 +568,26 @@ def _size(change: Change) -> int:
     )
 
 
+def describe(change: Change) -> str:
+    """A step in a few words, for the log: "+3 parts, -1 wire, 40 moved"."""
+    out = []
+    for (before, after, moves), what in zip(change, ("part", "wire", "color")):
+        added = len(after.keys() - before.keys())
+        gone = len(before.keys() - after.keys())
+        changed = len(before.keys() & after.keys())
+        moved = sum(len(uids) for uids, _, _ in moves)
+        if what == "color":
+            if added or gone or changed:
+                out.append(f"{added + gone + changed} wire color{'s' * (added + gone + changed > 1)}")
+            continue
+        for n, sign in ((added, "+"), (gone, "-"), (changed, "~")):
+            if n:
+                out.append(f"{sign}{n} {what}{'s' * (n > 1)}")
+        if moved:
+            out.append(f"{moved} {what}{'s' * (moved > 1)} moved")
+    return ", ".join(out) or "nothing"
+
+
 def _empty(change: Change) -> bool:
     return not any(b or a or m for b, a, m in change)
 

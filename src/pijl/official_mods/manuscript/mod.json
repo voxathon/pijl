@@ -1,0 +1,7 @@
+{
+    "name": "Manuscript",
+    "version": "1.0",
+    "description": "Writes a log of what pijl does into its own folder: starts, mods, projects, opens and saves, every edit, undo and redo, problems, crashes.",
+    "author": "pijl",
+    "pijl": ">=0.3.3"
+}

@@ -43,7 +43,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
+import platform
 import re
 import sys
 from typing import TYPE_CHECKING, Any, BinaryIO, TextIO
@@ -51,6 +53,8 @@ from typing import TYPE_CHECKING, Any, BinaryIO, TextIO
 if TYPE_CHECKING:
     from .engine import Harness
     from .logic import Level
+
+log = logging.getLogger("pijl.app")
 
 COMMANDS = ("launch", "gui", "prefs", "run", "list", "bench")
 
@@ -92,6 +96,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"pijl: PIJL_ENGINE: {e}", file=sys.stderr)
         return 2
     _load_mods(settle=args.command != "gui")  # (the editor says when it's up)
+    from . import __version__
+    from .sim.config import default
+
+    log.info(
+        "pijl %s, python %s, %s: %s",
+        __version__, platform.python_version(), platform.platform(), " ".join(argv) or "(launcher)",
+    )
+    logging.getLogger("pijl.sim").info("engine: %s", default())
     if args.command == "gui":
         from .ui import theme
 
@@ -308,6 +320,7 @@ def _run(engine, args) -> int:
             if not h.settle(args.max_ticks):
                 unsettled = True
                 print(f"pijl: warning: not stable after {args.max_ticks} ticks", file=sys.stderr)
+                logging.getLogger("pijl.sim").warning("not stable after %d ticks", args.max_ticks)
         else:
             h.step(args.ticks)
         for problem in h.problems:
@@ -521,4 +534,5 @@ def _quote(name: str) -> str:
 
 def _fail(msg: str, status: int = 1) -> int:
     print(f"pijl: {msg}", file=sys.stderr)
+    log.error("%s (exit %d)", msg, status)
     return status

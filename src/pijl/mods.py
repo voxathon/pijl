@@ -15,6 +15,12 @@ patched name. Patch methods on classes rather than module-level functions: a
 
 (PIJL_MODS: another mods folder.)
 
+Official mods ship inside pijl (OFFICIAL) and are copied into the mods folder when
+it's planned, like any mod dropped in by hand: so they start out disabled. A name
+that's in either list but not on disk was deleted by the user and stays deleted.
+When pijl ships a newer version (mod.json's), its files are copied over the old
+ones; anything else in the mod's folder (its config, its logs) is left alone.
+
 The two lists: one name per line, any mix of LF / CRLF / CR, blank lines and
 "#..." lines ignored, names compared without case. A mod on disk that's in neither
 list is new and gets appended to disabled.txt. A name in both is disabled. A name
@@ -39,8 +45,10 @@ import importlib.abc
 import importlib.machinery
 import importlib.util
 import json
+import logging
 import os
 import re
+import shutil
 import sys
 import traceback
 from collections.abc import Callable
@@ -50,19 +58,22 @@ from types import ModuleType
 
 from . import __version__
 
+log = logging.getLogger("pijl.mods")
+
 PACKAGE = "pijl_mods"
 LOADORDER = "loadorder.txt"
 DISABLED = "disabled.txt"
 MANIFEST = "mod.json"
-SENTINEL = "mods.loading"  # in the data root, while mods load and pijl starts
+SENTINEL = "mods.loading"
+OFFICIAL = (
+    Path(__file__).parent / "official_mods"
+)  # in the data root, while mods load and pijl starts
 
 LOADORDER_HEAD = (
     "# Mods that load, in this order: one folder or script name per line.\n"
     "# Move a name here from disabled.txt to turn it on.\n"
 )
-DISABLED_HEAD = (
-    "# Mods that don't load. New mods are added here.\n"
-)
+DISABLED_HEAD = "# Mods that don't load. New mods are added here.\n"
 
 
 def mods_dir() -> Path:
@@ -132,10 +143,14 @@ def discover(folder: Path) -> dict[str, Mod]:
         if key in found:  # foo/ and foo.py: Python imports the folder
             if p.is_dir():
                 found[key], mod = mod, found[key]
-            found[key].warnings.append(f"{mod.path.name} has the same name; it's ignored")
+            found[key].warnings.append(
+                f"{mod.path.name} has the same name; it's ignored"
+            )
             continue
         if not name.isidentifier():
-            mod.problems.append(f"{name!r} isn't a valid module name (letters, digits, _)")
+            mod.problems.append(
+                f"{name!r} isn't a valid module name (letters, digits, _)"
+            )
         mod.manifest, mod.warnings = read_manifest(mod)
         found[key] = mod
     return found
@@ -242,14 +257,20 @@ def enable(name: str, folder: Path | None = None) -> None:
     name = found.name if found else name  # (spelled as on disk)
     order = _without(_dedup(read_list(folder / LOADORDER)), name) + [name]
     write_list(folder / LOADORDER, order, LOADORDER_HEAD)
-    write_list(folder / DISABLED, _without(read_list(folder / DISABLED), name), DISABLED_HEAD)
+    write_list(
+        folder / DISABLED, _without(read_list(folder / DISABLED), name), DISABLED_HEAD
+    )
 
 
 def disable(name: str, folder: Path | None = None) -> None:
     """Turn a mod off: out of the load order, into disabled.txt (if it's on disk;
     a missing one is just forgotten)."""
     folder = mods_dir() if folder is None else folder
-    write_list(folder / LOADORDER, _without(read_list(folder / LOADORDER), name), LOADORDER_HEAD)
+    write_list(
+        folder / LOADORDER,
+        _without(read_list(folder / LOADORDER), name),
+        LOADORDER_HEAD,
+    )
     off = _without(read_list(folder / DISABLED), name)
     if name.casefold() in discover(folder):
         off.append(name)
@@ -296,6 +317,8 @@ def plan(folder: Path | None = None, write: bool = True) -> Plan:
     """Read the lists; with `write`, create the folder and the lists if they're missing
     and append new mods to disabled.txt."""
     folder = mods_dir() if folder is None else folder
+    if write:
+        install_official(folder)
     mods = discover(folder)
     order, off = read_list(folder / LOADORDER), read_list(folder / DISABLED)
     off_keys = {n.casefold() for n in off}
@@ -322,6 +345,50 @@ def plan(folder: Path | None = None, write: bool = True) -> Plan:
         if new or not (folder / DISABLED).exists():
             append_list(folder / DISABLED, [m.name for m in new], DISABLED_HEAD)
     return Plan(folder, mods, enabled, disabled, new, missing, both)
+
+
+def install_official(folder: Path) -> list[str]:
+    """Copy the official mods into `folder`: the ones not there yet (unless a list
+    names them: then they were deleted), and newer versions over older ones (only
+    the shipped files). Returns the names copied."""
+    try:
+        shipped = [
+            p for p in sorted(OFFICIAL.iterdir()) if (p / "__init__.py").is_file()
+        ]
+    except OSError:
+        return []
+    listed = {
+        n.casefold()
+        for n in read_list(folder / LOADORDER) + read_list(folder / DISABLED)
+    }
+    copied = []
+    for src in shipped:
+        dst = folder / src.name
+        if dst.exists():
+            have = Mod(dst.name, dst)
+            have.manifest, _ = read_manifest(have)
+            new = Mod(src.name, src)
+            new.manifest, _ = read_manifest(new)
+            try:
+                if parse_version(new.version) <= parse_version(have.version):
+                    continue
+            except ValueError:
+                continue  # (no version on one side: leave theirs be)
+        elif src.name.casefold() in listed:
+            continue
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(
+                src,
+                dst,
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns("__pycache__"),
+            )
+        except OSError as e:
+            log.warning("can't install the official mod %s: %s", src.name, e)
+            continue
+        copied.append(src.name)
+    return copied
 
 
 def notes(p: Plan) -> dict[str, list[str]]:
@@ -421,7 +488,9 @@ def load(safe: bool | None = None, folder: Path | None = None) -> Report:
         return rep
     try:
         sentinel.parent.mkdir(parents=True, exist_ok=True)
-        sentinel.write_text(", ".join(m.name for m in p.enabled) + "\n", encoding="utf-8")
+        sentinel.write_text(
+            ", ".join(m.name for m in p.enabled) + "\n", encoding="utf-8"
+        )
     except OSError:
         pass
     package = _package(p.folder)
@@ -445,13 +514,19 @@ def load(safe: bool | None = None, folder: Path | None = None) -> Report:
             rep.problems.append(f"{mod.name}: {_last_line(e)}; not loaded")
             _tracebacks[mod.name] = traceback.format_exc()
             dotted = f"{package.__name__}.{mod.name}"
-            for k in [k for k in sys.modules if k == dotted or k.startswith(dotted + ".")]:
+            for k in [
+                k for k in sys.modules if k == dotted or k.startswith(dotted + ".")
+            ]:
                 del sys.modules[k]
             continue
         finally:
             _current = None
         rep.loaded.append(mod)
     _loading = False
+    # (only now: a mod that logs, like manuscript, has had the chance to listen)
+    log.info("%s", rep.summary())
+    for problem in rep.problems:
+        log.warning("%s", problem)
     return rep
 
 
@@ -531,7 +606,12 @@ def version_matches(version: str, spec: str) -> bool | None:
             n = max(len(have), len(want))
             a, b = have + (0,) * (n - len(have)), want + (0,) * (n - len(want))
             ok = {
-                ">=": a >= b, "<=": a <= b, ">": a > b, "<": a < b, "==": a == b, "!=": a != b
+                ">=": a >= b,
+                "<=": a <= b,
+                ">": a > b,
+                "<": a < b,
+                "==": a == b,
+                "!=": a != b,
             }[op]
             if not ok:
                 return False

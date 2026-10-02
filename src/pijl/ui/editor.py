@@ -99,6 +99,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 import sys
 import time
@@ -143,6 +144,7 @@ from .document import (
     capture,
     change_uids,
     changes,
+    describe,
     instantiate,
     instantiate_keyed,
     internal_wires,
@@ -199,6 +201,12 @@ FIT_MARGIN, FIT_MARGIN_SHARE = (
     0.05,
 )  # room around the board when fitting it: world units, or of its size
 STATS_EVERY = 0.25  # s: how often the status bar's numbers are refreshed (averaged over that time)
+
+
+log_app = logging.getLogger("pijl.app")
+log_files = logging.getLogger("pijl.files")
+log_edit = logging.getLogger("pijl.edit")
+log_ui = logging.getLogger("pijl.ui")
 
 
 class Mode(Enum):
@@ -2137,6 +2145,9 @@ class Editor(pyglet.window.Window):
                 self._report(f"couldn't delete {titles[name]}: {e}")
                 continue
             trashed.append([name, str(where)])
+            log_files.info(
+                "deleted %s [%s]%s", titles[name], name, "" if forever else f" (to the trash: {where})"
+            )
         done = [name for name, _ in trashed]
         self._forget_doc(done)
         self.catalog.book.forget()
@@ -2173,17 +2184,25 @@ class Editor(pyglet.window.Window):
         board = self.history.undo_stack[-1][2] if self.history.undo_stack else 0
         lib = self.lib_history.undo_stack
         if lib and lib[-1].stamp > board:
+            log_edit.info("undo (library)")
             self._apply_library(self.lib_history.undo(), undo=True)
         else:
-            self._apply(self.history.undo())
+            change = self.history.undo()
+            if change is not None:
+                log_edit.info("undo: %s", describe(change))
+            self._apply(change)
 
     def _redo(self) -> None:
         board = self.history.redo_stack[-1][2] if self.history.redo_stack else None
         lib = self.lib_history.redo_stack
         if lib and (board is None or lib[-1].stamp < board):
+            log_edit.info("redo (library)")
             self._apply_library(self.lib_history.redo(), undo=False)
         else:
-            self._apply(self.history.redo())
+            change = self.history.redo()
+            if change is not None:
+                log_edit.info("redo: %s", describe(change))
+            self._apply(change)
 
     def _library_checkpoint(self) -> None:
         """Record what the user did to the library since the last step, if anything."""
@@ -2281,6 +2300,7 @@ class Editor(pyglet.window.Window):
             self.lib_history.record(self.library.to_dict(), retitled=[(id, old, title)])
             self.history.redo_stack.clear()  # (see _record_touched)
             self.picker.refresh()
+            log_files.info("renamed %s to %s [%s]", old, title, id)
             self._notice(f"renamed {old} to {title}")
 
     def _retitle(self, titles: list[tuple[str, str]]) -> list[str]:
@@ -3080,6 +3100,7 @@ class Editor(pyglet.window.Window):
         self._unsaved_then(self._quit)
 
     def _quit(self) -> None:
+        log_app.info("editor closing")
         self._save_library()
         self.circuit.close_all()  # every opened part gets its close()
         self.close()
@@ -3087,11 +3108,13 @@ class Editor(pyglet.window.Window):
     def _report(self, msg: str) -> None:
         """Show a problem at the top of the window (the newest one) and on stderr."""
         print(msg, file=sys.stderr)
+        log_ui.warning("%s", msg)
         pyglet.clock.unschedule(self._clear_status)
         self.status.text, self.status.color = msg, T.MENU_DANGER
 
     def _notice(self, msg: str) -> None:
         """Show something worth knowing (not a problem) for a few seconds."""
+        log_ui.debug("%s", msg)
         pyglet.clock.unschedule(self._clear_status)
         self.status.text, self.status.color = msg, T.HELP_TEXT
         pyglet.clock.schedule_once(self._clear_status, NOTICE_SECONDS)
@@ -3145,6 +3168,12 @@ class Editor(pyglet.window.Window):
             recorded = self.history.record(*now, moves=moves)
         if recorded:  # one timeline: something new done means nothing left to redo
             self.lib_history.redo_stack.clear()
+            if log_edit.isEnabledFor(logging.DEBUG if amend else logging.INFO):
+                step = describe(self.history.undo_stack[-1][0])
+                if amend:
+                    log_edit.debug("edit (folded into the last step): %s", step)
+                else:
+                    log_edit.info("edit: %s", step)
         if paint_parts or paint_wires:
             paint(self, paint_parts | ends, paint_wires)
         return recorded
@@ -3217,9 +3246,12 @@ class Editor(pyglet.window.Window):
         self._reset_history(id)
         self.project.remember_open(id)
         self._fit_camera()
+        snap = loaded.snapshot
+        log_files.info("opened %s [%s]: %d parts, %d wires", name, id, len(snap.parts), len(snap.wires))
         if loaded.warnings:
             for w in loaded.warnings:
                 print(f"{name}: {w}", file=sys.stderr)
+                log_files.warning("%s: %s", name, w)
             more = (
                 f" (+{len(loaded.warnings) - 1} more, see the console)"
                 if len(loaded.warnings) > 1
@@ -3230,6 +3262,7 @@ class Editor(pyglet.window.Window):
             self._notice(f"opened {name}")
 
     def _new(self) -> None:
+        log_files.info("new board")
         self._clear_board()
         self._reset_history(None)
         self.project.remember_open(None)
@@ -3327,6 +3360,9 @@ class Editor(pyglet.window.Window):
         except (OSError, ValueError):
             pass  # (only a record)
         self._sync_library()
+        log_files.info(
+            "saved %s [%s]: %d parts, %d wires", self.doc_title, id, len(snap.parts), len(snap.wires)
+        )
         self._notice(f"saved {self.doc_title}")
         return True
 
@@ -3441,6 +3477,7 @@ class Editor(pyglet.window.Window):
         """Point everything at `project`: its part scripts, its macros, a fresh circuit.
         (Its picker library is loaded separately, see _load_library.)"""
         self.project = project
+        log_files.info("project %s (%s)", project.name, project.path)
         try:
             remember_project(project.name)
         except OSError as e:
@@ -3736,6 +3773,7 @@ def _pin_part_uids(wire_data) -> set[int]:
 def run(project: str | None = None, settle_ticks: int = SETTLE_TICKS) -> bool:
     """Open the editor until it's closed. True: it asked for the launcher back."""
     editor = Editor(project, settle_ticks)
+    log_app.info("editor up")
     mods.settled()  # (it's up: no crash to blame on the mods)
     pyglet.app.run()
     return editor.relaunch

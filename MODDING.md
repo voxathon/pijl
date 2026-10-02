@@ -40,6 +40,29 @@ mods on and off, move them up and down the load order, see what's wrong with eac
 one, and switch safe start on or off. When the page rewrites a list, comment and
 blank lines stay where they are.
 
+## Official mods
+
+Some mods ship with pijl. The first time pijl sees the mods folder without one,
+it copies the mod in. It's new, so it starts out disabled, like any other. If you
+delete it while its name is still in one of the lists, it stays deleted. When a
+pijl update brings a newer version (the `version` in its `mod.json`), the shipped
+files are copied over the old ones, and anything else in its folder stays.
+
+- **manuscript** writes pijl's log to files: one per run in `manuscript/logs/`, with
+  starts, loaded mods, projects, opens, saves, deletes and renames, every edit,
+  undo and redo, problems, and uncaught exceptions with their tracebacks. Its
+  settings are in `manuscript/config.json`, which it writes with the defaults on
+  its first run: `levels` (logger name -> `debug`, `info`, `warning`, `error` or
+  `off`), `keep` (how many log files), `crashes` and `stderr` (also copy
+  everything printed to stderr).
+
+## Logging
+
+pijl logs to Python's `logging`, under `pijl.app`, `pijl.mods`, `pijl.files`,
+`pijl.edit`, `pijl.ui` and `pijl.sim`, and attaches no handlers: without a mod
+that listens, nothing is written anywhere. To log from your own mod, use
+`logging.getLogger(__name__)` (that's `pijl_mods.<your mod>`). manuscript picks it up.
+
 ## Manifest
 
 The manifest is optional. Write it as `mod.json` in a folder mod, or as

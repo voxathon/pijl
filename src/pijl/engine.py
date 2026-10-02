@@ -28,6 +28,7 @@ Nothing here writes to the project: no settings.json, no remembered macro.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,9 @@ from .project import Project, last_project, project_names, projects_dir
 from .sim import Circuit
 from .sim.config import EngineConfig
 from .storage import MacroStore, load_file
+
+log_files = logging.getLogger("pijl.files")
+log_sim = logging.getLogger("pijl.sim")
 
 SETTLE_TICKS = 64  # power-on noise, like the editor's (see sim/circuit.py): latches pick a side
 MAX_TICKS = 10_000  # run-to-stable gives up after this many steps that change something
@@ -92,6 +96,7 @@ class Engine:
             known = ", ".join(project_names()) or "none"
             raise FileNotFoundError(f"no project at {path} (projects: {known})")
         self.project = Project(path)
+        log_files.info("project %s (%s)", self.project.name, path)
         # (no parts folder: a project the editor never opened, which would copy the
         # shipped templates into it; read those from the package instead)
         parts = self.project.parts_dir
@@ -170,6 +175,9 @@ class Harness:
         for i, led in enumerate(self._outs):
             c.connect(part.outputs[i], led.inputs[0])
         self.part = part
+        log_sim.debug(
+            "harness for %s: %d in, %d out, %s", macro.title, len(self.inputs), len(self.outputs), c.config
+        )
         self.last_ticks: int | None = 0  # what the last settle() took (None: gave up)
         # pin slots, for set_bits / bits: no handles or Levels per pin on the fast path
         self._in_slots = np.array([sw.outputs[0].slot for sw in self._ins], np.intp)
