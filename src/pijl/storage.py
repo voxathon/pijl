@@ -26,8 +26,7 @@ nicely in git:
   - "kind" names a part type (pijl.parts); a placed macro has "macro": its name
     instead, so the two can never collide.
   - "label", "props", "bends" and a wire's "color" (a name, see ui/theme.py
-    WIRE_COLORS) and "layer" (0 to 15, see snapshot.py) are left out when empty /
-    default.
+    WIRE_COLORS) are left out when empty / default.
   - A wire end is a pin ({"part", "in"/"out": index}), a macro's pin
     ({"part", "pin": uid of the IN/OUT inside the macro that it comes from}, so
     it survives the macro's ports being moved around), or a point along another
@@ -54,7 +53,7 @@ from typing import Any
 
 from .parts import Registry, check_props
 from .project import write_atomic
-from .snapshot import LAYER_COUNT, MACRO, EndRef, Point, Snapshot
+from .snapshot import MACRO, EndRef, Point, Snapshot
 
 FORMAT = 1
 NAME_MAX = 40
@@ -135,8 +134,6 @@ def encode(
             d["bends"] = [_point(p) for p in bends]
         if uid in snap.wire_colors:
             d["color"] = snap.wire_colors[uid]
-        if snap.wire_layers.get(uid):
-            d["layer"] = snap.wire_layers[uid]
         wires.append(d)
     head: dict[str, Any] = {"pijl": FORMAT}
     if title is not None:
@@ -220,16 +217,11 @@ def decode(data: Any, types: Registry) -> Loaded:
             color = d.get("color")
             if color is not None and not isinstance(color, str):
                 raise ValueError("bad color")
-            layer = _int(d.get("layer", 0))
-            if not 0 <= layer < LAYER_COUNT:
-                raise ValueError(f"no layer {layer}")
             out.snapshot.wires[uid] = (src, dst, bends, src_pt, dst_pt)
             if color:
                 out.snapshot.wire_colors[uid] = (
                     color  # names the UI doesn't know draw as default
                 )
-            if layer:
-                out.snapshot.wire_layers[uid] = layer
         except (KeyError, TypeError, ValueError) as e:
             warn(f"a wire was unreadable ({_why(e)}), dropped")
     if lost:

@@ -55,7 +55,7 @@ __all__ = [
 # they grow across boards and the two timelines can be told apart by which came last.
 STAMPS = itertools.count(1)
 
-# One undo step: for parts, wires, wire colors and wire layers, what the uids it touches looked like
+# One undo step: for parts, wires and wire colors, what the uids it touches looked like
 # before and after, as two dicts (uid -> value). A uid missing from one of them was
 # absent then. (Two dicts instead of uid -> (before, after) pairs: a step that adds or
 # removes a big batch is one dict of the values, not a pair per uid as well.)
@@ -65,7 +65,7 @@ STAMPS = itertools.count(1)
 # a copy of every part twice (see _compress). Undo takes the delta off again.
 Move = tuple[np.ndarray, float, float]
 Section = tuple[dict[int, object], dict[int, object], tuple[Move, ...]]
-Change = tuple[Section, Section, Section, Section]
+Change = tuple[Section, Section, Section]
 
 # How much the undo history may hold, in values (a part's or wire's data on one side
 # of a step; a moved uid counts as 1/16: it's 8 bytes in a move, not a tuple). About
@@ -98,7 +98,7 @@ def capture(
         else sorted(views, key=lambda v: v.part.uid)
     )
     parts = {v.part.uid: part_data(v) for v in views}
-    out, colors, layers = {}, {}, {}
+    out, colors = {}, {}
     # (the whole board: wires attached to nothing at all too)
     if whole:
         some = sorted(editor.wire_views.values(), key=lambda v: v.wire.uid)
@@ -116,9 +116,7 @@ def capture(
         out[view.wire.uid] = data
         if view.color:
             colors[view.wire.uid] = view.color
-        if view.layer:
-            layers[view.wire.uid] = view.layer
-    return Snapshot(parts, out, colors, layers)
+    return Snapshot(parts, out, colors)
 
 
 def _cut_loose(view: WireView, data: WireData, parts: set, wires: set) -> WireData:
@@ -134,12 +132,11 @@ def _cut_loose(view: WireView, data: WireData, parts: set, wires: set) -> WireDa
 
 def changes(
     editor: Editor, parts: Iterable[int], wires: Iterable[int]
-) -> tuple[dict, dict, dict, dict]:
+) -> tuple[dict, dict, dict]:
     """What those parts and wires (uids) look like now, for History.record: their
-    data, their wire colors and layers -- or None where they're gone (or a wire has
-    no color, or is on layer 0)."""
+    data, their wire colors -- or None where they're gone (or a wire has no color)."""
     c = editor.circuit
-    pd, wd, cd, ld = {}, {}, {}, {}
+    pd, wd, cd = {}, {}, {}
     for uid in parts:
         part = c.part_by_uid.get(uid)
         view = editor.part_views.get(part) if part is not None else None
@@ -149,8 +146,7 @@ def changes(
         view = editor.wire_views.get(wire) if wire is not None else None
         wd[uid] = wire_data(view) if view is not None else None
         cd[uid] = view.color if view is not None and view.color else None
-        ld[uid] = view.layer if view is not None and view.layer else None
-    return pd, wd, cd, ld
+    return pd, wd, cd
 
 
 def part_data(view: PartView) -> PartData:
@@ -202,12 +198,7 @@ def rewire(editor: Editor, view: WireView, side: str, target, at) -> Wire:
     w = view.wire
     family = [w, *c.descendants(w)]
     datas = [
-        (
-            x.uid,
-            wire_data(editor.wire_views[x]),
-            editor.wire_views[x].color,
-            editor.wire_views[x].layer,
-        )
+        (x.uid, wire_data(editor.wire_views[x]), editor.wire_views[x].color)
         for x in family
     ]
     src, dst, bends, src_pt, dst_pt = datas[0][1]
@@ -217,12 +208,12 @@ def rewire(editor: Editor, view: WireView, side: str, target, at) -> Wire:
         src, src_pt = ref, pt
     else:
         dst, dst_pt = ref, pt
-    datas[0] = (w.uid, (src, dst, bends, src_pt, dst_pt), *datas[0][2:])
+    datas[0] = (w.uid, (src, dst, bends, src_pt, dst_pt), datas[0][2])
     editor.remove_wire(view)  # (the whole family)
     made: dict[int, Wire] = {}
     lookup = collections.ChainMap(made, c.wire_by_uid)
     with editor.wire_batch():
-        for uid, (src, dst, bends, src_pt, dst_pt), color, layer in datas:
+        for uid, (src, dst, bends, src_pt, dst_pt), color in datas:
             made[uid] = editor.connect(
                 _resolve(src, c.part_by_uid, lookup, uid),
                 _resolve(dst, c.part_by_uid, lookup, uid),
@@ -230,7 +221,6 @@ def rewire(editor: Editor, view: WireView, side: str, target, at) -> Wire:
                 src_pt,
                 dst_pt,
                 color=color,
-                layer=layer,
                 check=False,
             )
     new = made[w.uid]
@@ -329,13 +319,11 @@ def _restore(
                     dst_pt,
                     uid=uid,
                     color=target.wire_colors.get(uid),
-                    layer=target.wire_layers.get(uid, 0),
                     check=False,
                 )
                 continue
             view = editor.wire_views[wire]
             view.color = target.wire_colors.get(uid)  # paint() redoes the gradients
-            view.layer = target.wire_layers.get(uid, 0)
             if (
                 tuple(view.bends) != bends
                 or (src_pt and view.src != src_pt)
@@ -392,7 +380,6 @@ def _instantiate(
                 src_pt,
                 dst_pt,
                 color=clip.wire_colors.get(uid),
-                layer=clip.wire_layers.get(uid, 0),
                 check=False,
             )
     if not _colored(clip):
@@ -421,10 +408,7 @@ class History:
         self, initial: Snapshot, limit: int = 500, max_values: int = MAX_VALUES
     ) -> None:
         self.current = Snapshot(
-            dict(initial.parts),
-            dict(initial.wires),
-            dict(initial.wire_colors),
-            dict(initial.wire_layers),
+            dict(initial.parts), dict(initial.wires), dict(initial.wire_colors)
         )
         self.undo_stack: list[
             tuple[Change, int, int]
@@ -434,15 +418,14 @@ class History:
         self.max_values = max_values
         self.state = 0
 
-    def _sections(self) -> tuple[dict, dict, dict, dict]:
-        c = self.current
-        return c.parts, c.wires, c.wire_colors, c.wire_layers
+    def _sections(self) -> tuple[dict, dict, dict]:
+        return self.current.parts, self.current.wires, self.current.wire_colors
 
-    def _diff(self, parts: dict, wires: dict, colors: dict, layers: dict | None) -> Change:
+    def _diff(self, parts: dict, wires: dict, colors: dict) -> Change:
         """The entries that differ from `current`: (before, after) per section (no
         moves yet: see _compress)."""
         out = []
-        for now, cur in zip((parts, wires, colors, layers or {}), self._sections()):
+        for now, cur in zip((parts, wires, colors), self._sections()):
             before, after = {}, {}
             for uid, new in now.items():
                 old = cur.get(uid)
@@ -455,12 +438,7 @@ class History:
         return tuple(out)
 
     def record(
-        self,
-        parts: dict,
-        wires: dict,
-        colors: dict,
-        layers: dict | None = None,
-        moves: tuple = ((), ()),
+        self, parts: dict, wires: dict, colors: dict, moves: tuple = ((), ())
     ) -> bool:
         """A new step: what these uids look like now (see changes()); None = gone.
         No-op (returns False) if that's what they looked like already.
@@ -468,7 +446,7 @@ class History:
         `moves`: (part moves, wire moves), each a list of (uids, dx, dy): uids that
         only moved, exactly (see views.Touched.moved), and aren't in parts / wires.
         They're shifted here, without their data being taken again."""
-        change = self._diff(parts, wires, colors, layers)
+        change = self._diff(parts, wires, colors)
         if _empty(change) and not any(moves):
             return False
         _apply(self._sections(), change, 1)
@@ -492,19 +470,13 @@ class History:
                 u: snap.wire_colors.get(u)
                 for u in cur.wire_colors.keys() | snap.wire_colors.keys()
             },
-            {
-                u: snap.wire_layers.get(u)
-                for u in cur.wire_layers.keys() | snap.wire_layers.keys()
-            },
         )
 
-    def amend(
-        self, parts: dict, wires: dict, colors: dict, layers: dict | None = None
-    ) -> bool:
+    def amend(self, parts: dict, wires: dict, colors: dict) -> bool:
         """Like record, but folded into the newest step (a run of small tweaks = one undo step)."""
         if not self.undo_stack:
-            return self.record(parts, wires, colors, layers)
-        change = self._diff(parts, wires, colors, layers)
+            return self.record(parts, wires, colors)
+        change = self._diff(parts, wires, colors)
         if _empty(change):
             return False
         top, before, _ = self.undo_stack[-1]
@@ -560,7 +532,7 @@ class History:
         return entry[0]
 
 
-def _apply(sections: tuple[dict, ...], change: Change, side: int) -> None:
+def _apply(sections: tuple[dict, dict, dict], change: Change, side: int) -> None:
     """Set every entry of `change` to its before (side 0) or after (side 1) value."""
     sign = 1 if side else -1
     for d, section, shift in zip(sections, change, _SHIFTS):
@@ -573,7 +545,7 @@ def _apply(sections: tuple[dict, ...], change: Change, side: int) -> None:
                 d[uid] = shift(d[uid], sign * dx, sign * dy)
 
 
-def _add_moves(change: Change, moves: tuple, sections: tuple[dict, ...]) -> Change:
+def _add_moves(change: Change, moves: tuple, sections: tuple[dict, dict, dict]) -> Change:
     """Shift `sections` (the board) by these moves, and add them to the step."""
     out = list(change)
     for i, (section_moves, d, shift) in enumerate(zip(moves, sections, _SHIFTS)):
@@ -652,8 +624,8 @@ def _wire_delta(a: tuple, b: tuple) -> tuple[float, float] | None:
     return pb[0][0] - pa[0][0], pb[0][1] - pa[0][1]
 
 
-_SHIFTS: tuple[Callable, ...] = (_shift_part, _shift_wire, None, None)
-_DELTAS: tuple[Callable | None, ...] = (_part_delta, _wire_delta, None, None)
+_SHIFTS: tuple[Callable, ...] = (_shift_part, _shift_wire, None)
+_DELTAS: tuple[Callable | None, ...] = (_part_delta, _wire_delta, None)
 
 
 def _compress(change: Change) -> Change:
@@ -752,7 +724,7 @@ def _part_groups(before: dict, after: dict, shift, delta) -> dict[tuple, list[in
     }
 
 
-def _expand(change: Change, sections: tuple[dict, ...]) -> Change:
+def _expand(change: Change, sections: tuple[dict, dict, dict]) -> Change:
     """A step's moves spelled out as before / after values again; `sections` must be
     the board right after the step (its after side)."""
     out = []
@@ -767,10 +739,9 @@ def _expand(change: Change, sections: tuple[dict, ...]) -> Change:
 
 
 def change_uids(change: Change) -> tuple[set[int], set[int]]:
-    """The part and wire uids an undo step touches (wire colors and layers count as wires)."""
-    parts, wires, colors, layers = change
-    wire_uids = section_uids(wires) | section_uids(colors) | section_uids(layers)
-    return section_uids(parts), wire_uids
+    """The part and wire uids an undo step touches (wire colors count as wires)."""
+    parts, wires, colors = change
+    return section_uids(parts), section_uids(wires) | section_uids(colors)
 
 
 def _ref(end, wire: Wire) -> EndRef:

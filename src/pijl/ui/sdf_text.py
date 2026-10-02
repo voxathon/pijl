@@ -52,7 +52,7 @@ flat out vec4 c;
 void main() {{
     vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));
     tex = mix(uv.xy, uv.zw, corner);
-    c = vec4(color.rgb, color.a * top_fade);
+    c = color;
     gl_Position = window.projection * window.view * vec4(rect.xy + lift * lift_offset + corner * rect.zw, 0.0, 1.0);
 }}
 """

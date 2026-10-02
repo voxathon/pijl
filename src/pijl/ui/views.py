@@ -22,7 +22,6 @@ import pyglet
 from pyglet import shapes
 
 from ..sim import Part, Pin, Wire
-from ..snapshot import LAYER_COUNT
 from . import theme as T
 from .canvas import Canvas
 from .paint import Pair, Rgb, sample, with_hue
@@ -126,11 +125,7 @@ class Layers:
             order=4
         )  # pin name tag backgrounds: over wires and parts
         self.text_order = 5  # SDFText's layer
-        # what's on the parts (outlines to text): they fade by wire layer (Canvas.part_orders)
-        self.parts = frozenset((1, 2, 3, 4, 5))
         self.overlay = pyglet.graphics.Group(order=6)
-        # wires being drawn: on top, by wire layer like the board's (see canvas.py)
-        self.preview = pyglet.graphics.Group(order=7)
 
 
 class _GradientLine(shapes.Line):
@@ -196,8 +191,6 @@ class Polyline:
         "_plain",
         "_vfracs",
         "_colors",
-        "_layers",
-        "_vias",
     )
 
     def __init__(
@@ -238,15 +231,9 @@ class Polyline:
         # vertices are just the points), and per stops: rgba arrays per vertex (off, on)
         self._vfracs: list[float] | None = None
         self._colors: dict[tuple, tuple[np.ndarray, np.ndarray]] | None = None
-        # Wire layers of its segments (() all on layer 0) and its vias' slots: only for
-        # a line in a layered buffer (see canvas.py), like the wire preview's
-        self._layers: tuple[int, ...] = ()
-        self._vias = None
 
-    def set_points(self, points: list[Point], layers=()) -> None:
-        """New points, and the layer of each segment between them."""
+    def set_points(self, points: list[Point]) -> None:
         self.points = list(points)
-        self._layers = fit_layers(layers, len(self.points) - 1)
         self._layout_key = _STALE
         self._build()
 
@@ -305,11 +292,6 @@ class Polyline:
             slots = self._slots = slots[:n_seg] if n_seg else NO_SLOTS
         if n_seg:
             _write_layout(buf, slots, verts, corner_idx)
-        if buf.layered:
-            _write_piece_layers(buf, slots, self._layers, corner_idx)
-            self._vias = _place_vias(
-                buf, self._vias, self.points, self._layers, self._opacity, bool(self._lift)
-            )
 
     @property
     def color(self):
@@ -378,9 +360,6 @@ class Polyline:
         for s in self._slots.tolist():
             self.buf.free(s)
         self._slots = NO_SLOTS
-        if self._vias is not None:
-            self.buf.free_many(self._vias)
-            self._vias = None
 
 
 def _layout(pts: list[Point], stops) -> tuple[list[Point], list[float] | None, list[int]]:
@@ -1248,7 +1227,6 @@ def _label_anchor(look) -> str:
 
 
 SELECTED, LIFTED, TAGGED = 1, 2, 4  # WireTable / PartTable flags (TAGGED: parts)
-VIA = 8  # WireTable: the wire is a via (see snapshot.py), drawn as a ring
 
 
 def _buffered(code: str, width: int, n: int, old: np.ndarray | None = None):
@@ -1300,9 +1278,6 @@ class WireTable:
         self.stops = np.full(cap, None, object)
         self.lstops = np.full(cap, None, object)
         self.pair = np.full(cap, None, object)
-        # The wire layer it runs on (2.5D, see snapshot.py; a via's: its floor). Only
-        # drawing and clicking: what's connected is what the wires' ends say.
-        self.layer = np.zeros(cap, np.uint8)
         self.row_of = np.full(cap, -1, np.int32)  # by circuit wire slot: its view's row
         # row -> [layout key, fractions per vertex, colors per stops] (see _layout), for
         # the lines laid out for a gradient; the rest are a segment per pair of points
@@ -1310,14 +1285,13 @@ class WireTable:
 
     _COLS = (
         "xy", "ints", "seg", "dot", "flags", "opacity", "seq", "wslot",
-        "segs", "bends", "color", "stops", "lstops", "pair", "layer",
+        "segs", "bends", "color", "stops", "lstops", "pair",
     )  # fmt: skip
 
     @property
     def buf(self):
         if self._buf is None:
             self._buf = self.canvas.buffer(SEGMENT, self.layers.wires)
-            self._buf.layered = True  # (drawn by wire layer: see canvas.py)
         return self._buf
 
     def new_rows(self, k: int) -> range:
@@ -1346,7 +1320,6 @@ class WireTable:
         self.seg[rows] = -1
         self.dot[rows] = -1
         self.flags[rows] = 0
-        self.layer[rows] = 0
         for col in (self.segs, self.bends, self.color, self.stops, self.lstops, self.pair):
             col[rows] = None
         for r in rows.tolist():
@@ -1449,57 +1422,6 @@ class WireTable:
         self._set_slots(row, slots)
         if n_seg:
             _write_layout(buf, slots, verts, corner_idx)
-        if self.layer[row] or self.flags[row] & VIA:
-            self.lay_layer(row)
-
-    def lay_layer(self, row: int) -> None:
-        """Write the wire's layer into its shapes (segments, junction dots) -- or, for a
-        via, give it its look."""
-        if self.flags[row] & VIA:
-            self._via_look(row)
-            return
-        buf = self.buf
-        dots = self.dot[row]
-        slots = np.concatenate((self.slots(row), dots[dots >= 0]))
-        if slots.size:
-            buf.f["flags"][slots, 0] = self.layer[row]
-            buf.layer_mask |= 1 << int(self.layer[row])
-            buf.f["sel"][slots, 1] = 0
-            buf.mark_many(slots)
-
-    def _via_look(self, row: int) -> None:
-        """A via is a line of no length with both ends free (see snapshot.py): its segment
-        (invisible, there for the selection halo) and its ends' squares become a ring in
-        its floor's color and the hole in it, reaching from its floor up to the top."""
-        buf = self.buf
-        f = buf.f
-        floor = int(self.layer[row])
-        ring, hole = self.dot[row].tolist()
-        shapes = (
-            (int(self.seg[row]), T.VIA_RADIUS, (0, 0, 0, 0)),
-            (ring, T.VIA_RADIUS, T.LAYER_COLORS[floor]),
-            (hole, T.VIA_HOLE_RADIUS, T.VIA_HOLE),
-        )
-        p = self.end(row, 0)
-        for slot, radius, color in shapes:
-            if slot < 0:
-                continue
-            f["a"][slot] = f["b"][slot] = p
-            f["radius"][slot] = radius
-            rgba = _rgba(color)
-            f["ca"][slot] = f["cb"][slot] = f["ca_on"][slot] = f["cb_on"][slot] = rgba
-            f["flags"][slot, 0] = floor
-            f["flags"][slot, 2:] = 255, 255
-            f["sel"][slot, 1] = LAYER_COUNT - 1
-            buf.mark(slot)
-        buf.layer_mask |= (1 << LAYER_COUNT) - (1 << floor)  # (floor and up)
-        # (the ring and hole keep their colors whatever the wire's state)
-        both = [k for k in (ring, hole) if k >= 0]
-        if both and buf.wire_src is not None:
-            buf.wire_src[both] = -1
-            buf.state[both] = 0
-            buf.state_dirty = True
-            buf.gen += 1
 
     def set_pair(self, row: int, pair: Pair) -> None:
         """One (off, on) color pair for the whole line (drops any gradient)."""
@@ -1522,83 +1444,12 @@ class WireTable:
             self._build(row)
 
 
-def _write_piece_layers(buf, slots: np.ndarray, layers, corner_idx) -> None:
-    """Each laid-out piece of a line gets its segment's layer (`corner_idx`: the
-    vertices of the layout that are real corners, see _layout: a segment's pieces lie
-    between two of them). `layers` empty: all on layer 0."""
-    if not slots.size:
-        return
-    if layers:
-        piece = np.searchsorted(
-            np.asarray(corner_idx, np.intp), np.arange(len(slots)), side="right"
-        )
-        lay = np.asarray(layers, np.uint8)[np.minimum(piece, len(layers) - 1)]
-    else:
-        lay = 0
-    f = buf.f
-    f["flags"][slots, 0] = lay
-    f["sel"][slots, 1] = 0
-    buf.mark_many(slots)
-
-
-def fit_layers(layers, n_seg: int) -> tuple[int, ...]:
-    """`layers` (one per segment) for a line of n_seg segments: cut short, or its last
-    layer carried on. () when every segment is on layer 0."""
-    if not layers or not any(layers):
-        return ()
-    out = tuple(layers[:n_seg]) + (layers[-1],) * (n_seg - len(layers))
-    return out if any(out) else ()
-
-
-def _place_vias(buf, old, pts: list[Point], layers, opacity: int, lifted: bool):
-    """Vias drawn where a line through `pts` changes layer (the wire preview's: the
-    real ones are wires, see WireTable._via_look): a ring in its floor's color and its
-    hole, reaching from the floor up. Reuses `old` (their slots so far, or
-    None) if the count is the same; returns their slots now (None: no vias)."""
-    at = via_bends(layers)
-    n = 2 * len(at)
-    if old is not None and len(old) == n:
-        slots = old
-    else:
-        if old is not None:
-            buf.free_many(old)
-        slots = buf.alloc_many(n) if n else None
-    if not n:
-        return None
-    f = buf.f
-    xy = np.array([pts[k + 1] for k in at], np.float64)
-    floor = [min(layers[k], layers[k + 1]) for k in at]
-    ring = np.array([_rgba(T.LAYER_COLORS[k]) for k in floor], np.uint8)
-    for part, radius, rgba in (
-        (slots[0::2], T.VIA_RADIUS, ring),
-        (slots[1::2], T.VIA_HOLE_RADIUS, _rgba(T.VIA_HOLE)),
-    ):
-        f["a"][part] = f["b"][part] = xy
-        f["radius"][part] = radius
-        f["ca"][part] = f["cb"][part] = f["ca_on"][part] = f["cb_on"][part] = rgba
-        f["flags"][part] = 0, opacity, 255, 255
-        f["flags"][part, 0] = np.array(floor, np.uint8)
-        f["sel"][part] = 0
-        f["sel"][part, 1] = LAYER_COUNT - 1
-        f["lift"][part] = 1.0 if lifted else 0.0
-    buf.mark_many(slots)
-    return slots
-
-
-def via_bends(layers) -> list[int]:
-    """Which bends (by index) are vias: the segments on either side are on different
-    layers. (Bend k sits between segments k and k + 1.)"""
-    if not layers:
-        return []
-    return [k for k in range(len(layers) - 1) if layers[k] != layers[k + 1]]
-
-
 def _int_bits(x, y, k: int) -> int:
     return ((type(x) is int) | (type(y) is int) << 1) << 2 * k
 
 
 def _fill_rows(views: list[WireView], specs: list[tuple]) -> None:
-    """New views' rows (consecutive), from their (wire, src, bends, dst, color[, layer])."""
+    """New views' rows (consecutive), from their (wire, src, bends, dst, color)."""
     if not views:
         return
     t, n = views[0].table, len(views)
@@ -1611,21 +1462,17 @@ def _fill_rows(views: list[WireView], specs: list[tuple]) -> None:
         grown[: len(t.row_of)] = t.row_of
         t.row_of = grown
     t.row_of[wslot] = np.arange(rows.start, rows.stop)
-    ends = [(*src, *dst) for _, src, _, dst, *_ in specs]
+    ends = [(*src, *dst) for _, src, _, dst, _ in specs]
     t.xy[rows] = np.fromiter(itertools.chain.from_iterable(ends), np.float64, 4 * n).reshape(n, 4)
     t.ints[rows] = [
         (type(a) is int) | (type(b) is int) << 1 | (type(c) is int) << 2 | (type(d) is int) << 3
         for a, b, c, d in ends
     ]
-    for i, (w, src, bends, dst, color, *layer) in enumerate(specs):
+    for i, (_, _, bends, _, color) in enumerate(specs):
         if bends:
             t.bends[rows.start + i] = tuple(bends)
         if color is not None:  # a T.WIRE_COLORS name; None = Default (inherit from the ends)
             t.color[rows.start + i] = color
-        if layer:
-            t.layer[rows.start + i] = layer[0]
-        if w.src is w and w.dst is w and not bends and src == dst:  # (see snapshot.is_via)
-            t.flags[rows.start + i] |= VIA
 
 
 class WireView:
@@ -1633,8 +1480,7 @@ class WireView:
 
     Bend points are layout data, so they live here and not in the sim. So is color:
     `color` is what the user picked (None: Default), `stops` the gradient that
-    paint.py worked out from it and from what the wire connects to. So is the wire
-    `layer` it runs on (see WireTable.layer).
+    paint.py worked out from it and from what the wire connects to.
 
     A handle: what it knows is a row of its WireTable.
     """
@@ -1649,24 +1495,23 @@ class WireView:
         dst: Point,
         table: WireTable,
         color: str | None = None,
-        layer: int = 0,
     ) -> None:
         self.wire, self.table, self.row = wire, table, table.new_rows(1)[0]
-        spec = (wire, src, bends, dst, color, layer)
+        spec = (wire, src, bends, dst, color)
         _fill_rows([self], [spec])
         _make_wire_shapes([self], [[src, *bends, dst]])
 
     @classmethod
     def many(cls, specs: list[tuple], table: WireTable) -> list[WireView]:
-        """A view for each (wire, src, bends, dst, color[, layer]): like making them one by
-        one, in order, with the shapes made all at once."""
+        """A view for each (wire, src, bends, dst, color): like making them one by one, in
+        order, with the shapes made all at once."""
         views = []
         for spec, row in zip(specs, table.new_rows(len(specs))):
             view = cls.__new__(cls)
             view.wire, view.table, view.row = spec[0], table, row
             views.append(view)
         _fill_rows(views, specs)
-        _make_wire_shapes(views, [[s[1], *s[2], s[3]] for s in specs])
+        _make_wire_shapes(views, [[src, *bends, dst] for _, src, bends, dst, _ in specs])
         return views
 
     @property
@@ -1740,28 +1585,6 @@ class WireView:
         self.table.bends[self.row] = tuple(bends) or None
         self._redraw()
 
-    @property
-    def layer(self) -> int:
-        """The wire layer it runs on (a via: its floor)."""
-        return int(self.table.layer[self.row])
-
-    @layer.setter
-    def layer(self, value: int) -> None:
-        if value != self.layer:
-            Touched.wire(self.wire.uid)
-            self.table.layer[self.row] = value
-            self.table.lay_layer(self.row)
-
-    @property
-    def is_via(self) -> bool:
-        return bool(self.table.flags[self.row] & VIA)
-
-    def reaches(self, layer: int) -> bool:
-        """Can it be clicked on (wired to, branched off) from that layer? A wire only
-        from its own; a via from its floor and every layer above."""
-        mine = self.layer
-        return layer >= mine if self.is_via else layer == mine
-
     def _redraw(self) -> None:
         t, row = self.table, self.row
         t.redraw(row)
@@ -1770,8 +1593,6 @@ class WireView:
             dot = int(t.dot[row, k])
             if dot >= 0:
                 _place_wire_dot(t.buf, dot, t.end(row, k), end is w)
-        if t.flags[row] & VIA:
-            t.lay_layer(row)  # (its ends aren't squares)
         if t.index is not None:
             t.index.put_polyline(self, self.points)
         Touched.wire(
@@ -1808,8 +1629,6 @@ class WireView:
         """Both colors of the line and dots: the gradient, else the classic grey / red.
         (X, Z and conflicts are patterns the state picks, whatever these are.)"""
         t, row = self.table, self.row
-        if t.flags[row] & VIA:
-            return  # (a via keeps its floor's color)
         dots = t.dot[row].tolist()
         stops = self.stops
         if not stops:
@@ -2215,16 +2034,6 @@ def _make_wire_shapes(views: list[WireView], lines: list[list[Point]]) -> None:
         t.segs[rows[i]] = slots[first[i] : first[i] + n_seg[i]]
     t.dot[rows[dot_src], 0] = slots[(first + n_seg)[dot_src]]
     t.dot[rows[dot_dst], 1] = slots[(first + n_seg + dot_src)[dot_dst]]
-    # an end on a via: no junction dot (the via shows where it is); a radius of 0 keeps
-    # the slot, which says that end is a junction (see _move_wire_mirrors)
-    for k, (has, end) in enumerate(((dot_src, "src"), (dot_dst, "dst"))):
-        for i in np.flatnonzero(has).tolist():
-            parent = getattr(views[i].wire, end)
-            prow = t.row_of[parent.slot] if parent.slot < len(t.row_of) else -1
-            if parent is not views[i].wire and prow >= 0 and t.flags[prow] & VIA:
-                buf.f["radius"][t.dot[rows[i], k]] = 0.0
-    for r in rows[(t.layer[rows] != 0) | ((t.flags[rows] & VIA) != 0)].tolist():
-        t.lay_layer(r)
     if t.index is not None:
         t.index.put_polylines(list(zip(views, lines)))
     Touched.wire_many(v.wire.uid for v in views)
