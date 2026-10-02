@@ -18,11 +18,6 @@ Options:
                     part of those kinds is looked up at once (sim/lut.py); the rest
                     run as batches
           batches:  each kind's eval runs on arrays of its instances (sim/batches.py)
-  compile off:      macros are flattened into their gates, a tick each
-          mixed:    every macro on the board runs as a program: logic without loops
-                    in one tick, a tick per trip round a loop (sim/compile.py)
-          zero:     the same, but loops run until they stop changing within the
-                    tick (capped; what doesn't settle goes X)
 """
 
 from __future__ import annotations
@@ -33,7 +28,6 @@ from dataclasses import dataclass, fields, replace
 OPTIONS: dict[str, tuple[str, ...]] = {
     "dirty": ("adaptive", "off"),
     "eval": ("lut", "batches"),
-    "compile": ("off", "mixed", "zero"),
 }
 
 
@@ -41,7 +35,6 @@ OPTIONS: dict[str, tuple[str, ...]] = {
 class EngineConfig:
     dirty: str = OPTIONS["dirty"][0]
     eval: str = OPTIONS["eval"][0]
-    compile: str = OPTIONS["compile"][0]
 
     def __post_init__(self) -> None:
         for f in fields(self):

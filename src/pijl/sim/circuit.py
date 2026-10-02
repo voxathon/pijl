@@ -542,17 +542,6 @@ class Circuit:
         self._type_ids: dict[PartType, int] = {}
         self._templates: dict[PartType, _Template] = {}
         self._blueprints: dict[PartType, _Blueprint] = {}  # macro types: see _make
-        self._bp_of: dict[int, _Blueprint] = {}  # macro instance slot -> what made it
-        # Compiled macros (sim/compile.py): programs by blueprint (None: can't be), the
-        # board instances running as them, by group
-        self._programs: dict[_Blueprint, Any] = {}
-        self._groups: list = []
-        self._compiled_groups_spec: list = []
-        self._in_compiled = np.zeros(0, bool)  # per part slot: inside a compiled one
-        self._compiled_out = np.zeros(0, bool)  # per pin slot: a compiled one's output
-        self._compiled_links = np.zeros(0, bool)  # per part slot: compiled (no links)
-        self._compiled_stale = False  # its values aren't in the hidden pins yet
-        self._unsettled = False  # (plain stepper) a compiled one's state moved last step
         self._linked: dict[int, None] = {}  # slots of parts with links (macros, joins)
         self._n_part_slots = 0
         self._settling = 0  # how many parts are still settling
@@ -626,7 +615,7 @@ class Circuit:
         """Take on the code paths self.config names: step() and run_until_stable() come
         from its stepper, and the stepper runs the parts through its evaluator. Pokes (pin slots written from outside step(): Pin.state,
         write_pins) are only kept for a stepper that wants them."""
-        from . import batches, compile, dirty, lut, plain  # (they import this module)
+        from . import batches, dirty, lut, plain  # (they import this module)
 
         stepper = {"adaptive": dirty, "off": plain}[self.config.dirty]
         evaluator = {"batches": batches, "lut": lut}[self.config.eval]
@@ -634,14 +623,6 @@ class Circuit:
         self._run_all_tracked = MethodType(evaluator.run_all_tracked, self)
         self._run_some = MethodType(evaluator.run_some, self)
         self._costs = evaluator.COSTS
-        # compiled macros (sim/compile.py): run_* by mode; the rest only on or off
-        mode = self.config.compile
-        off = mode == "off"
-        self._choose_compiled = MethodType(compile.choose_off if off else compile.choose, self)
-        self._attach_compiled = MethodType(compile.attach_off if off else compile.attach, self)
-        self._sync_compiled = MethodType(compile.sync_off if off else compile.sync, self)
-        self._run_programs = MethodType(getattr(compile, f"run_all_{mode}"), self)
-        self._run_some_programs = MethodType(getattr(compile, f"run_some_{mode}"), self)
         self.step: Callable[[], None] = MethodType(stepper.step, self)
         # run_until_stable(limit): step until a step changes no pin and nothing is
         # settling any more, at most `limit` steps that change something (plus the one
@@ -804,13 +785,11 @@ class Circuit:
         if body is not None:
             bp = self._blueprints.get(t)
             if bp is not None and bp.current(self.registry):
-                slot = self._stamp(bp, t, uid, owner)
-                self._bp_of[slot] = bp
-                return slot
+                return self._stamp(bp, t, uid, owner)
             marks = (self._n_part_slots, self._pins.n, len(self._wire_slots.wires))
         slot = self._make_one(t, uid, owner)
         if body is not None:
-            self._blueprints[t] = self._bp_of[slot] = _Blueprint(self, *marks)
+            self._blueprints[t] = _Blueprint(self, *marks)
         return slot
 
     def _make_one(self, t: PartType, uid: int, owner: int) -> int:
@@ -1088,7 +1067,7 @@ class Circuit:
         # keeps its own copy of what it needs)
         self._handles[at] = self._label[at] = self._props[at] = None
         for s in tree:
-            for d in (self._linked, self._inner, self._inner_wires, self._links, self._drives, self._bp_of):
+            for d in (self._linked, self._inner, self._inner_wires, self._links, self._drives):
                 d.pop(s, None)
         self._nets_dirty = self._kinds_dirty = self._batches_dirty = True
         return removed
@@ -1371,17 +1350,13 @@ class Circuit:
         nodes are pin slots and wires, and whose edges are wire ends and macro links."""
         store, ws = self._pins, self._wire_slots
         n_pins, n_wires = store.n, len(ws.wires)
-        self._choose_compiled()  # (which board macros run compiled: sim/compile.py)
         live = np.flatnonzero(
             ws.alive[:n_wires]
         )  # wire slots; a wire's node is n_pins + its slot
         ends = np.where(
             ws.end_is_wire[live], n_pins + ws.end_slot[live], ws.end_slot[live]
         )
-        compiled = self._compiled_links
-        links = [  # macro pins <-> ports, joins (a compiled macro's pins stay its own)
-            self._links[s] for s in self._linked if not (s < len(compiled) and compiled[s])
-        ]
+        links = [self._links[s] for s in self._linked]  # macro pins <-> ports, joins
         pairs = np.concatenate(links).astype(np.intp) if links else np.empty((0, 2), np.intp)
         link_a, link_b = pairs[:, 0], pairs[:, 1]
         a = np.concatenate((n_pins + live, n_pins + live, link_a))
@@ -1401,13 +1376,9 @@ class Circuit:
         net_of[member] = net
         n_nets = int(net.max()) + 1 if net.size else 0
 
-        in_net = member[:n_pins].copy()
-        reader = store.reader[:n_pins].copy()
+        in_net = member[:n_pins]
+        reader = store.reader[:n_pins]
         weak = store.weak[:n_pins]
-        if len(self._compiled_out):  # compiled macros: their outputs drive, their insides
-            reader[self._compiled_out[:n_pins]] = False  # are the program's business
-            inner = self._in_compiled[store.part[:n_pins]]
-            in_net[inner] = False
         drivers, driven, starts = _grouped(
             np.flatnonzero(in_net & ~reader & ~weak), net_of
         )
@@ -1419,7 +1390,7 @@ class Circuit:
         )
         self._readers = np.flatnonzero(in_net & reader)
         self._reader_net = net_of[self._readers]
-        store.states[:n_pins][store.alive[:n_pins] & reader & ~member[:n_pins]] = (
+        store.states[:n_pins][store.alive[:n_pins] & reader & ~in_net] = (
             Z  # unconnected: floating
         )
 
@@ -1454,7 +1425,6 @@ class Circuit:
         self._rd_sorted = self._readers[order]
         self._rd_start = np.searchsorted(self._reader_net[order], np.arange(n_nets + 1))
         self._rd_count = np.diff(self._rd_start)
-        self._attach_compiled(net_of)
         self._full = True
         self._nets_dirty = False
         self._nets_version += 1
@@ -1465,7 +1435,6 @@ class Circuit:
         """(value, conflict) of the net this wire belongs to, as of the last step."""
         if self._nets_dirty:
             self._rebuild_nets()
-        self._sync_compiled()
         i = self._wire_net[wire.slot]
         return Level(int(self.net_value[i])), bool(self.net_conflict[i])
 
@@ -1490,7 +1459,6 @@ class Circuit:
 
     def pin_codes(self, slots: np.ndarray) -> np.ndarray:
         """The logic codes of these pin slots: Pin.state for many pins at once."""
-        self._sync_compiled()
         return self._pins.states[slots]
 
     @property
@@ -1516,7 +1484,6 @@ class Circuit:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """wire_state for many wire slots at once: (value codes, conflicts, has a net)."""
         net = self.wire_nets(slots)
-        self._sync_compiled()
         has = net >= 0
         if not len(self.net_value):
             return np.zeros(len(slots), CODE), np.zeros(len(slots), bool), has
@@ -1528,7 +1495,6 @@ class Circuit:
         board wires whose net changed). With everything=True, the rest is empty."""
         if self._nets_dirty:
             self._rebuild_nets()
-        self._sync_compiled()
         states = self._pins.states[: self._pins.n]
         if (
             self._changed_all
@@ -1615,16 +1581,11 @@ class Circuit:
     def _eval_batches(self) -> list[_Batch]:
         """Per kind with an eval: the instances step() evaluates (live ones only, unless
         pure) and index arrays of their pins."""
-        if self._nets_dirty:
-            self._rebuild_nets()  # (decides which parts are inside compiled macros)
         if self._batches_dirty:
             self._batches = []
-            inner = self._in_compiled
             for t, slots in self._by_kind().items():
                 if not t.has("eval"):
                     continue
-                if len(inner):
-                    slots = slots[~inner[slots]]
                 if not t.pure:
                     slots = slots[self._live[slots]]
                 if not slots.size:

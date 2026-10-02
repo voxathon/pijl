@@ -39,7 +39,6 @@ def step(c: Circuit) -> None:
         dirty = c._dirty
         if poked.size:
             dirty = _distinct(np.concatenate((dirty, store.part[poked])), c._n_part_slots)
-        touched_parts = dirty  # (compiled macros among them too)
         bid = c._batch_of[dirty]
         dirty, bid = dirty[bid >= 0], bid[bid >= 0]
         if dirty.size:  # (none: next to free) is picking them out worth it?
@@ -53,13 +52,8 @@ def step(c: Circuit) -> None:
     # Phase 1: parts compute outputs from current inputs (sim/batches.py, sim/lut.py).
     if full:
         outs_moved, moved = c._run_all_tracked(), []
-        prog_moved, unsettled = c._run_programs()
     else:
         outs_moved, moved = False, c._run_some(dirty, bid)
-        prog_moved, unsettled = c._run_some_programs(touched_parts)
-    if prog_moved:
-        moved = moved + prog_moved
-        outs_moved = True
 
     # Phase 2: nets resolve their drivers and hand the value to their readers. Many
     # changed readers (past `most`, where picking out even one kind's parts would cost
@@ -76,7 +70,7 @@ def step(c: Circuit) -> None:
         touched = np.concatenate([poked, *moved]) if moved else poked
         nets = c._pin_net[touched]
         n, changed = _carry_some(c, _distinct(nets[nets >= 0], len(c.net_value)), most)
-    c._quiet = not (outs_moved or moved or n or unsettled) and len(c.faults) == faults
+    c._quiet = not (outs_moved or moved or n) and len(c.faults) == faults
     c._full = changed is None
     if changed is not None:
         c._dirty = _distinct(changed, c._n_part_slots)

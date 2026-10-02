@@ -722,9 +722,7 @@ def _measure(
     except Failed as e:
         cells["settle"] = "FAIL"
         print(f"  {macro}, settle: {e}", file=sys.stderr)
-    # (the longest path is the flattened circuit's: compiled, a macro's own timing holds)
-    path = k.path(n) if k.path and config.compile == "off" else 0
-    ticks = max(max(seen, default=0), path) or 1
+    ticks = max(max(seen, default=0), k.path(n) if k.path else 0) or 1
     for layer in ("engine", "pipe"):
         if layer not in layers or cells.get("settle") == "FAIL":
             continue
