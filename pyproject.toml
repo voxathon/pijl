@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "moxxie", email = "moxxie@knolastna.me" }
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
 keywords = ["logic", "circuit", "simulator", "digital", "gates"]
@@ -15,7 +15,7 @@ classifiers = [
     "Intended Audience :: Education",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
 ]
 dependencies = [
