@@ -40,6 +40,7 @@ from .parts import TEMPLATES, Registry
 from .parts import load as load_parts
 from .project import Project, last_project, project_names, projects_dir
 from .sim import Circuit
+from .sim.config import EngineConfig
 from .storage import MacroStore, load_file
 
 SETTLE_TICKS = 64  # power-on noise, like the editor's (see sim/circuit.py): latches pick a side
@@ -136,10 +137,12 @@ class Engine:
         name: str | Path | MacroType,
         settle_ticks: int = SETTLE_TICKS,
         seed: int = 0,
+        config: EngineConfig | None = None,
     ) -> Harness:
-        """The macro on a board of its own, its pins brought out (see Harness)."""
+        """The macro on a board of its own, its pins brought out (see Harness).
+        `config`: the engine's code paths (default: as decided at startup)."""
         t = name if isinstance(name, MacroType) else self.macro(name)
-        return Harness(t, self.catalog, settle_ticks, seed)
+        return Harness(t, self.catalog, settle_ticks, seed, config)
 
 
 class Harness:
@@ -152,9 +155,10 @@ class Harness:
         catalog: Catalog,
         settle_ticks: int = SETTLE_TICKS,
         seed: int = 0,
+        config: EngineConfig | None = None,
     ) -> None:
         self.macro = macro
-        self.circuit = c = Circuit(catalog, settle_ticks=settle_ticks, seed=seed)
+        self.circuit = c = Circuit(catalog, settle_ticks=settle_ticks, seed=seed, config=config)
         self.inputs: tuple[str, ...] = macro.ins
         self.outputs: tuple[str, ...] = macro.outs
         part = c.add_parts([macro], [None])[0]

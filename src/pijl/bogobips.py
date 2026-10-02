@@ -2,7 +2,7 @@
 
     pijl bench bogobips [--kind sipo,piso,counter,lfsr,tree,decoder,adder] [--depth ...]
                         [--layers engine,settle,pipe] [--seconds 0.5] [--seed 0]
-                        [--flips 1] [--nest]
+                        [--flips 1] [--nest] [--engines "dirty=off;dirty=adaptive"]
 
 Circuits built from gates are driven with a seeded random stimulus and read back,
 and every piece of the circuit that does its job once counts as one unit of work:
@@ -51,6 +51,9 @@ Three layers, each a column:
   - pipe:   a child `pijl run --raw` process fed over stdin, answers read back
     from stdout. The whole external I/O round trip.
 
+--engines runs every circuit once per engine config (see pijl/sim/config.py), a row
+each, so code paths can be compared in one run; the pipe's child gets the same one.
+
 Each circuit is its own oracle (a register gives back its input, delayed; a tree
 is an AND or a parity; a decoder one-hot; an adder a sum). Every clock is read,
 and every 64th read is checked, so a speed-up that breaks timing shows up as FAIL,
@@ -76,6 +79,7 @@ from pathlib import Path
 import numpy as np
 
 from .engine import Engine, Harness
+from .sim.config import EngineConfig, default
 from .snapshot import MACRO, Snapshot
 
 PROJECT = "bogo"
@@ -562,11 +566,14 @@ def encode(sets: tuple[tuple[int, str], ...], n_in: int) -> bytes:
     return bytes(out + b";")
 
 
-def _pipe(root: Path, macro: str, n_in: int, n_out: int, steps: Iterator[Step], ticks: int, seconds: float) -> float:
+def _pipe(
+    root: Path, macro: str, n_in: int, n_out: int, steps: Iterator[Step], ticks: int, seconds: float, config: EngineConfig
+) -> float:
     """Reads per second through a child `pijl run --raw`: steps down stdin, a "?"
     after each read, the answers read back on a thread and (every 64th) checked at
     the end."""
-    cmd = _command() + ["--data", str(root), "-p", PROJECT, "run", macro, "--raw", "--ticks", str(ticks), "--noise", "0"]
+    cmd = _command() + ["--data", str(root), "-p", PROJECT, "--engine", str(config)]
+    cmd += ["run", macro, "--raw", "--ticks", str(ticks), "--noise", "0"]
     with tempfile.TemporaryFile() as errors:
         return _talk(cmd, errors, n_in, n_out, steps, seconds)
 
@@ -652,6 +659,12 @@ def main(args) -> int:
     if args.flips < 1:
         print("pijl: --flips must be at least 1", file=sys.stderr)
         return 2
+    try:
+        configs = [EngineConfig.parse(t, default()) for t in args.engines.split(";") if t.strip()] or [default()]
+    except ValueError as e:
+        print(f"pijl: --engines: {e}", file=sys.stderr)
+        return 2
+    width = max(len(str(c)) for c in configs) if len(configs) > 1 else 0
     plan = [(k, n) for k in kinds for n in (given or KINDS[k].depths)]
     too_deep = [f"{k} {n} (at most {KINDS[k].most})" for k, n in plan if n > KINDS[k].most]
     if too_deep:
@@ -666,17 +679,20 @@ def main(args) -> int:
         t0 = time.perf_counter()
         eng = make_project(root, plan, args.nest)
         print(f"(generated in {time.perf_counter() - t0:.1f}s)", flush=True)
-        head = f"{'kind':8} {'depth':>6} {'work':>8} {'build':>8} {'ticks/clock':>11}"
+        head = f"{'kind':8} {'depth':>6} " + (f"{'engine':{width}} " if width else "")
+        head += f"{'work':>8} {'build':>8} {'ticks/clock':>11}"
         print(head + "".join(f" {lay:>9}" for lay in layers), flush=True)
         for kind, n in plan:
-            row, rates = _measure(eng, root, KINDS[kind], n, layers, args)
-            print(row, flush=True)
-            if rates is None:
-                status = 1
-                continue
-            for layer, bips in rates.items():
-                if bips > peak.get(kind, (0.0, ""))[0]:
-                    peak[kind] = (bips, f"{n}, {layer}")
+            for config in configs:
+                row, rates = _measure(eng, root, KINDS[kind], n, layers, args, config, width)
+                print(row, flush=True)
+                if rates is None:
+                    status = 1
+                    continue
+                for layer, bips in rates.items():
+                    if bips > peak.get(kind, (0.0, ""))[0]:
+                        where = f"{n}, {layer}" + (f", {config}" if width else "")
+                        peak[kind] = (bips, where)
     finally:
         shutil.rmtree(root, ignore_errors=True)
     for kind, (bips, where) in peak.items():
@@ -684,11 +700,13 @@ def main(args) -> int:
     return status
 
 
-def _measure(eng: Engine, root: Path, k: Kind, n: int, layers: list[str], args) -> tuple[str, dict[str, float] | None]:
+def _measure(
+    eng: Engine, root: Path, k: Kind, n: int, layers: list[str], args, config: EngineConfig, width: int
+) -> tuple[str, dict[str, float] | None]:
     """One row of the table, and BIPS by layer (None if a cell failed)."""
     macro = f"{k.name} {n}"
     t0 = time.perf_counter()
-    h = eng.harness(macro, settle_ticks=0)
+    h = eng.harness(macro, settle_ticks=0, config=config)
     built = time.perf_counter() - t0
     work = k.work(n)
     rng = np.random.default_rng(args.seed)
@@ -713,13 +731,14 @@ def _measure(eng: Engine, root: Path, k: Kind, n: int, layers: list[str], args) 
                 rate = _drive(h, steps, ticks, args.seconds, [])
             else:
                 fresh = k.script(n, np.random.default_rng(args.seed), args.flips)
-                rate = _pipe(root, macro, len(h.inputs), len(h.outputs), fresh, ticks, args.seconds)
+                rate = _pipe(root, macro, len(h.inputs), len(h.outputs), fresh, ticks, args.seconds, config)
             cells[layer] = _si(rate * work)
             rates[layer] = rate * work
         except Failed as e:
             cells[layer] = "FAIL"
             print(f"  {macro}, {layer}: {e}", file=sys.stderr)
-    row = f"{k.name:8} {n:>6} {_si(work):>8} {built * 1000:>6.0f}ms {k.edges * ticks:>11}"
+    row = f"{k.name:8} {n:>6} " + (f"{str(config):{width}} " if width else "")
+    row += f"{_si(work):>8} {built * 1000:>6.0f}ms {k.edges * ticks:>11}"
     row += "".join(f" {cells.get(lay, '-'):>9}" for lay in layers)
     return row, (None if "FAIL" in cells.values() else rates)
 

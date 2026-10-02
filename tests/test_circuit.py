@@ -1,7 +1,9 @@
 import numpy as np
+import pytest
 
 from pijl.logic import ONE, X, Z, ZERO, Level
 from pijl.sim import Circuit
+from pijl.sim.config import EngineConfig
 
 
 def settle(c: Circuit, steps: int = 10) -> None:
@@ -447,9 +449,9 @@ def test_merge_onto_a_free_end_leaves_a_free_end():
 
 
 def test_dirty_set_matches_running_everything():
-    """Circuit.step only runs pure parts whose inputs changed and carries only nets
-    whose drivers did. It must match running everything (incremental = False) tick
-    for tick: random boards with loops, fights, tri-states and pulls, pins written from
+    """The dirty-set stepper only runs pure parts whose inputs changed and carries only
+    nets whose drivers did. It must match the plain one (running everything) tick for
+    tick: random boards with loops, fights, tri-states and pulls, pins written from
     outside (inputs and outputs alike, X and Z included), settling, and wiring edits
     while it runs."""
     import random
@@ -457,10 +459,9 @@ def test_dirty_set_matches_running_everything():
     kinds = ["IN", "NAND", "AND", "OR", "NOT", "XOR", "BUF", "TRI", "PULLUP", "PULLDOWN", "OUT"]
     levels = [ZERO, ONE, X, Z]
 
-    def build(seed: int, incremental: bool):
+    def build(seed: int, dirty: str):
         rng = random.Random(seed)
-        c = Circuit(settle_ticks=rng.choice([0, 0, 6]), seed=seed)
-        c.incremental = incremental
+        c = Circuit(settle_ticks=rng.choice([0, 0, 6]), seed=seed, config=EngineConfig(dirty=dirty))
         parts = [c.add_part(rng.choice(kinds)) for _ in range(rng.randint(4, 40))]
         outs = [q for p in parts for q in p.outputs]
         ins = [q for p in parts for q in p.inputs]
@@ -473,8 +474,8 @@ def test_dirty_set_matches_running_everything():
         return rng, c, parts, outs, ins
 
     for seed in range(60):
-        ra, a, pa, oa, ia = build(seed, True)
-        rb, b, pb, ob, ib = build(seed, False)
+        ra, a, pa, oa, ia = build(seed, "adaptive")
+        rb, b, pb, ob, ib = build(seed, "off")
         for tick in range(80):
             for rng, c, parts, outs, ins in ((ra, a, pa, oa, ia), (rb, b, pb, ob, ib)):
                 r = rng.random()
@@ -492,3 +493,17 @@ def test_dirty_set_matches_running_everything():
             assert np.array_equal(a.net_value, b.net_value), (seed, tick)
             assert np.array_equal(a.net_conflict, b.net_conflict), (seed, tick)
         assert a.run_until_stable(200) == b.run_until_stable(200), seed
+
+
+def test_engine_config_text_and_binding():
+    cfg = EngineConfig.parse("dirty=off")
+    assert cfg == EngineConfig(dirty="off") and EngineConfig.parse(str(cfg)) == cfg
+    assert EngineConfig.parse("") == EngineConfig()  # (defaults: the fastest proven)
+    for bad in ("dirty=maybe", "turbo=on", "dirty"):
+        with pytest.raises(ValueError):
+            EngineConfig.parse(bad)
+    from pijl.sim import dirty, plain
+
+    for name, module in (("off", plain), ("adaptive", dirty)):
+        c = Circuit(config=EngineConfig(dirty=name))
+        assert c.step.__func__ is module.step and c.run_until_stable.__func__ is module.run_until_stable

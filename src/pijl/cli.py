@@ -5,8 +5,10 @@
     pijl bench bogobips           the shift register benchmark (see bogobips.py)
     pijl run MACRO [VALUES...]    run a macro headless (see below)
 
-Global: --project NAME|PATH (default: the one the editor had open last) and
---data DIR (the data root, like PIJL_DATA). Headless commands never import pyglet.
+Global: --project NAME|PATH (default: the one the editor had open last),
+--data DIR (the data root, like PIJL_DATA) and --engine OPTIONS (the engine's code
+paths, like PIJL_ENGINE: "dirty=off"; see pijl/sim/config.py). Headless commands
+never import pyglet.
 
 `pijl run` drives the macro's inputs from outside and prints its outputs:
 
@@ -49,6 +51,14 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv if _has_command(argv) else ["gui", *argv])
     if args.data:
         os.environ["PIJL_DATA"] = args.data
+    if args.engine:
+        from .sim.config import EngineConfig, default, set_default
+
+        try:
+            set_default(EngineConfig.parse(args.engine, default()))
+        except ValueError as e:
+            print(f"pijl: --engine: {e}", file=sys.stderr)
+            return 2
     if args.command == "gui":
         from .ui import run  # (pyglet: only now)
 
@@ -86,6 +96,7 @@ def _parser() -> argparse.ArgumentParser:
         c = argparse.ArgumentParser(add_help=False)
         c.add_argument("-p", "--project", default=default, help="project name or folder (default: the last one open)")
         c.add_argument("--data", default=default, help="data root folder (default: PIJL_DATA, else the per-user one)")
+        c.add_argument("--engine", default=default, help='engine options, e.g. "dirty=off" (default: PIJL_ENGINE, else the fastest)')
         return c
 
     p = argparse.ArgumentParser(
@@ -131,6 +142,7 @@ def _parser() -> argparse.ArgumentParser:
     bench.add_argument("--seed", type=int, default=0, help="seed for the random stimulus")
     bench.add_argument("--flips", type=int, default=1, help="inputs flipped per vector, for trees, decoders and adders (default 1)")
     bench.add_argument("--nest", action="store_true", help="build trees and adders from nested macros")
+    bench.add_argument("--engines", default="", help='engine configs to compare, ";" between them, e.g. "dirty=off;dirty=adaptive" (default: the --engine one)')
     return p
 
 
