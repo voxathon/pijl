@@ -12,8 +12,10 @@ LOAD PROJECT lists the projects (click one to pick it, "rename" to rename it),
 NEW PROJECT makes one, SETTINGS edits the preferences (click a value to change
 it; numbers are typed, or nudged with the wheel), and HEADLESS runs one of the
 project's macros without the editor: in this terminal if pijl has one, else in a
-console window of its own. MODS turns mods on and off, orders them, and has the
-safe start switch (start without mods; shown on the main page when it's on).
+console window of its own. MODS has the enabled mods on the left, in load order,
+and the disabled ones on the right: click a mod to move it across, or drag it
+(across, to a place in the load order, or up and down it). It also has the safe
+start switch (start without mods; shown on the main page when it's on).
 
 This module imports only theme (colors) and line_edit from pijl.ui: the editor's
 modules read theme.UI_SCALE when they're imported, which happens after this
@@ -46,6 +48,7 @@ FONT = "Consolas"
 BUTTON = (T.PICKER_HEADER, T.MENU_HOVER)  # (fill, hovered fill)
 PRIMARY = ((48, 104, 186), (66, 128, 215))
 ROW = (T.PICKER_BG, T.PICKER_HOVER)
+WELL = (22, 22, 27)  # the mods page's two lists, sunk below the background
 ACCENT = (*T.SELECT, 255)
 
 
@@ -65,9 +68,19 @@ class _Hit:
     hint: str = ""
     rect: shapes.ShapeBase | None = None
     colors: tuple = ()
+    drag: object = None  # set: it can be dragged (and clicks on release)
 
     def contains(self, x: float, y: float) -> bool:
         return self.x <= x < self.x + self.w and self.y <= y < self.y + self.h
+
+
+@dataclass
+class _ModDrag:
+    col: str  # "on" (the load order) or "off"
+    index: int
+    row: ModRow
+    text: str
+    grab: tuple[float, float]  # where the press was, from the row's corner
 
 
 @dataclass
@@ -117,6 +130,12 @@ class LauncherWindow(pyglet.window.Window):
         self.message, self.danger = "", False
         self.status: list[pyglet.text.Label] = []  # its lines, top to bottom
         self._mouse = (-1.0, -1.0)
+        self.mod_scroll = {"on": 0, "off": 0}
+        self._cols: dict = {}  # the mods page's two lists (see _page_mods)
+        self._press: tuple | None = None  # (hit, x, y): pressed on something draggable
+        self.dragging: _ModDrag | None = None
+        self.overlay = pyglet.graphics.Batch()  # what's being dragged
+        self._overlay_drawn: list = []
         self._ready = True
         if launcher.problems:
             self.say("; ".join(launcher.problems), danger=True)
@@ -163,6 +182,7 @@ class LauncherWindow(pyglet.window.Window):
         wheel=None,
         hint="",
         border=T.PICKER_BORDER,
+        drag=None,
     ):
         rect = shapes.BorderedRectangle(
             x,
@@ -175,7 +195,9 @@ class LauncherWindow(pyglet.window.Window):
             batch=self.batch,
             group=self._back,
         )
-        self.hits.append(_Hit(x, y, w, h, click, right, wheel, hint, rect, colors))
+        self.hits.append(
+            _Hit(x, y, w, h, click, right, wheel, hint, rect, colors, drag)
+        )
         return rect
 
     def _button(
@@ -278,7 +300,9 @@ class LauncherWindow(pyglet.window.Window):
             self.page, self.scroll, self.editing, self.message = page, 0, None, ""
         self.batch = pyglet.graphics.Batch()
         self._back = pyglet.graphics.Group(0)
-        self._sel = pyglet.graphics.Group(0.5)  # a field's selected text: under the text
+        self._sel = pyglet.graphics.Group(
+            0.5
+        )  # a field's selected text: under the text
         self._text = pyglet.graphics.Group(1)
         self.hits, self.hovered, self.edit = [], None, None
         # what's drawn on the page (pyglet takes a label or shape out of the batch
@@ -605,63 +629,205 @@ class LauncherWindow(pyglet.window.Window):
         except OSError as e:
             on, off = [], []
             self.say(f"can't read the mods folder: {e}", danger=True)
-        if not on and not off:
-            self._label(
-                "No mods. Put a mod's .py file or folder in",
-                PAD * s,
-                self.top,
-                10,
-                T.HELP_TEXT,
-                anchor_y="top",
-            )
-            self._label(
-                la.mods_folder(),
-                PAD * s,
-                self.top - 20 * s,
-                9.5,
-                T.PICKER_DIM_TEXT,
-                anchor_y="top",
-            )
-        rows: list = (["LOAD ORDER", *on] if on else []) + (["DISABLED", *off] if off else [])
-
-        def draw(row, x, y, w) -> None:
-            h = ROW_H * s - 2 * s
-            if not isinstance(row, ModRow):  # a heading
-                self._label(row, x, y + 8 * s, 9.5, T.PICKER_DIM_TEXT, bold=True)
-                return
-            hint = "; ".join(filter(None, [row.description, *row.notes]))
-            self._box(x, y, w, h, ROW, lambda: None, hint=hint or row.name)
-            color = T.MENU_DANGER if row.notes else ACCENT if row.on else T.PART_TEXT
-            self._label(
-                f"{row.title} {row.tags}".rstrip(),
-                x + 8 * s,
-                y + h / 2,
-                color=color,
-                anchor_y="center",
-            )
-            bw = 54 * s
-            buttons = (
-                [("up", lambda: self._mod(la.mod_move, row.name, -1)),
-                 ("down", lambda: self._mod(la.mod_move, row.name, 1)),
-                 ("off", lambda: self._mod(la.mod_off, row.name))]
-                if row.on
-                else [("on", lambda: self._mod(la.mod_on, row.name))]
-            )
-            bx = x + w - 3 * s
-            for text, click in reversed(buttons):
-                bx -= bw
-                self._button(
-                    text, bx, y + 3 * s, bw, h - 6 * s, click, ROW, size=9.5, color=T.HELP_TEXT
+        x, w = PAD * s, self.width - 2 * PAD * s
+        cw = (w - GAP * s) / 2
+        bottom = (PAD + SMALL_BTN_H + 18 + STATUS_LINES * STATUS_LINE_H) * s
+        top = self.top - 12 * s
+        inner, rh = 4 * s, ROW_H * s
+        fits = max(1, int((top - bottom - 2 * inner) // rh))
+        folder = f"the mods folder: {la.mods_folder()}"
+        self._cols = {}
+        for col, cx, rows, title, empty in (
+            ("on", x, on, "ENABLED: LOAD ORDER", "drag mods here"),
+            ("off", x + cw + GAP * s, off, "DISABLED", "none"),
+        ):
+            self._label(title, cx, self.top, 9.5, T.PICKER_DIM_TEXT, bold=True)
+            # the panel: hovering it says where mods go
+            self._box(cx, bottom, cw, top - bottom, (WELL, WELL), hint=folder)
+            scroll = max(0, min(self.mod_scroll[col], len(rows) - fits))
+            self.mod_scroll[col] = scroll
+            if len(rows) > fits:
+                self._label(
+                    f"{scroll + 1}-{scroll + fits} of {len(rows)}",
+                    cx + cw,
+                    self.top,
+                    9.5,
+                    T.PICKER_DIM_TEXT,
+                    anchor_x="right",
                 )
-                bx -= 3 * s
-
-        self._list(rows, draw)
+            if not rows:
+                self._label(
+                    empty,
+                    cx + cw / 2,
+                    top - inner - rh / 2,
+                    9.5,
+                    T.PICKER_DIM_TEXT,
+                    anchor_x="center",
+                    anchor_y="center",
+                )
+            for i, row in enumerate(rows[scroll : scroll + fits]):
+                y = top - inner - (i + 1) * rh
+                self._mod_row(
+                    col, scroll + i, row, cx + inner, y, cw - 2 * inner, rh - 2 * s
+                )
+            self._cols[col] = (
+                cx,
+                bottom,
+                cw,
+                top - bottom,
+                top - inner,
+                scroll,
+                len(rows),
+                fits,
+            )
         self._bottom(
             (
                 f"SAFE START: {'ON' if la.safe else 'OFF'}",
                 self._toggle_safe,
             )
         )
+
+    def _mod_row(self, col: str, index: int, row: ModRow, x, y, w, h) -> None:
+        s, la = self.s, self.launcher
+        how = (
+            "click: turn it off, drag: move it in the load order"
+            if row.on
+            else "click: turn it on, drag: put it in the load order"
+        )
+        hint = ". ".join(filter(None, [row.description, *row.notes, how]))
+        text = f"{row.title} {row.tags}".rstrip()
+        dragged = self.dragging is not None and self.dragging.row.name == row.name
+        click = (
+            (lambda: self._mod(la.mod_off, row.name))
+            if row.on
+            else (lambda: self._mod(la.mod_on, row.name))
+        )
+        self._box(x, y, w, h, ROW, click, hint=hint, drag=(col, index, row, text))
+        tx = x + 8 * s
+        if row.on:
+            self._label(
+                str(index + 1),
+                tx + 2 * self._char_w,
+                y + h / 2,
+                9.5,
+                T.PICKER_DIM_TEXT,
+                anchor_x="right",
+                anchor_y="center",
+            )
+            tx += 3 * self._char_w + 4 * s
+        color = (
+            T.PICKER_DIM_TEXT
+            if dragged
+            else T.MENU_DANGER
+            if row.notes
+            else T.PART_TEXT
+        )
+        self._label(
+            self._fit(text, x + w - 8 * s - tx),
+            tx,
+            y + h / 2,
+            color=color,
+            anchor_y="center",
+        )
+
+    def _fit(self, text: str, width: float, size: float = 11) -> str:
+        """Cut text to fit `width` (the font's monospaced)."""
+        n = max(1, int(width / (self._char_w * size / 9.5)))
+        return text if len(text) <= n else text[: n - 1] + "…"
+
+    # ---- dragging mods -----------------------------------------------------------
+
+    def _drop_at(self, x: float, y: float) -> tuple[str, int] | None:
+        """Where a mod dropped here would go: ("on", its place in the load order) or
+        ("off", 0)."""
+        rh = ROW_H * self.s
+        for col, (cx, cy, cw, ch, rows_top, scroll, n, fits) in self._cols.items():
+            if cx <= x < cx + cw and cy <= y < cy + ch:
+                if col == "off":
+                    return col, 0
+                i = scroll + round((rows_top - y) / rh)
+                return col, max(scroll, min(i, scroll + fits, n))
+        return None
+
+    def _show_drag(self, x: float, y: float) -> None:
+        d, s = self.dragging, self.s
+        self.overlay = pyglet.graphics.Batch()
+        drawn = self._overlay_drawn = []
+        target = self._drop_at(x, y)
+        if target is not None and (target[0], d.col) != ("off", "off"):
+            col, i = target
+            cx, cy, cw, ch, rows_top, scroll, *_ = self._cols[col]
+            if col == "on":  # a line where it'd go
+                ly = rows_top - (i - scroll) * ROW_H * s
+                drawn.append(
+                    shapes.Rectangle(
+                        cx + 4 * s,
+                        ly - s,
+                        cw - 8 * s,
+                        2 * s,
+                        color=ACCENT,
+                        batch=self.overlay,
+                    )
+                )
+            else:  # the panel, outlined
+                b = max(1, round(s))
+                for args in (
+                    (cx, cy, cw, b),
+                    (cx, cy + ch - b, cw, b),
+                    (cx, cy, b, ch),
+                    (cx + cw - b, cy, b, ch),
+                ):
+                    drawn.append(
+                        shapes.Rectangle(*args, color=ACCENT, batch=self.overlay)
+                    )
+        cw = self._cols[d.col][2]
+        w, h = cw - 8 * s, ROW_H * s - 2 * s
+        gx, gy = x - d.grab[0], y - d.grab[1]
+        ghost = shapes.BorderedRectangle(
+            gx,
+            gy,
+            w,
+            h,
+            max(1, round(s)),
+            color=T.PICKER_LIFT,
+            border_color=T.SELECT,
+            batch=self.overlay,
+        )
+        ghost.opacity = 230
+        drawn.append(ghost)
+        drawn.append(
+            pyglet.text.Label(
+                self._fit(d.text, w - 16 * s),
+                font_name=FONT,
+                font_size=11 * s,
+                color=T.PART_TEXT,
+                x=gx + 8 * s,
+                y=gy + h / 2,
+                anchor_y="center",
+                batch=self.overlay,
+            )
+        )
+
+    def _start_drag(self, hit: _Hit, x: float, y: float) -> None:
+        col, index, row, text = hit.drag
+        self.dragging = _ModDrag(col, index, row, text, (x - hit.x, y - hit.y))
+        self.show()  # (dims the row it came from)
+
+    def _end_drag(self, x: float, y: float | None) -> None:
+        """Drop it here (y None: nowhere)."""
+        d, la = self.dragging, self.launcher
+        self.dragging = None
+        self.overlay, self._overlay_drawn = pyglet.graphics.Batch(), []
+        to, i = (None if y is None else self._drop_at(x, y)) or (None, 0)
+        if d.col == "on" and to == "on":
+            i -= i > d.index  # (it's out of the list while it moves)
+            self._mod(la.mod_move, d.row.name, i - d.index)
+        elif d.col == "off" and to == "on":
+            self._mod(la.mod_on, d.row.name, i)
+        elif d.col == "on" and to == "off":
+            self._mod(la.mod_off, d.row.name)
+        else:
+            self.show()
 
     # ---- what the buttons do -----------------------------------------------------
 
@@ -672,7 +838,11 @@ class LauncherWindow(pyglet.window.Window):
     def _toggle_safe(self) -> None:
         self.launcher.safe = not self.launcher.safe
         self.show()
-        self.say("starts without mods" if self.launcher.safe else "starts with the mods in the load order")
+        self.say(
+            "starts without mods"
+            if self.launcher.safe
+            else "starts with the mods in the load order"
+        )
 
     def _finish(self, result: list[str] | None) -> None:
         self.result = result
@@ -792,6 +962,7 @@ class LauncherWindow(pyglet.window.Window):
         pyglet.gl.glClearColor(r / 255, g / 255, b / 255, 1)
         self.clear()
         self.batch.draw()
+        self.overlay.draw()
 
     def on_resize(self, width: int, height: int) -> None:
         super().on_resize(width, height)
@@ -829,6 +1000,9 @@ class LauncherWindow(pyglet.window.Window):
                 self.text_mouse.press(self._edit_target(), x, y, self.keys_shift)
             return
         hit = self._hit(x, y)
+        if button == mouse.LEFT and hit is not None and hit.drag is not None:
+            self._press = (hit, x, y)  # a click or a drag: the release says which
+            return
         if self.editing is not None:  # a click outside the field drops the edit
             self.editing = None
             if hit is None or not (hit.click or hit.right):
@@ -847,6 +1021,14 @@ class LauncherWindow(pyglet.window.Window):
         notches = int(scroll_y) or (1 if scroll_y > 0 else -1 if scroll_y < 0 else 0)
         if not notches:
             return
+        if self.page == "mods":  # each list scrolls on its own
+            for col, (cx, cy, cw, ch, *_) in self._cols.items():
+                if cx <= x < cx + cw and cy <= y < cy + ch:
+                    self.mod_scroll[col] -= notches
+                    self.show()
+                    if self.dragging is not None:
+                        self._show_drag(x, y)
+            return
         hit = self._hit(x, y)
         if hit is not None and hit.wheel is not None and self.editing is None:
             hit.wheel(notches)
@@ -860,10 +1042,24 @@ class LauncherWindow(pyglet.window.Window):
     def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers) -> None:
         if self.text_mouse.dragging and self.edit is not None:
             self.text_mouse.drag(self._edit_target(), x, y)
+        if self._press is not None and self.dragging is None:
+            hit, px, py = self._press
+            if abs(x - px) + abs(y - py) > 5 * self.s:
+                self._start_drag(hit, px, py)
+        if self.dragging is not None:
+            self._mouse = (x, y)
+            self._show_drag(x, y)
 
     def on_mouse_release(self, x, y, button, modifiers) -> None:
         if button == mouse.LEFT:
             self.text_mouse.release()
+            press, self._press = self._press, None
+            if self.dragging is not None:
+                self._end_drag(x, y)
+            elif press is not None and press[0].contains(x, y):
+                if self.message and self.danger:
+                    self.message = ""
+                press[0].click()
 
     def on_key_press(self, symbol, modifiers) -> None:
         self.keys_shift = bool(modifiers & key.MOD_SHIFT)
@@ -874,7 +1070,10 @@ class LauncherWindow(pyglet.window.Window):
         if self.edit is not None and symbol in (key.ENTER, key.NUM_ENTER):
             self.edit.enter(self.edit.line.text)
         elif symbol == key.ESCAPE:
-            if self.editing is not None:
+            if self.dragging is not None:
+                self._press = None
+                self._end_drag(0, None)
+            elif self.editing is not None:
                 self.editing = None
                 self.show()
             elif self.page != "main":

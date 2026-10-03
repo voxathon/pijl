@@ -124,8 +124,8 @@ class Launcher:
                 on.append(ModRow(name, True, None, False, ["not in the mods folder"]))
         return on, [row(m, False) for m in p.disabled]
 
-    def mod_on(self, name: str) -> None:
-        mods.enable(name)
+    def mod_on(self, name: str, at: int | None = None) -> None:
+        mods.enable(name, at=at)
 
     def mod_off(self, name: str) -> None:
         mods.disable(name)

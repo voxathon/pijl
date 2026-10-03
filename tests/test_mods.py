@@ -447,6 +447,8 @@ def test_enable_disable_and_move():
     assert [m.name for m in p.disabled] == ["c"]
     with pytest.raises(ValueError):
         mods.move("c", 1)
+    mods.enable("c", at=1)  # (dropped into a place in the load order)
+    assert [m.name for m in mods.plan().enabled] == ["a", "c", "b"]
 
 
 def test_disabling_a_missing_mod_forgets_it():

@@ -248,12 +248,14 @@ def _without(names: list[str], name: str) -> list[str]:
     return [n for n in names if n.casefold() != name.casefold()]
 
 
-def enable(name: str, folder: Path | None = None) -> None:
-    """Turn a mod on: last in the load order, out of disabled.txt."""
+def enable(name: str, folder: Path | None = None, at: int | None = None) -> None:
+    """Turn a mod on: last in the load order (or `at` that place), out of
+    disabled.txt."""
     folder = mods_dir() if folder is None else folder
     found = discover(folder).get(name.casefold())
     name = found.name if found else name  # (spelled as on disk)
-    order = _without(_dedup(read_list(folder / LOADORDER)), name) + [name]
+    order = _without(_dedup(read_list(folder / LOADORDER)), name)
+    order.insert(len(order) if at is None else max(0, at), name)
     write_list(folder / LOADORDER, order, LOADORDER_HEAD)
     write_list(
         folder / DISABLED, _without(read_list(folder / DISABLED), name), DISABLED_HEAD
