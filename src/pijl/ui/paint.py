@@ -102,6 +102,8 @@ def paint(
         own = color_pair(part_color(part))
         pins = [own[1] if own else _pin_tint(c, wire_views, pin) for pin in part.pins]
         view.set_tints(pins, own[1] if own else next((t for t in pins if t), None))
+        if part.type.look.face:  # (a face's color is its own: it colors no wires)
+            view.set_face_color(part.props.get("color"))
 
 
 def _end_color(wire, end, at: Point, wire_views: dict) -> Pair | None:

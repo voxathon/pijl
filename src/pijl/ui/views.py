@@ -15,6 +15,7 @@ import operator
 from array import array
 from collections.abc import Mapping
 from contextlib import contextmanager
+from functools import lru_cache
 from types import MappingProxyType
 
 import numpy as np
@@ -24,7 +25,7 @@ from pyglet import shapes
 from ..sim import Part, Pin, Wire
 from . import theme as T
 from .canvas import Canvas
-from .paint import Pair, Rgb, sample, with_hue
+from .paint import Pair, Rgb, color_pair, sample, with_hue
 from .sdf_shapes import (
     DOT,
     RECT,
@@ -676,11 +677,21 @@ class PartTable:
         self.tag_g0 = np.zeros(cap, np.int32)
         self.tag_ng = np.zeros(cap, np.int32)
         self.tag_glyphs = np.full(cap, None, object)
+        # its face's marks (SEGMENT, bodies layer), as runs like the title's glyphs, and
+        # the color they're tinted with (props["color"], see set_face_color)
+        self.face0 = np.zeros(cap, np.int32)
+        self.nface = np.zeros(cap, np.int32)
+        self.faces = np.full(cap, None, object)
+        self.face_color = np.full(cap, None, object)
+        # the rows whose face has marks the face() hook lights (see sync.py); face_gen
+        # moves whenever that changes
+        self.hooked: dict[int, None] = {}
+        self.face_gen = 0
 
     _COLS = (
         "xy", "ints", "wh", "body", "flags", "opacity", "seq", "pin0", "npin",
         "glyph0", "nglyph", "view", "title", "name", "tints", "body_tint",
-        "pinslots", "glyphs",
+        "pinslots", "glyphs", "face0", "nface", "faces", "face_color",
     )  # fmt: skip
     _PIN_COLS = (
         "pin_row", "pin_out", "pin_dy", "pin_dot", "tag_bg", "tag_g0", "tag_ng", "tag_glyphs",
@@ -729,11 +740,17 @@ class PartTable:
         self.flags[rows] = 0
         self.npin[rows] = self.pin0[rows] = 0
         self.nglyph[rows] = self.glyph0[rows] = 0
+        self.nface[rows] = self.face0[rows] = 0
         for col in (
-            self.view, self.title, self.name,
-            self.tints, self.body_tint, self.pinslots, self.glyphs,
+            self.view, self.title, self.name, self.tints, self.body_tint,
+            self.pinslots, self.glyphs, self.faces, self.face_color,
         ):  # fmt: skip
             col[rows] = None
+        if self.hooked:
+            for row in rows.tolist():
+                if row in self.hooked:
+                    del self.hooked[row]
+                    self.face_gen += 1
 
     # ---- one row -----------------------------------------------------------------
 
@@ -775,6 +792,16 @@ class PartTable:
     def titles_of(self, rows: np.ndarray) -> np.ndarray:
         """The title glyph slots of many views (see pins_of)."""
         return _runs(self.glyph0[rows], self.nglyph[rows], self.glyphs, rows)
+
+    def face_slots(self, row: int) -> np.ndarray:
+        f0 = int(self.face0[row])
+        if f0 >= 0:
+            return np.arange(f0, f0 + int(self.nface[row]))
+        return self.faces[row]
+
+    def faces_of(self, rows: np.ndarray) -> np.ndarray:
+        """The face mark slots of many views (see pins_of)."""
+        return _runs(self.face0[rows], self.nface[rows], self.faces, rows)
 
     def tags_of(self, pins: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """The name tags of these pins: (backing slots, glyph slots), of those shown."""
@@ -1064,6 +1091,14 @@ class PartView:
         self._place_title()
         if self._name is not None:
             self._name.move_to(*self.name_pos())
+        faces = self.table.face_slots(self.row)
+        if faces.size:
+            t = self.part.type
+            layout = _face_layout(t.ins, t.outs, t.look)
+            buf = self.canvas.buffer(SEGMENT, self.layers.bodies)
+            buf.f["a"][faces] = layout.a + (x, y)
+            buf.f["b"][faces] = layout.b + (x, y)
+            buf.mark_many(faces)
         dots = self.dots
         if dots:
             buf = self.canvas.buffer(DOT, self.layers.pins)
@@ -1135,6 +1170,11 @@ class PartView:
             buf.mark_many(glyphs)
         if self._name is not None:
             self._name.opacity = a
+        faces = self.table.face_slots(self.row)
+        if faces.size:
+            buf = self.canvas.buffer(SEGMENT, self.layers.bodies)
+            buf.f["flags"][faces, 1] = a
+            buf.mark_many(faces)
         if self.pin_labels_shown:
             bgs, glyphs = self.table.tags_of(self.table.pin_slots(self.row))
             if glyphs.size:
@@ -1157,6 +1197,23 @@ class PartView:
         t.tints[row] = None if all(c is None for c in pins) else pins
         t.body_tint[row] = body
         self._recolor()
+
+    def set_face_color(self, color: str | None) -> None:
+        """Tint the face's marks with a palette color (props["color"]; None: as the
+        look says)."""
+        t, row = self.table, self.row
+        if t.face_color[row] == color:
+            return
+        t.face_color[row] = color
+        faces = t.face_slots(row)
+        if faces.size:
+            pair = color_pair(color)
+            off, on = _face_rgba(self.look.face_colors, pair[1] if pair else None)
+            buf = self.canvas.buffer(SEGMENT, self.layers.bodies)
+            f = buf.f
+            f["ca"][faces] = f["cb"][faces] = off
+            f["ca_on"][faces] = f["cb_on"][faces] = on
+            buf.mark_many(faces)
 
     def _recolor(self) -> None:
         """Both colors of every pin (and of a lit body), per the tints."""
@@ -1203,13 +1260,16 @@ def _fill_part_rows(views: list[PartView], placed: list[tuple]) -> None:
         made = by_type.get(key)
         if made is None:
             look = part.type.look
-            title = part.type.title or part.kind
-            w = T.IO_WIDTH if look.narrow else T.PART_WIDTH
-            if not look.narrow:  # long titles (macro names) widen the body, in grid steps
-                need = text.measure(title, T.TITLE_SIZE) + 2 * T.TITLE_PAD
-                w = max(w, math.ceil(need / (2 * T.GRID)) * 2 * T.GRID)
-            n_pins = max(len(ins), len(outs), 1)
-            made = by_type[key] = (w, (n_pins + 1) * T.PIN_SPACING, title)  # (see theme.py)
+            title = (part.type.title or part.kind) if look.titled else ""
+            if look.size:  # (the registry checked it's on the grid)
+                w, h = look.size
+            else:
+                w = T.IO_WIDTH if look.narrow else T.PART_WIDTH
+                if not look.narrow and title:  # long titles (macro names) widen the body
+                    need = text.measure(title, T.TITLE_SIZE) + 2 * T.TITLE_PAD
+                    w = max(w, math.ceil(need / (2 * T.GRID)) * 2 * T.GRID)  # (grid steps)
+                h = (max(len(ins), len(outs), 1) + 1) * T.PIN_SPACING  # (see theme.py)
+            made = by_type[key] = (w, h, title)
         wh.append(made[:2])
         titles.append(made[2])
     t.wh[rows] = wh
@@ -1833,6 +1893,7 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
         buf.mark_many(slots)
         buf.show_pins(slots, pin_slots)
     t.pin_dot[pin_slots] = slots
+    _make_faces(views, rows, xs, ys, pin_slots, starts)
     # the spatial index: the body, and the pins sticking out of its sides (_index_box)
     if t.index is not None:
         r = T.PIN_RADIUS
@@ -1840,6 +1901,84 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
     Touched.part_many(
         v.part.uid for v in views
     )  # new: its own color (props) needs painting
+
+
+class _FaceLayout:
+    """A face's marks, worked out once per (pins, look): ends from the body's corner
+    (k x 2 each; a dot's b is its a), radii, the pin each follows (its index in
+    part.pins, -1 for none) and the indices of the marks face() lights."""
+
+    def __init__(self, ins: tuple, outs: tuple, look) -> None:
+        marks = look.face
+        self.k = len(marks)
+        self.a = np.array([m.a for m in marks], np.float64).reshape(-1, 2)
+        self.b = np.array([m.a if m.b is None else m.b for m in marks], np.float64).reshape(-1, 2)
+        self.radius = np.array([m.radius for m in marks], np.float32)
+        names = list(ins) + list(outs)
+        self.pin = np.array(
+            [-1 if m.pin is None else names.index(m.pin) for m in marks], np.intp
+        )
+        self.hooked = np.flatnonzero(self.pin < 0)
+        self.colors = look.face_colors
+
+
+@lru_cache(maxsize=256)
+def _face_layout(ins: tuple, outs: tuple, look) -> _FaceLayout:
+    return _FaceLayout(ins, outs, look)
+
+
+def _face_rgba(names: tuple[str, str], tint: Rgb | None) -> tuple[tuple, tuple]:
+    """A face's (off, on) mark colors, from theme names, tinted with `tint`'s hue."""
+
+    def rgb(name, fallback):
+        value = getattr(T, name, None)
+        if isinstance(value, tuple) and value and isinstance(value[0], tuple):
+            value = value[0]  # (a (fill, edge) pair: its fill)
+        return value if isinstance(value, tuple) and len(value) in (3, 4) else fallback
+
+    off, on = rgb(names[0], T.FACE_OFF), rgb(names[1], T.FACE_ON)
+    return _rgba(with_hue(off, tint)), _rgba(with_hue(on, tint))
+
+
+def _make_faces(views: list[PartView], rows: np.ndarray, xs, ys, pin_slots, starts) -> None:
+    """The face marks of the new views whose look has any: one SEGMENT each in the
+    bodies layer (over every body, under the pins). Marks that follow a pin show its
+    state like a pin dot does (sync.py); the rest wait for face() (also sync.py)."""
+    groups: dict[_FaceLayout, list[int]] = {}
+    for i, v in enumerate(views):
+        if v.look.face:
+            pt = v.part.type
+            groups.setdefault(_face_layout(pt.ins, pt.outs, pt.look), []).append(i)
+    if not groups:
+        return
+    t = views[0].table
+    buf = t.canvas.buffer(SEGMENT, t.layers.bodies)
+    for layout, members in groups.items():
+        idx = np.array(members, np.intp)
+        n, k = len(idx), layout.k
+        slots = buf.alloc_many(n * k)
+        corner = np.column_stack((xs[idx], ys[idx]))[:, None, :]
+        f = buf.f
+        f["a"][slots] = (corner + layout.a).reshape(-1, 2)
+        f["b"][slots] = (corner + layout.b).reshape(-1, 2)
+        f["radius"][slots] = np.tile(layout.radius, n)
+        off, on = _face_rgba(layout.colors, None)
+        f["ca"][slots] = f["cb"][slots] = off
+        f["ca_on"][slots] = f["cb_on"][slots] = on
+        f["flags"][slots] = 0, 255, 255, 255  # (round caps at both ends)
+        f["lift"][slots] = 0.0
+        f["sel"][slots] = 0
+        buf.set_state(slots, SHOW_OFF)
+        buf.mark_many(slots)
+        grid = slots.reshape(n, k)
+        pinned = layout.pin >= 0
+        if pinned.any():
+            src = pin_slots[starts[idx][:, None] + layout.pin[pinned]]
+            buf.show_pins(grid[:, pinned].ravel(), src.ravel())
+        t._set_runs(rows[idx], slots, np.full(n, k, np.intp), t.face0, t.nface, t.faces)
+        if layout.hooked.size:
+            t.hooked.update(dict.fromkeys(rows[idx].tolist()))
+            t.face_gen += 1
 
 
 def _look_data(look) -> tuple:
@@ -2091,6 +2230,7 @@ class _Slots:
         canvas, layers = t.canvas, t.layers
         rows = _rows_of(views) if rows is None else rows
         self.bodies(views, rows)
+        self.array(canvas, SEGMENT, layers.bodies, t.faces_of(rows))
         dots = t.pin_dot[t.pins_of(rows)]
         self.array(canvas, DOT, layers.pins, dots[dots >= 0])
         tagged = rows[(t.flags[rows] & TAGGED) != 0]

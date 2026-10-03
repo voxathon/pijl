@@ -14,6 +14,9 @@ SWITCH_OFF = ((70, 40, 40), (112, 62, 62))
 SWITCH_ON = ((220, 60, 60), (140, 30, 30))
 LED_OFF = ((45, 45, 52), (86, 86, 98))
 LED_ON = ((240, 70, 70), (155, 35, 35))
+# Marks on a part's face (Look.face: display segments), off / on
+FACE_OFF = (72, 48, 54)
+FACE_ON = (240, 70, 70)
 PART_TEXT = (235, 235, 245, 255)
 LABEL_TEXT = (200, 200, 215, 255)  # user labels next to parts
 

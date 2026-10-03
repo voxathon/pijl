@@ -165,7 +165,7 @@ from .inside import Level, PinProbe, build_scene, free_scene, put_scene, take_sc
 from .library import Library, LibraryHistory, Step
 from .line_edit import LineEdit
 from .menu import RAINBOW, ContextMenu, MenuItem
-from .paint import paint, part_color
+from .paint import paint
 from .picker import PartPicker, Row
 from .popover import NumberPopover
 from .prompt import Prompt
@@ -1210,12 +1210,13 @@ class Editor(pyglet.window.Window):
             )
             if len(group) == 1 and view.part.inner:
                 items[:0] = self._macro_items(view)
-            if view.look.lit:  # switches and LEDs are color sources (paint.py)
+            # switches and LEDs are color sources (paint.py); faces are tinted
+            if view.look.lit or view.look.face:
                 items.append(
                     MenuItem(
                         "Recolor",
                         submenu=self._recolor_items(
-                            _common(part_color(v.part) for v in group),
+                            _common(v.part.props.get("color") for v in group),
                             lambda c: [self._set_part_color(v, c) for v in group],
                         ),
                     )
@@ -3102,7 +3103,7 @@ class Editor(pyglet.window.Window):
         # frame on a board of oscillators, where nearly everything changes every tick.
         if self.inside and not self.inside[0].inst.live:
             self._leave_inside(everything=True)  # (its instance is gone)
-        self.view_sync(self.circuit, self.world)
+        self.view_sync(self.circuit, self.world, self.part_table)
         self.probe.update(
             self.hover_view if self.pin_label_mode != PIN_LABELS_HIDDEN else None
         )

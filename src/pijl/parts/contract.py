@@ -45,6 +45,10 @@ What the engine promises:
     (and on undo / redo), for all the edited parts at once; while a slider drags
     the props change but changed() waits, unless the setting says live=True.
     eval sees the new props on the next step either way.
+  - face() is the only hook that's only called by the editor (never headless):
+    once a frame, for the live instances on screen. It decides how the marks of
+    the part's face (Look.face) that don't follow a pin are lit, so it may
+    depend on anything; it must not change props or the circuit.
   - action() runs once per click on one of the part's actions, for all the
     clicked parts at once (live ones only). Prop changes it makes are undoable;
     anything else it does (part.state, the outside world) isn't.
@@ -70,6 +74,23 @@ SUPPORTED_APIS = (
 LABEL_SIDES = ("below", "left", "right")
 
 
+GRID_STEP = 20  # Look.size is in these steps (2 x the editor's grid), so pins land on the grid
+
+
+@dataclass(frozen=True)
+class Mark:
+    """One shape on a part's face (Look.face): a capsule `radius` thick from `a` to `b`,
+    or a dot at `a` if there's no `b`. Points are in world units from the body's
+    bottom left corner, y up. It follows `pin` (an input or output name): lit while
+    that pin is 1, and patterned like a pin while it's X or Z. A mark without a pin
+    shows what the part type's face() hook says."""
+
+    a: tuple[float, float]
+    b: tuple[float, float] | None = None
+    radius: float = 5.0
+    pin: str | None = None
+
+
 @dataclass(frozen=True)
 class Look:
     """How the editor draws a part. Colors are names from ui/theme.py."""
@@ -84,6 +105,13 @@ class Look:
     pin_labels: bool = (
         True  # name tags next to the pins (Tab picks hidden / hover / always)
     )
+    size: tuple[int, int] | None = (
+        None  # body (width, height) in multiples of GRID_STEP; None: from pins and title
+    )
+    titled: bool = True  # the title on the body (off for a part whose face says it all)
+    face: tuple[Mark, ...] = ()  # shapes drawn on the body, over it (see Mark)
+    face_colors: tuple[str, str] = ("FACE_OFF", "FACE_ON")  # marks' (off, on) colors.
+    # A part with a face can be recolored: its props["color"] tints them
 
 
 class PartType:
@@ -136,6 +164,11 @@ class PartType:
 
     def action(self, ctx: Ctx, name: str) -> None:
         """The user picked action `name` (a key of `actions`) for ctx.parts."""
+
+    def face(self, ctx: Ctx, *ins):
+        """Once a frame, in the editor, for the parts it shows: input arrays in (as in
+        eval), and one value per face mark without a pin out, in Look.face order (just
+        the value if there's one). Values are as eval's. Only the look changes."""
 
     def click(self, part: Part) -> None:
         """The user clicked a placed instance. Overriding this makes the part clickable

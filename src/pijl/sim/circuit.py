@@ -1576,6 +1576,28 @@ class Circuit:
                     ctx = Ctx(_Handles(self, live), self.tick, now)
                     self._guard(t, "frame", lambda: t.frame(ctx))
 
+    def face_codes(self, t: PartType, slots: np.ndarray) -> np.ndarray:
+        """What t.face() says for these parts (slots, all of type t): logic codes, one
+        row per part and a column per face mark without a pin. Parts that aren't live
+        show 0, and a faulted kind (or a raising hook) shows X."""
+        k = sum(m.pin is None for m in t.look.face)
+        out = np.full((len(slots), k), ZERO, CODE)
+        n = self._n_part_slots
+        ok = slots < n
+        ok[ok] = self._alive[slots[ok]] & self._live[slots[ok]]
+        live = slots[ok]
+        if not live.size:
+            return out
+        if t.kind in self.faults:
+            out[ok] = X
+            return out
+        first = self._pin0[live].astype(np.intp)
+        ins = [Logic.of_codes(self._pins.states[first + i]) for i in range(len(t.ins))]
+        ctx = Ctx(_Handles(self, live), self.tick)
+        raw = self._guard(t, "face", lambda: _values(t.face(ctx, *ins), k, len(live), "face"))
+        out[ok] = X if raw is _FAILED else np.column_stack(raw)
+        return out
+
     # ---- part types --------------------------------------------------------
 
     def _eval_batches(self) -> list[_Batch]:
@@ -1805,13 +1827,17 @@ def _evaluate(t: PartType, ctx: Ctx, ins: list[np.ndarray]) -> list[np.ndarray]:
 
 def _outputs(t: PartType, raw: Any, n: int) -> list[np.ndarray]:
     """Normalize what eval returned: one array of n logic codes per output pin."""
-    k = len(t.outs)
+    return _values(raw, len(t.outs), n, "eval")
+
+
+def _values(raw: Any, k: int, n: int, hook: str) -> list[np.ndarray]:
+    """k values (one per output pin, or face mark) of n instances each, as codes."""
     if k == 0:
         return []
     if k == 1 and not (isinstance(raw, tuple) and len(raw) == 1):
         raw = (
             raw,
-        )  # one output: anything but a 1-tuple is its value (a scalar, list or array)
+        )  # one value: anything but a 1-tuple is it (a scalar, list or array)
     if not isinstance(raw, tuple) or len(raw) != k:
-        raise ValueError(f"eval returned {raw!r}; expected {k} output value(s)")
+        raise ValueError(f"{hook} returned {raw!r}; expected {k} value(s)")
     return [np.broadcast_to(codes(v), (n,)) for v in raw]

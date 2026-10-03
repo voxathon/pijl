@@ -25,7 +25,7 @@ import sys
 import traceback
 from pathlib import Path
 
-from .contract import API, LABEL_SIDES, SUPPORTED_APIS, Look, PartType
+from .contract import API, GRID_STEP, LABEL_SIDES, SUPPORTED_APIS, Look, Mark, PartType
 from .ports import PORTS
 from .settings import Action, Setting
 
@@ -131,6 +131,7 @@ class Registry:
             raise ValueError(f"{name}: has actions but no action() hook")
         if not isinstance(t.look, Look) or t.look.label not in LABEL_SIDES:
             raise ValueError(f"{name}: bad look {t.look!r}")
+        _check_face(t)
 
     # ---- loading -----------------------------------------------------------
 
@@ -174,6 +175,53 @@ class Registry:
             self.errors.append(f"{path.name}: {detail}")
         finally:
             self._pending = None
+
+
+def _check_face(t: PartType) -> None:
+    """Look.size and Look.face (see contract.Mark)."""
+    name, look = t.kind, t.look
+    if look.size is not None:
+        size = look.size
+        if (
+            not isinstance(size, tuple)
+            or len(size) != 2
+            or not all(type(v) is int and v > 0 and v % GRID_STEP == 0 for v in size)
+        ):
+            raise ValueError(
+                f"{name}: Look.size must be (width, height), multiples of {GRID_STEP}"
+            )
+    if not isinstance(look.face, tuple):
+        raise TypeError(f"{name}: Look.face must be a tuple of Marks")
+    if not (
+        isinstance(look.face_colors, tuple)
+        and len(look.face_colors) == 2
+        and all(isinstance(c, str) for c in look.face_colors)
+    ):
+        raise ValueError(f"{name}: Look.face_colors must be two theme color names")
+    pins = set(t.ins + t.outs)
+    hooked = 0
+    for i, m in enumerate(look.face):
+        where = f"{name}: Look.face[{i}]"
+        if not isinstance(m, Mark):
+            raise TypeError(f"{where}: not a Mark")
+        points = (m.a,) if m.b is None else (m.a, m.b)
+        if not all(
+            isinstance(p, tuple)
+            and len(p) == 2
+            and all(isinstance(v, (int, float)) for v in p)
+            for p in points
+        ) or not (isinstance(m.radius, (int, float)) and m.radius > 0):
+            raise ValueError(
+                f"{where}: points must be (x, y) tuples, the radius a number > 0"
+            )
+        if m.pin is None:
+            hooked += 1
+        elif m.pin not in pins:
+            raise ValueError(f"{where}: no pin called {m.pin!r}")
+    if hooked and not t.has("face"):
+        raise ValueError(f"{name}: face marks without a pin need a face() hook")
+    if t.has("face") and not hooked:
+        raise ValueError(f"{name}: has a face() hook but no face marks without a pin")
 
 
 def load(*folders: Path) -> Registry:

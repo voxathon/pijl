@@ -55,6 +55,14 @@ files are copied over the old ones, and anything else in its folder stays.
   its first run: `levels` (logger name -> `debug`, `info`, `warning`, `error` or
   `off`), `keep` (how many log files), `crashes` and `stderr` (also copy
   everything printed to stderr).
+- **displays** ("Displays & Stuff") adds a DISPLAYS collection to the part picker:
+  `7SEG`, a seven-segment digit with a pin per segment (a..g, clockwise from the
+  top, g in the middle, and dp); `HEX`, a digit that decodes four bits (8, 4, 2,
+  1) into 0..F; and `BAR`, eight LEDs in a column. Recolor them from the
+  right-click menu. Boards that use them need the mod to open with the displays in
+  place. The mod draws nothing itself: its parts use `Look.size`, `Look.face` and
+  the `face()` hook from the part contract (`pijl/parts/contract.py`), which part
+  scripts can use too.
 
 ## Logging
 

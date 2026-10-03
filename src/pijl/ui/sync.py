@@ -17,10 +17,12 @@ from the sim's arrays and one scatter into the buffer's state bytes, uploaded wh
 
 from __future__ import annotations
 
+import weakref
+
 import numpy as np
 
 from .canvas import Canvas, InstanceBuffer
-from .sdf_shapes import SHOW_BY_CODE, SHOW_FIGHT
+from .sdf_shapes import SEGMENT, SHOW_BY_CODE, SHOW_FIGHT
 
 _NONE = np.empty(0, np.int32)  # a buffer that shows no pins / wires
 
@@ -33,9 +35,12 @@ class ViewSync:
         # per buffer: (key, shape slots, the pins they show) / (key, shape slots, nets)
         self._pins: dict[int, tuple] = {}
         self._wires: dict[int, tuple] = {}
+        # per part table: (key, [(part type, part slots, mark slots n x k)])
+        self._faces: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
-    def __call__(self, circuit, canvas: Canvas) -> None:
-        """Show the circuit's current pin and net states on the canvas's shapes."""
+    def __call__(self, circuit, canvas: Canvas, table=None) -> None:
+        """Show the circuit's current pin and net states on the canvas's shapes, and
+        (given the canvas's part table) light the face marks face() hooks decide."""
         for buf in canvas.buffers():
             shapes, pins = self._pin_slots(buf, circuit)
             if shapes.size:
@@ -44,6 +49,29 @@ class ViewSync:
             if shapes.size:
                 fight = circuit.net_conflict[nets].view(np.uint8) << 2
                 buf.set_state(shapes, _WIRE_SHOW[circuit.net_value[nets] | fight])
+        if table is not None and table.hooked:
+            buf = canvas.buffer(SEGMENT, table.layers.bodies)
+            for t, parts, marks in self._face_groups(table):
+                codes = circuit.face_codes(t, parts)
+                buf.set_state(marks.ravel(), SHOW_BY_CODE[codes].ravel())
+
+    def _face_groups(self, table) -> list[tuple]:
+        """The views with face() marks, by part type: what changes only with edits."""
+        from .views import _face_layout
+        cached = self._faces.get(table)
+        if cached is None or cached[0] != table.face_gen:
+            groups: dict = {}
+            for row in table.hooked:
+                part = table.view[row].part
+                t = part.type
+                parts, marks = groups.setdefault(t, ([], []))
+                parts.append(part.slot)
+                marks.append(table.face_slots(row)[_face_layout(t.ins, t.outs, t.look).hooked])
+            cached = self._faces[table] = (
+                table.face_gen,
+                [(t, np.array(p, np.intp), np.stack(m)) for t, (p, m) in groups.items()],
+            )
+        return cached[1]
 
     def _pin_slots(self, buf: InstanceBuffer, circuit) -> tuple[np.ndarray, np.ndarray]:
         key = (buf.gen, id(circuit), circuit.pin_count)

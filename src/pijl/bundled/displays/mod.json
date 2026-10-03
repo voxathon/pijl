@@ -1,0 +1,7 @@
+{
+    "name": "Displays & Stuff",
+    "version": "1.0",
+    "description": "Display parts: a seven-segment digit, a hex digit that decodes four bits itself, and an eight-LED bar.",
+    "author": "pijl",
+    "pijl": ">=0.3.5"
+}
