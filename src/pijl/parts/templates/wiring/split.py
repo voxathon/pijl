@@ -56,7 +56,7 @@ class Split(PartType):
     settings = {
         "width": Number(8, 1, MAX_WIDTH, hint="lanes in the bus"),
         "pattern": Pattern(
-            "", max_len=48, hint="pins from lane 0: 4,4  or  3,5  or  1x8 (blank: one per lane)"
+            "", max_len=48, hint="pin sizes from lane 0: 4,4  3,5  1x8 (blank: one per lane)"
         ),
         "flip": Toggle(label="Flip (bus out: a merger)"),
     }

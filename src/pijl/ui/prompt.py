@@ -1,5 +1,5 @@
 """A small modal box near the top of the window: a title, an optional text field,
-an optional list that the field filters, and a hint line.
+an optional list that the field filters, and a hint (wrapped to the box's width).
 
 Used for naming a macro, the Ctrl+O quick-open, "unsaved changes?" and
 "really delete?". Screen
@@ -82,6 +82,8 @@ class Prompt:
             for line in textwrap.wrap(message, int((W - 2 * PAD) / char_w))
         ]
         self.message_h = len(self.message) * MESSAGE_H + PAD / 2 if self.message else 0
+        self._wrap = int((W - 2 * PAD) / char_w)  # (hint lines, in characters)
+        n_hint = max(1, len(textwrap.wrap(hint, self._wrap)))
         self.h = (
             PAD
             + TITLE_H
@@ -89,6 +91,7 @@ class Prompt:
             + (FIELD_H + PAD / 2 if self.edit else 0)
             + n_rows * ROW_H
             + HINT_H
+            + (n_hint - 1) * MESSAGE_H
             + PAD / 2
         )
         self.shade = shapes.Rectangle(
@@ -131,7 +134,8 @@ class Prompt:
             )
             for _ in range(n_rows)
         ]
-        self.hint = label(hint, color=T.HELP_TEXT, size=SMALL)
+        self.hints = [label(color=T.HELP_TEXT, size=SMALL) for _ in range(n_hint)]
+        self.set_hint(hint)
         self.layout(win_w, win_h)
         self._refilter()
 
@@ -158,7 +162,8 @@ class Prompt:
             y -= ROW_H
             row.position = (left + PAD, y)
             text.position = (left + PAD + 8 * S, y + ROW_H / 2, 0)
-        self.hint.position = (left + PAD, y - HINT_H / 2, 0)
+        for i, line in enumerate(self.hints):
+            line.position = (left + PAD, y - HINT_H / 2 - i * MESSAGE_H, 0)
         self._show()
 
     def _show(self) -> None:
@@ -265,8 +270,14 @@ class Prompt:
         return self.panel.contains(sx, sy)
 
     def set_hint(self, text: str, danger: bool = False) -> None:
-        self.hint.text = text
-        self.hint.color = T.MENU_DANGER if danger else T.HELP_TEXT
+        """The hint, wrapped over the lines the box has for it (made for the first one:
+        a longer one later gets its overflow on the last line)."""
+        lines = textwrap.wrap(text, self._wrap) or [""]
+        n = len(self.hints)
+        lines = lines[: n - 1] + [" ".join(lines[n - 1 :])] + [""] * (n - len(lines))
+        for label, line in zip(self.hints, lines):
+            label.text = line
+            label.color = T.MENU_DANGER if danger else T.HELP_TEXT
 
     def tick(self, dt: float) -> None:
         """Caret blink."""
@@ -282,7 +293,8 @@ class Prompt:
         self.shade.delete()
         self.panel.delete()
         self.title.delete()
-        self.hint.delete()
+        for line in self.hints:
+            line.delete()
         for line in self.message:
             line.delete()
         if self.field is not None:
