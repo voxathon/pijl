@@ -1030,11 +1030,11 @@ class PartView:
 
     def _tag_specs(self) -> list[tuple]:
         """SDFText.labels specs for the pin name tags' text, in place (see _tag_at)."""
-        t = self.part.type
+        lay = self.part.layout  # (its own pins: see PartType.layout)
         color = (*T.LABEL_TEXT[:3], self.opacity)
         return [
             (
-                (t.ins if pin.is_input else t.outs)[pin.index],
+                (lay.ins if pin.is_input else lay.outs)[pin.index],
                 *self._tag_at(pin),
                 T.PIN_LABEL_SIZE,
                 color,
@@ -1093,8 +1093,7 @@ class PartView:
             self._name.move_to(*self.name_pos())
         faces = self.table.face_slots(self.row)
         if faces.size:
-            t = self.part.type
-            layout = _face_layout(t.ins, t.outs, t.look)
+            layout = _face_layout(self.part.layout, self.part.type.look)
             buf = self.canvas.buffer(SEGMENT, self.layers.bodies)
             buf.f["a"][faces] = layout.a + (x, y)
             buf.f["b"][faces] = layout.b + (x, y)
@@ -1255,12 +1254,14 @@ def _fill_part_rows(views: list[PartView], placed: list[tuple]) -> None:
     wh, titles = [], []
     for part, _, _ in placed:
         t_ = part.type
-        ins, outs = t_.ins, t_.outs
-        key = (id(t_), t_.kind, len(ins), len(outs))
+        lay = part.layout  # (its own pins: see PartType.layout)
+        ins, outs = lay.ins, lay.outs
+        cells = _cells(lay, t_.look)
+        key = (id(t_), t_.kind, len(ins), len(outs), cells)
         made = by_type.get(key)
         if made is None:
             look = part.type.look
-            title = (part.type.title or part.kind) if look.titled else ""
+            title = (part.type.title or part.kind) if look.titled and not cells else ""
             if look.size:  # (the registry checked it's on the grid)
                 w, h = look.size
             else:
@@ -1268,7 +1269,7 @@ def _fill_part_rows(views: list[PartView], placed: list[tuple]) -> None:
                 if not look.narrow and title:  # long titles (macro names) widen the body
                     need = text.measure(title, T.TITLE_SIZE) + 2 * T.TITLE_PAD
                     w = max(w, math.ceil(need / (2 * T.GRID)) * 2 * T.GRID)  # (grid steps)
-                h = (max(len(ins), len(outs), 1) + 1) * T.PIN_SPACING  # (see theme.py)
+                h = (max(len(ins), len(outs), cells, 1) + 1) * T.PIN_SPACING  # (see theme.py)
             made = by_type[key] = (w, h, title)
         wh.append(made[:2])
         titles.append(made[2])
@@ -1329,6 +1330,7 @@ class WireTable:
         self.opacity = np.full(cap, 255, np.uint8)
         self.seq = np.zeros(cap, np.int64)  # see _seq
         self.wslot = np.full(cap, -1, np.int32)  # the circuit wire's slot
+        self.thick = np.full(cap, T.WIRE_THICKNESS, np.float32)  # its line (a bus: thicker)
         # Objects, None meaning the usual: segments when not exactly one (else see seg),
         # bend points (a tuple), color name, paint.py's stops, the line's own gradient
         # (None: one color) and its one (off, on) color pair (None: neutral).
@@ -1344,7 +1346,7 @@ class WireTable:
         self.grad: dict[int, list] = {}
 
     _COLS = (
-        "xy", "ints", "seg", "dot", "flags", "opacity", "seq", "wslot",
+        "xy", "ints", "seg", "dot", "flags", "opacity", "seq", "wslot", "thick",
         "segs", "bends", "color", "stops", "lstops", "pair",
     )  # fmt: skip
 
@@ -1364,7 +1366,7 @@ class WireTable:
                     setattr(self, f"_{name}b", buf)
                     setattr(self, name, view)
                     continue
-                fill = {"seg": -1, "dot": -1, "opacity": 255, "wslot": -1}.get(name, 0)
+                fill = {"seg": -1, "dot": -1, "opacity": 255, "wslot": -1, "thick": T.WIRE_THICKNESS}.get(name, 0)
                 new = np.full((2 * n, *old.shape[1:]), None if old.dtype == object else fill, old.dtype)
                 new[:n] = old
                 setattr(self, name, new)
@@ -1468,7 +1470,7 @@ class WireTable:
             _new_segments(
                 buf,
                 new,
-                T.WIRE_THICKNESS,
+                float(self.thick[row]),
                 int(self.opacity[row]),
                 flags & LIFTED,
                 255 if flags & SELECTED else 0,
@@ -1788,8 +1790,8 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
         look = v.look
         if id(look) not in looks:
             looks[id(look)] = _look_data(look)
-        pt = v.part.type
-        group_of.setdefault((id(look), len(pt.ins), len(pt.outs), w, h), []).append(i)
+        lay = v.part.layout
+        group_of.setdefault((id(look), len(lay.ins), len(lay.outs), w, h), []).append(i)
     is_out = np.zeros(len(pin_slots), bool)
     pin_dy = np.zeros(len(pin_slots))  # from the body's middle (see pin_pos)
     lit = np.zeros(n, bool)
@@ -1855,7 +1857,9 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
     has_pins = counts > 0
     on = np.full(n, SHOW_OFF, np.uint8)
     first_pin = np.full(n, -1, np.intp)
-    shows = lit & has_pins
+    # (one showing bit cells doesn't: they say it all, and a lit body would hide them)
+    celled = np.fromiter((_cells(v.part.layout, v.part.type.look) > 0 for v in views), bool, n)
+    shows = lit & has_pins & ~celled
     on[shows] = SHOW_BY_CODE[codes[starts[shows]]]
     first_pin[shows] = pin_slots[starts[shows]]
     buf = canvas.buffer(RECT, layers.bodies)
@@ -1906,25 +1910,71 @@ def _make_part_shapes(views: list[PartView], pin_labels: bool) -> None:
 class _FaceLayout:
     """A face's marks, worked out once per (pins, look): ends from the body's corner
     (k x 2 each; a dot's b is its a), radii, the pin each follows (its index in
-    part.pins, -1 for none) and the indices of the marks face() lights."""
+    part.pins, -1 for none) and the indices of the marks face() lights. Bit cells
+    (Look.cells) are marks too, after the look's own: one per lane of the cells pin,
+    following just that lane (`lane`: -1 for the look's own marks)."""
 
-    def __init__(self, ins: tuple, outs: tuple, look) -> None:
+    def __init__(self, lay, look) -> None:
         marks = look.face
-        self.k = len(marks)
-        self.a = np.array([m.a for m in marks], np.float64).reshape(-1, 2)
-        self.b = np.array([m.a if m.b is None else m.b for m in marks], np.float64).reshape(-1, 2)
-        self.radius = np.array([m.radius for m in marks], np.float32)
-        names = list(ins) + list(outs)
-        self.pin = np.array(
-            [-1 if m.pin is None else names.index(m.pin) for m in marks], np.intp
-        )
+        names = list(lay.ins) + list(lay.outs)
+        a = [m.a for m in marks]
+        b = [m.a if m.b is None else m.b for m in marks]
+        radius = [m.radius for m in marks]
+        pin = [-1 if m.pin is None else names.index(m.pin) for m in marks]
+        lane = [-1] * len(marks)
+        n = _cells(lay, look)
+        if n:
+            k = names.index(look.cells)
+            cx = (look.size[0] if look.size else T.IO_WIDTH if look.narrow else T.PART_WIDTH) / 2
+            h = T.CELL_HALF
+            for i in range(n):  # (lane 0 at the top: in pin order, as a SPLIT's pins are)
+                y = (n - i) * T.PIN_SPACING
+                a.append((cx - h, y))
+                b.append((cx + h, y))
+                radius.append(T.CELL_RADIUS)
+                pin.append(k)
+                lane.append(i)
+        self.k = len(a)
+        self.a = np.array(a, np.float64).reshape(-1, 2)
+        self.b = np.array(b, np.float64).reshape(-1, 2)
+        self.radius = np.array(radius, np.float32)
+        self.pin = np.array(pin, np.intp)
+        self.lane = np.array(lane, np.intp)
         self.hooked = np.flatnonzero(self.pin < 0)
         self.colors = look.face_colors
 
 
 @lru_cache(maxsize=256)
-def _face_layout(ins: tuple, outs: tuple, look) -> _FaceLayout:
-    return _FaceLayout(ins, outs, look)
+def _face_layout(lay, look) -> _FaceLayout:
+    return _FaceLayout(lay, look)
+
+
+def _cells(lay, look) -> int:
+    """How many bit cells a part with this layout and look shows (Look.cells): its
+    cells pin's lanes, if that's a bus; else none."""
+    if look.cells is None:
+        return 0
+    names = lay.ins + lay.outs
+    if look.cells not in names:
+        return 0
+    w = lay.widths[names.index(look.cells)]
+    return w if w > 1 else 0
+
+
+def cell_at(view, wx: float, wy: float) -> int | None:
+    """The bit cell (its lane) of a part view at world point (wx, wy), if any."""
+    lay, look = view.part.layout, view.part.type.look
+    n = _cells(lay, look)
+    if not n:
+        return None
+    layout = _face_layout(lay, look)
+    first = layout.k - n
+    for i in range(n):
+        (ax, ay), (bx, _) = layout.a[first + i], layout.b[first + i]
+        r = T.CELL_RADIUS + 1
+        if view.x + ax - r <= wx <= view.x + bx + r and abs(wy - (view.y + ay)) <= r:
+            return i
+    return None
 
 
 def _face_rgba(names: tuple[str, str], tint: Rgb | None) -> tuple[tuple, tuple]:
@@ -1946,9 +1996,11 @@ def _make_faces(views: list[PartView], rows: np.ndarray, xs, ys, pin_slots, star
     state like a pin dot does (sync.py); the rest wait for face() (also sync.py)."""
     groups: dict[_FaceLayout, list[int]] = {}
     for i, v in enumerate(views):
-        if v.look.face:
-            pt = v.part.type
-            groups.setdefault(_face_layout(pt.ins, pt.outs, pt.look), []).append(i)
+        look = v.part.type.look
+        if look.face or look.cells is not None:
+            lay = v.part.layout
+            if look.face or _cells(lay, look):
+                groups.setdefault(_face_layout(lay, look), []).append(i)
     if not groups:
         return
     t = views[0].table
@@ -1971,10 +2023,14 @@ def _make_faces(views: list[PartView], rows: np.ndarray, xs, ys, pin_slots, star
         buf.set_state(slots, SHOW_OFF)
         buf.mark_many(slots)
         grid = slots.reshape(n, k)
-        pinned = layout.pin >= 0
+        pinned = (layout.pin >= 0) & (layout.lane < 0)
         if pinned.any():
             src = pin_slots[starts[idx][:, None] + layout.pin[pinned]]
             buf.show_pins(grid[:, pinned].ravel(), src.ravel())
+        cells = layout.lane >= 0
+        if cells.any():  # (pin_slots are the pins' heads: a lane is head + lane)
+            src = pin_slots[starts[idx][:, None] + layout.pin[cells]] + layout.lane[cells]
+            buf.show_lanes(grid[:, cells].ravel(), src.ravel())
         t._set_runs(rows[idx], slots, np.full(n, k, np.intp), t.face0, t.nface, t.faces)
         if layout.hooked.size:
             t.hooked.update(dict.fromkeys(rows[idx].tolist()))
@@ -2116,6 +2172,10 @@ def _make_wire_shapes(views: list[WireView], lines: list[list[Point]]) -> None:
     dot_dst = np.fromiter(("dst" in e for e in ends), bool, n)
     free_src = np.fromiter((v.wire.src is v.wire for v in views), bool, n)
     free_dst = np.fromiter((v.wire.dst is v.wire for v in views), bool, n)
+    bus = np.fromiter((v.wire.width > 1 for v in views), bool, n)
+    t.thick[np.fromiter((v.row for v in views), np.intp, n)] = np.where(
+        bus, T.BUS_THICKNESS, T.WIRE_THICKNESS
+    )
     rows = n_seg + dot_src + dot_dst
     first = np.cumsum(rows) - rows  # each wire's first row
     total = int(rows.sum())
@@ -2132,7 +2192,7 @@ def _make_wire_shapes(views: list[WireView], lines: list[list[Point]]) -> None:
         at = first[wire] + k
         a[at] = p[first_pt[wire] + k]
         b[at] = p[first_pt[wire] + k + 1]
-        radius[at] = T.WIRE_THICKNESS / 2
+        radius[at] = np.where(bus[wire], T.BUS_THICKNESS, T.WIRE_THICKNESS) / 2
         caps[at, 0] = np.where(k >= 1, 255, 0)
         caps[at, 1] = np.where(k + 1 <= n_seg[wire] - 1, 255, 0)
         # junction dots: zero-length, capped both ends
@@ -2142,7 +2202,7 @@ def _make_wire_shapes(views: list[WireView], lines: list[list[Point]]) -> None:
         ):
             w = np.flatnonzero(has)
             a[first[w] + row[w]] = b[first[w] + row[w]] = p[point[w]]
-            radius[first[w] + row[w]] = T.JUNCTION_RADIUS
+            radius[first[w] + row[w]] = np.where(bus[w], T.BUS_JUNCTION_RADIUS, T.JUNCTION_RADIUS)
             # free ends: squares, a segment as long as it's thick and uncapped
             sq = first[w] + row[w]
             sq = sq[free[w]]

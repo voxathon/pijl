@@ -52,6 +52,24 @@ What the engine promises:
   - action() runs once per click on one of the part's actions, for all the
     clicked parts at once (live ones only). Prop changes it makes are undoable;
     anything else it does (part.state, the outside world) isn't.
+  - Wide pins (buses): `widths = {"d": 8}` makes pin "d" 8 lanes wide (1 to
+    MAX_WIDTH). In eval (and face) a wide pin's array has shape (n, 8), lane 0
+    the least significant bit: & | ^ ~ work lane by lane, and pijl.logic.ints /
+    Logic.of_ints turn lanes into numbers and back. Return a wide output as Logic
+    (n, w) or (w,) -- or a Level, for every lane; plain numbers aren't taken
+    (is 5 one lane or bits?): use Logic.of_ints. A width may also be the name of a
+    prop (`{"d": "width"}`): each instance is as wide as its prop says (1 if it
+    has no such prop), read when the instance is made.
+  - A part's pins can differ from instance to instance: layout(props) says what an
+    instance with these props has (pin names, widths, joins); by default the class
+    attributes (ins, outs, widths, joins). Override it for a part whose pins follow
+    its settings (SPLIT: as many pins as its pattern says). Joins may name lanes:
+    "bus[0:4]" (lanes 0 to 3), "bus[5]". The engine reads pins only through
+    layout() (see layout_of), when an instance is made; a settings edit that changes
+    it rebuilds the instance (the editor drops wires that no longer fit). Instances
+    of one kind with different layouts are evaluated in separate batches, and eval
+    gets one array per input pin of *that* layout. Kinds with a wide pin, or a
+    layout other than their class attributes, aren't tabulated.
 """
 
 from __future__ import annotations
@@ -73,6 +91,8 @@ SUPPORTED_APIS = (
 
 LABEL_SIDES = ("below", "left", "right")
 
+
+MAX_WIDTH = 64  # lanes in a pin, at most (so a bus's value fits a uint64)
 
 GRID_STEP = 20  # Look.size is in these steps (2 x the editor's grid), so pins land on the grid
 
@@ -112,6 +132,9 @@ class Look:
     face: tuple[Mark, ...] = ()  # shapes drawn on the body, over it (see Mark)
     face_colors: tuple[str, str] = ("FACE_OFF", "FACE_ON")  # marks' (off, on) colors.
     # A part with a face can be recolored: its props["color"] tints them
+    cells: str | None = None  # a pin whose lanes, when it's a bus, the body shows as a
+    # column of cells (lane 0 at the top, like pins; the body grows to fit), each lit by its
+    # lane, in face_colors. A type with click_cell() gets a click on one
 
 
 class PartType:
@@ -144,6 +167,9 @@ class PartType:
     ] = ()  # pin groups that are one net straight through the
     # part (an inline pull: (("in", "out"),)). They show the
     # net's value; a joined output's eval value drives that net
+    widths: dict[
+        str, int | str
+    ] = {}  # pin name -> lanes (a bus), or the name of the prop that says; others: 1
     api: int = API  # the API its script was written for (set by the loader)
 
     def eval(self, ctx: Ctx, *ins):
@@ -174,12 +200,121 @@ class PartType:
         """The user clicked a placed instance. Overriding this makes the part clickable
         (a click then no longer selects it)."""
 
+    def click_cell(self, part: Part, lane: int) -> None:
+        """The user clicked cell `lane` of a placed instance (see Look.cells). A click on
+        the body anywhere else goes to click(), if the type has it."""
+
+    def layout(self, props: dict[str, Any]) -> dict[str, Any]:
+        """The pins of an instance with these props, as plain data: "ins" and "outs"
+        (names), "widths" (name -> lanes; or one width per pin, ins then outs) and
+        "joins" (groups of pins, or lane ranges of pins, that are one net straight
+        through the part). Keys left out: the class attributes. By default it's the
+        class attributes, a width naming a prop read from `props`."""
+        widths = {
+            name: props.get(w, 1) if isinstance(w, str) else w for name, w in self.widths.items()
+        }
+        return {"ins": self.ins, "outs": self.outs, "widths": widths, "joins": self.joins}
+
     def has(self, hook: str) -> bool:
         """Does this type override `hook`? Hooks it doesn't override are never called."""
         return getattr(type(self), hook) is not getattr(PartType, hook)
 
     def __repr__(self) -> str:
         return f"<PartType {self.kind}>"
+
+
+@dataclass(frozen=True)
+class Layout:
+    """An instance's pins, checked and normalized (layout_of): what the engine builds."""
+
+    ins: tuple[str, ...]
+    outs: tuple[str, ...]
+    widths: tuple[int, ...]  # per pin, ins then outs
+    # groups of lane ranges that are one net: (pin index (ins, then outs), first lane, lanes)
+    joins: tuple[tuple[tuple[int, int, int], ...], ...] = ()
+
+    @property
+    def n_in(self) -> int:
+        return len(self.ins)
+
+    @property
+    def wide(self) -> bool:
+        return any(w != 1 for w in self.widths)
+
+
+def layout_of(t: PartType, props: dict[str, Any]) -> Layout:
+    """t.layout(props), checked: the one place pins are read from. ValueError if it
+    isn't a layout (names that aren't strings, widths outside 1 to MAX_WIDTH, joins
+    of unknown pins, lanes or unequal widths, ...)."""
+    raw = t.layout(props)
+    if not isinstance(raw, dict):
+        raise ValueError(f"{t.kind}: layout() gave {type(raw).__name__}, not a dict")
+    ins, outs = tuple(raw.get("ins", t.ins)), tuple(raw.get("outs", t.outs))
+    names = ins + outs
+    if not all(isinstance(p, str) for p in names):
+        raise ValueError(f"{t.kind}: pin names must be strings")
+    index: dict[str, int] = {}
+    for k, name in enumerate(names):
+        index[name] = -1 if name in index else k  # (-1: there are two)
+
+    def pin(name: str, what: str) -> int:
+        k = index.get(name)
+        if k is None:
+            raise ValueError(f"{t.kind}: {what} names {name!r}, which isn't a pin")
+        if k < 0:
+            raise ValueError(f"{t.kind}: {what} names {name!r}, but two pins are called that")
+        return k
+
+    given = raw.get("widths", t.widths)
+    if isinstance(given, dict):
+        widths = [1] * len(names)
+        for name, w in given.items():
+            widths[pin(name, "widths")] = w
+    else:
+        widths = list(given)
+        if len(widths) != len(names):
+            raise ValueError(f"{t.kind}: {len(widths)} widths for {len(names)} pins")
+    for name, w in zip(names, widths):
+        if type(w) is not int or not 1 <= w <= MAX_WIDTH:
+            raise ValueError(f"{t.kind}: pin {name!r} can't be {w!r} lanes wide")
+    joins, seen = [], set()
+    for group in raw.get("joins", t.joins):
+        members = []
+        for ref in group:
+            if not isinstance(ref, str):
+                raise ValueError(f"{t.kind}: joins name pins (strings), not {ref!r}")
+            name, first, n = _lanes(ref)
+            k = pin(name, "joins")
+            if n is None:
+                first, n = 0, widths[k]
+            if first < 0 or n < 1 or first + n > widths[k]:
+                raise ValueError(f"{t.kind}: {ref!r}: {name!r} has lanes 0 to {widths[k] - 1}")
+            if k >= len(ins) and t.has("eval") and n != widths[k]:
+                raise ValueError(f"{t.kind}: {ref!r}: a part with an eval joins whole outputs")
+            lanes = {(k, first + i) for i in range(n)}
+            if lanes & seen:
+                raise ValueError(f"{t.kind}: joins name {ref!r} twice")
+            seen |= lanes
+            members.append((k, first, n))
+        if len({n for _, _, n in members}) > 1:
+            raise ValueError(f"{t.kind}: joined pins must be equally wide ({group!r})")
+        if len(members) > 1:
+            joins.append(tuple(members))
+    return Layout(ins, outs, tuple(widths), tuple(joins))
+
+
+def _lanes(ref: str) -> tuple[str, int, int | None]:
+    """"bus[0:4]" -> ("bus", 0, 4); "bus[5]" -> ("bus", 5, 1); "bus" -> ("bus", 0, None)."""
+    if not ref.endswith("]") or "[" not in ref:
+        return ref, 0, None
+    name, _, inside = ref[:-1].rpartition("[")
+    try:
+        if ":" in inside:
+            a, b = inside.split(":")
+            return name, int(a), int(b) - int(a)
+        return name, int(inside), 1
+    except ValueError:
+        raise ValueError(f"{ref!r}: lanes are written [i] or [first:end]") from None
 
 
 @dataclass

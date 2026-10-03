@@ -21,8 +21,9 @@ import weakref
 
 import numpy as np
 
+from ..logic import ONE, X, Z
 from .canvas import Canvas, InstanceBuffer
-from .sdf_shapes import SEGMENT, SHOW_BY_CODE, SHOW_FIGHT
+from .sdf_shapes import SEGMENT, SHOW_BY_CODE, SHOW_FIGHT, SHOW_X, SHOW_Z, partial
 
 _NONE = np.empty(0, np.int32)  # a buffer that shows no pins / wires
 
@@ -30,11 +31,29 @@ _NONE = np.empty(0, np.int32)  # a buffer that shows no pins / wires
 _WIRE_SHOW = np.concatenate((SHOW_BY_CODE, np.full(4, SHOW_FIGHT, np.uint8)))
 
 
+def _bus_show(codes: np.ndarray, starts: np.ndarray, n: np.ndarray, fights=None) -> np.ndarray:
+    """State bytes for buses, from their lanes' codes (each bus's from `starts`, `n` of
+    them): a fight on any lane shows as one; else any X -- or some lanes Z and some
+    not -- as X; all Z as Z; else lit as far as its lanes are 1 (sdf_shapes.partial)."""
+    if not len(starts):
+        return np.zeros(0, np.uint8)
+    ones = np.add.reduceat((codes == ONE).astype(np.intp), starts)
+    xs = np.add.reduceat((codes == X).astype(np.intp), starts)
+    zs = np.add.reduceat((codes == Z).astype(np.intp), starts)
+    out = partial(ones, n)
+    out[(xs > 0) | ((zs > 0) & (zs < n))] = SHOW_X
+    out[zs == n] = SHOW_Z
+    if fights is not None:
+        out[fights] = SHOW_FIGHT
+    return out
+
+
 class ViewSync:
     def __init__(self) -> None:
         # per buffer: (key, shape slots, the pins they show) / (key, shape slots, nets)
         self._pins: dict[int, tuple] = {}
         self._wires: dict[int, tuple] = {}
+        self._lanes: dict[int, tuple] = {}  # (key, shape slots, the lanes they show)
         # per part table: (key, [(part type, part slots, mark slots n x k)])
         self._faces: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
@@ -42,13 +61,24 @@ class ViewSync:
         """Show the circuit's current pin and net states on the canvas's shapes, and
         (given the canvas's part table) light the face marks face() hooks decide."""
         for buf in canvas.buffers():
-            shapes, pins = self._pin_slots(buf, circuit)
+            shapes, pins, bus = self._pin_slots(buf, circuit)
             if shapes.size:
                 buf.set_state(shapes, SHOW_BY_CODE[circuit.pin_codes(pins)])
-            shapes, nets = self._wire_slots(buf, circuit)
+            if bus is not None:  # buses: all their lanes at once
+                shapes, lanes, starts, n = bus
+                buf.set_state(shapes, _bus_show(circuit.pin_codes(lanes), starts, n))
+            shapes, nets, bus = self._wire_slots(buf, circuit)
             if shapes.size:
                 fight = circuit.net_conflict[nets].view(np.uint8) << 2
                 buf.set_state(shapes, _WIRE_SHOW[circuit.net_value[nets] | fight])
+            if bus is not None:
+                shapes, nets, starts, n = bus
+                fights = np.logical_or.reduceat(circuit.net_conflict[nets], starts)
+                buf.set_state(shapes, _bus_show(circuit.net_value[nets], starts, n, fights))
+            if buf.lane_src is not None:  # bit cells: one lane each
+                shapes, lanes = self._lane_slots(buf, circuit)
+                if shapes.size:
+                    buf.set_state(shapes, SHOW_BY_CODE[circuit.pin_codes(lanes)])
         if table is not None and table.hooked:
             buf = canvas.buffer(SEGMENT, table.layers.bodies)
             for t, parts, marks in self._face_groups(table):
@@ -66,14 +96,16 @@ class ViewSync:
                 t = part.type
                 parts, marks = groups.setdefault(t, ([], []))
                 parts.append(part.slot)
-                marks.append(table.face_slots(row)[_face_layout(t.ins, t.outs, t.look).hooked])
+                marks.append(table.face_slots(row)[_face_layout(part.layout, t.look).hooked])
             cached = self._faces[table] = (
                 table.face_gen,
                 [(t, np.array(p, np.intp), np.stack(m)) for t, (p, m) in groups.items()],
             )
         return cached[1]
 
-    def _pin_slots(self, buf: InstanceBuffer, circuit) -> tuple[np.ndarray, np.ndarray]:
+    def _pin_slots(self, buf: InstanceBuffer, circuit) -> tuple:
+        """(shapes, the one-lane pins they show, buses): buses is None, or (shapes,
+        their lane slots, where each one's lanes start, how many it has)."""
         key = (buf.gen, id(circuit), circuit.pin_count)
         cached = self._pins.get(id(buf))
         if cached is None or cached[0] != key:
@@ -82,18 +114,50 @@ class ViewSync:
             pins = src[shapes]
             ok = pins < circuit.pin_count  # (a stale view of a previous circuit: skip it)
             # (native ints: indexing with int32 would convert them every frame)
-            cached = self._pins[id(buf)] = (key, shapes[ok], pins[ok].astype(np.intp))
+            shapes, pins = shapes[ok], pins[ok].astype(np.intp)
+            lanes, n = circuit.lanes_of_pins(pins)
+            bus = None
+            wide = n > 1
+            if wide.any():
+                lanes, n = circuit.lanes_of_pins(pins[wide])
+                bus = (shapes[wide], lanes, np.cumsum(n) - n, n)
+                shapes, pins = shapes[~wide], pins[~wide]
+            cached = self._pins[id(buf)] = (key, shapes, pins, bus)
+        return cached[1], cached[2], cached[3]
+
+    def _lane_slots(self, buf: InstanceBuffer, circuit) -> tuple[np.ndarray, np.ndarray]:
+        key = (buf.gen, id(circuit), circuit.pin_count)
+        cached = self._lanes.get(id(buf))
+        if cached is None or cached[0] != key:
+            src = buf.lane_src
+            shapes = np.flatnonzero(src[: buf.end] >= 0)
+            lanes = src[shapes]
+            ok = lanes < circuit.pin_count
+            cached = self._lanes[id(buf)] = (key, shapes[ok], lanes[ok].astype(np.intp))
         return cached[1], cached[2]
 
-    def _wire_slots(self, buf: InstanceBuffer, circuit) -> tuple[np.ndarray, np.ndarray]:
+    def _wire_slots(self, buf: InstanceBuffer, circuit) -> tuple:
+        """(shapes, the nets of the one-lane wires they show, buses): buses is None,
+        or (shapes, their lanes' nets, where each one's start, how many it has)."""
         key = (buf.gen, id(circuit), circuit.nets_version)
         cached = self._wires.get(id(buf))
         if cached is None or cached[0] != key:
             src = buf.wire_src if buf.wire_src is not None else _NONE
             shapes = np.flatnonzero(src[: buf.end] >= 0)
-            nets = circuit.wire_nets(src[shapes])
+            wires = src[shapes].astype(np.intp)
+            nets = circuit.wire_nets(wires)
             has = nets >= 0  # (no net: left as it is)
             if not len(circuit.net_value):
                 has[:] = False
-            cached = self._wires[id(buf)] = (key, shapes[has], nets[has])
-        return cached[1], cached[2]
+            shapes, wires, nets = shapes[has], wires[has], nets[has]
+            bus = None
+            _, n = circuit.lanes_of_wires(wires)
+            wide = n > 1
+            if wide.any():
+                lanes, n = circuit.lanes_of_wires(wires[wide])
+                lane_nets = circuit.wire_nets(lanes)
+                if (lane_nets >= 0).all():
+                    bus = (shapes[wide], lane_nets, np.cumsum(n) - n, n)
+                shapes, nets = shapes[~wide], nets[~wide]
+            cached = self._wires[id(buf)] = (key, shapes, nets, bus)
+        return cached[1], cached[2], cached[3]

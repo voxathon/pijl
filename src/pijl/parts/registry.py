@@ -25,7 +25,9 @@ import sys
 import traceback
 from pathlib import Path
 
-from .contract import API, GRID_STEP, LABEL_SIDES, SUPPORTED_APIS, Look, Mark, PartType
+from .contract import (
+    API, GRID_STEP, LABEL_SIDES, MAX_WIDTH, SUPPORTED_APIS, Layout, Look, Mark, PartType, layout_of,
+)  # fmt: skip
 from .ports import PORTS
 from .settings import Action, Setting
 
@@ -81,11 +83,7 @@ class Registry:
         if not set(t.weak) <= set(t.outs):
             raise ValueError(f"{name}: weak pins must be outputs")
         t.joins = tuple(tuple(group) for group in t.joins)
-        joined = [p for group in t.joins for p in group]
-        if not set(joined) <= set(t.ins + t.outs) or len(joined) != len(set(joined)):
-            raise ValueError(f"{name}: joins must name pins, each at most once")
-        if len(set(t.ins + t.outs)) != len(t.ins + t.outs) and joined:
-            raise ValueError(f"{name}: joined pins need unique names")
+        _check_widths(t, engine)
         if t.port is not None and not engine:
             raise ValueError(f"{name}: only the engine defines ports (IN/OUT)")
         if t.pure and not t.outs:
@@ -132,6 +130,12 @@ class Registry:
         if not isinstance(t.look, Look) or t.look.label not in LABEL_SIDES:
             raise ValueError(f"{name}: bad look {t.look!r}")
         _check_face(t)
+        try:  # (what an instance with the default props gets: catches most mistakes now)
+            layout_of(t, fresh_props(t))
+        except ValueError as e:
+            raise ValueError(str(e)) from None
+        except Exception as e:
+            raise ValueError(f"{name}: layout() raised {e!r}") from None
 
     # ---- loading -----------------------------------------------------------
 
@@ -168,6 +172,8 @@ class Registry:
                 raise ValueError(f"API = {api!r}, this pijl has API = {API}")
             register(self)
             for t in self._pending:
+                if api < 2 and t.widths:
+                    raise ValueError(f"{t.kind}: wide pins need API = 2")
                 t.api = api
                 self.types[t.kind] = t
         except Exception:
@@ -175,6 +181,28 @@ class Registry:
             self.errors.append(f"{path.name}: {detail}")
         finally:
             self._pending = None
+
+
+def _check_widths(t: PartType, engine: bool = False) -> None:
+    """PartType.widths. The type gets its own copy (a mod editing one type's widths
+    in place must not edit the shared default). (The engine's ports read a prop they
+    don't always have: none means one lane.)"""
+    name = t.kind
+    if not isinstance(t.widths, dict):
+        raise TypeError(f"{name}: widths must be a dict")
+    t.widths = dict(t.widths)
+    pins = t.ins + t.outs
+    for pin, w in t.widths.items():
+        where = f"{name}: widths[{pin!r}]"
+        if pin not in pins:
+            raise ValueError(f"{where}: no pin called {pin!r}")
+        if isinstance(w, str):
+            if w not in t.props and w not in t.settings and not engine:
+                raise ValueError(f"{where}: no prop or setting called {w!r}")
+        elif type(w) is not int or not 1 <= w <= MAX_WIDTH:
+            raise ValueError(f"{where}: must be 1 to {MAX_WIDTH} lanes, or a prop name")
+    if t.widths and len(set(pins)) != len(pins):
+        raise ValueError(f"{name}: wide pins need unique pin names")
 
 
 def _check_face(t: PartType) -> None:
@@ -199,6 +227,8 @@ def _check_face(t: PartType) -> None:
     ):
         raise ValueError(f"{name}: Look.face_colors must be two theme color names")
     pins = set(t.ins + t.outs)
+    if look.cells is not None and look.cells not in pins:
+        raise ValueError(f"{name}: Look.cells names no pin ({look.cells!r})")
     hooked = 0
     for i, m in enumerate(look.face):
         where = f"{name}: Look.face[{i}]"
@@ -252,6 +282,40 @@ def flat(props: dict) -> bool:
         v is None or isinstance(v, (bool, int, float, str, bytes))
         for v in props.values()
     )
+
+
+def layout_props(t: PartType) -> tuple[str, ...] | None:
+    """The props t's layout depends on: those its widths name; None if t has its own
+    layout() (then it may depend on anything)."""
+    if type(t).layout is not PartType.layout:
+        return None
+    return tuple(w for w in t.widths.values() if isinstance(w, str))
+
+
+def static(t: PartType) -> bool:
+    """Is every instance of t laid out alike (its class attributes, nothing from props)?"""
+    return layout_props(t) == ()
+
+
+def layout_cached(t: PartType, props: dict, seen: dict) -> Layout | None:
+    """layout_of(t, props), None if that fails; worked out once per type and value of
+    the props it depends on, remembered in `seen` (a board of IN ports asks once, not
+    once per port). For reading saved boards; the circuit has its own (_shape_of)."""
+    keys = seen.get(t, seen)
+    if keys is seen:
+        keys = seen[t] = layout_props(t)
+    key = None
+    if keys is not None:
+        key = (t, *map(props.get, keys))
+        if key in seen:
+            return seen[key]
+    try:
+        lay = layout_of(t, props)
+    except Exception:
+        lay = None
+    if key is not None:
+        seen[key] = lay
+    return lay
 
 
 def check_props(t: PartType, props: dict) -> tuple[dict, list[str]]:

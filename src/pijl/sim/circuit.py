@@ -55,6 +55,15 @@ again (scipy's connected components) doesn't loop over wires in Python either.
 What changed for the UI (take_changes) is a diff of the state arrays against what
 it was shown last.
 
+Buses: a pin can be several lanes wide (PartType.widths). A pin of width w is w
+pin slots in a row (its first, the "head", is what a Pin handle stands for), and a
+wire of width w is w wire slots in a row, lane i joining lane i of each end. So a
+bus is just w ordinary nets: nothing past the wiring knows about widths, except
+eval, which gets a wide pin's lanes as one (n, w) array. Wires only join ends of
+the same width (can_connect). A part's pin layout -- its widths -- is its *shape*;
+instances of one kind may differ (a width read from props), and are evaluated a
+shape at a time.
+
 Parts and pins are tables too: a part is a row by part slot (type, uid, owner, its
 first pin slot, ...; see Circuit._new_rows), a pin a row of _PinStates. Part and
 Pin objects are handles on rows, made when something asks for one and then kept
@@ -79,8 +88,8 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
 from ..logic import CODE, ONE, X, Z, ZERO, Level, Logic, codes, fights, resolve
-from ..parts import Ctx, PartType, Registry, builtin_registry, fresh_props
-from ..parts.registry import flat
+from ..parts import MAX_WIDTH, Ctx, Layout, PartType, Registry, builtin_registry, fresh_props, layout_of
+from ..parts.registry import copy_props, flat, layout_props
 from .config import EngineConfig
 from .config import default as default_config
 
@@ -114,24 +123,39 @@ class _PinStates:
         self.index = np.zeros(1024, np.int32)  # its index on its side
         self.is_input = np.zeros(1024, bool)
         self.passive = np.zeros(1024, bool)  # see Pin.passive
-        # Pin handles by slot, made on first use; None again once the pin is gone
+        self.lane = np.zeros(1024, np.int16)  # its lane in its pin (0: the head)
+        self.width = np.ones(1024, np.int16)  # its pin's lanes (unused slots: 1)
+        # Pin handles by (head) slot, made on first use; None again once the pin is gone
         self.pins: list[Pin | None] = []
 
-    _COLS = ("states", "reader", "alive", "weak", "part", "index", "is_input", "passive")
+    _COLS = (
+        "states", "reader", "alive", "weak", "part", "index", "is_input", "passive", "lane", "width",
+    )  # fmt: skip
 
     def new(
-        self, part: int, index: int, is_input: bool, initial: Level = Z, weak: bool = False
+        self, part: int, index: int, is_input: bool, initial: Level = Z, weak: bool = False,
+        width: int = 1,
     ) -> int:
-        """One more pin (no handle yet); its slot."""
+        """One more pin, `width` lanes (no handle yet); its (head) slot."""
         slot = self.n
-        self._room(slot + 1)
-        self.n += 1
-        self.pins.append(None)
-        self.states[slot] = initial
-        self.reader[slot] = is_input
-        self.alive[slot] = True
-        self.weak[slot] = weak
-        self.part[slot], self.index[slot], self.is_input[slot] = part, index, is_input
+        end = slot + width
+        self._room(end)
+        self.n = end
+        if width == 1:
+            self.pins.append(None)
+            self.states[slot], self.reader[slot], self.alive[slot] = initial, is_input, True
+            self.weak[slot], self.passive[slot] = weak, False
+            self.part[slot], self.index[slot], self.is_input[slot] = part, index, is_input
+            return slot  # (lane 0 of 1: what _room left there)
+        self.pins.extend([None] * width)
+        self.states[slot:end] = initial
+        self.reader[slot:end] = is_input
+        self.alive[slot:end] = True
+        self.weak[slot:end] = weak
+        self.part[slot:end], self.index[slot:end], self.is_input[slot:end] = part, index, is_input
+        self.passive[slot:end] = False
+        self.lane[slot:end] = np.arange(width)
+        self.width[slot:end] = width
         return slot
 
     def new_block(
@@ -143,9 +167,12 @@ class _PinStates:
         weak: np.ndarray,
         reader: np.ndarray | None = None,
         passive: np.ndarray | None = None,
+        lane: np.ndarray | None = None,
+        width: np.ndarray | None = None,
     ) -> None:
-        """new() for many pins at once: the next len(part) slots, in order. (`reader`,
-        `passive`: when they aren't just is_input and False.)"""
+        """new() for many pin slots at once: the next len(part) slots, in order, lane by
+        lane. (`reader`, `passive`, `lane`, `width`: when they aren't just is_input,
+        False, 0 and 1.)"""
         first, k = self.n, len(part)
         end = first + k
         self._room(end)
@@ -158,8 +185,9 @@ class _PinStates:
         self.part[first:end] = part
         self.index[first:end] = index
         self.is_input[first:end] = is_input
-        if passive is not None:
-            self.passive[first:end] = passive
+        self.passive[first:end] = False if passive is None else passive
+        self.lane[first:end] = 0 if lane is None else lane
+        self.width[first:end] = 1 if width is None else width
 
     def handle(self, slot: int) -> Pin:
         pin = self.pins[slot]
@@ -167,20 +195,26 @@ class _PinStates:
             pin = self.pins[slot] = Pin.__new__(Pin)
             pin._store, pin.slot, pin._part = self, slot, None
             pin.index, pin.is_input = int(self.index[slot]), bool(self.is_input[slot])
+            pin.width = int(self.width[slot])
         return pin
 
     def kill(self, slots: list[int]) -> None:
-        """These pins' parts are gone."""
+        """These pin slots' parts are gone (every lane: give them all)."""
         self.alive[slots] = False
         for slot in slots:
             self.pins[slot] = None
 
+    def lanes(self, head: int) -> np.ndarray:
+        """A pin's lane slots, by its head."""
+        return np.arange(head, head + int(self.width[head]))
+
     def _room(self, n: int) -> None:
-        """Arrays long enough for n pins."""
+        """Arrays long enough for n pins. (New slots: lane 0 of a one-lane pin.)"""
         while n > len(self.states):
             for name in self._COLS:
                 old = getattr(self, name)
-                setattr(self, name, np.concatenate((old, np.zeros_like(old))))
+                more = np.ones_like(old) if name == "width" else np.zeros_like(old)
+                setattr(self, name, np.concatenate((old, more)))
 
 
 class _WireSlots:
@@ -196,49 +230,79 @@ class _WireSlots:
         self.end_is_wire = np.zeros((256, 2), bool)
         self.end_slot = np.zeros((256, 2), np.int32)
         self.uid = np.zeros(256, np.int64)
+        self.lane = np.zeros(256, np.int16)  # its lane in its wire (0: the head)
+        self.width = np.ones(256, np.int16)  # its wire's lanes (unused slots: 1)
 
-    _COLS = ("alive", "board", "end_is_wire", "end_slot", "uid")
+    _COLS = ("alive", "board", "end_is_wire", "end_slot", "uid", "lane", "width")
 
-    def _new_slot(self) -> int:
-        slot = len(self.wires)
-        if slot == len(self.alive):
-            for name in self._COLS:
-                old = getattr(self, name)
-                setattr(self, name, np.concatenate((old, np.zeros_like(old))))
-        self.wires.append(None)
-        self.alive[slot] = True
-        return slot
-
-    def add(self, wire: Wire, board: bool) -> None:
-        wire.slot = slot = self._new_slot()
-        self.wires[slot] = wire
-        self.board[slot], self.uid[slot] = board, wire.uid
-        self.set_ends(wire)
-
-    def add_hidden(self, uid: int, ends: list[tuple[bool, int]]) -> int:
-        """A wire inside a macro, by its ends (is it a wire?, slot; slot -1: a free end);
-        no object. Its slot."""
-        slot = self._new_slot()
-        self.board[slot], self.uid[slot] = False, uid
-        for side, (is_wire, end) in enumerate(ends):
-            self.end_is_wire[slot, side] = is_wire
-            self.end_slot[slot, side] = slot if is_wire and end < 0 else end
-        return slot
-
-    def add_hidden_block(self, end_is_wire: np.ndarray, end_slot: np.ndarray, uid: np.ndarray) -> None:
-        """add_hidden for many wires at once: the next len(uid) slots."""
-        first, k = len(self.wires), len(uid)
-        end = first + k
+    def _room(self, end: int) -> None:
+        """Arrays long enough for `end` slots. (New slots: lane 0 of a one-lane wire.)"""
         while end > len(self.alive):
             for name in self._COLS:
                 old = getattr(self, name)
-                setattr(self, name, np.concatenate((old, np.zeros_like(old))))
+                more = np.ones_like(old) if name == "width" else np.zeros_like(old)
+                setattr(self, name, np.concatenate((old, more)))
+
+    def _new_slots(self, width: int) -> int:
+        """`width` slots in a row, for one wire; the first (its head)."""
+        slot = len(self.wires)
+        end = slot + width
+        if end > len(self.alive):
+            self._room(end)
+        if width == 1:
+            self.wires.append(None)
+            self.alive[slot] = True  # (lane 0 of 1: what _room left there)
+            return slot
+        self.wires.extend([None] * width)
+        self.alive[slot:end] = True
+        self.lane[slot:end] = np.arange(width)
+        self.width[slot:end] = width
+        return slot
+
+    def add(self, wire: Wire, board: bool) -> None:
+        w = wire.width
+        wire.slot = slot = self._new_slots(w)
+        self.wires[slot] = wire
+        if w == 1:
+            self.board[slot], self.uid[slot] = board, wire.uid
+        else:
+            self.board[slot : slot + w], self.uid[slot : slot + w] = board, wire.uid
+        self.set_ends(wire)
+
+    def add_hidden(self, uid: int, ends: list[tuple[bool, int]], width: int = 1) -> int:
+        """A wire inside a macro, by its ends (is it a wire?, head slot; slot -1: a free
+        end); no object. Its head slot."""
+        slot = self._new_slots(width)
+        if width == 1:
+            self.board[slot], self.uid[slot] = False, uid
+            for side, (is_wire, at) in enumerate(ends):
+                self.end_is_wire[slot, side] = is_wire
+                self.end_slot[slot, side] = slot if is_wire and at < 0 else at
+            return slot
+        end = slot + width
+        self.board[slot:end], self.uid[slot:end] = False, uid
+        lanes = np.arange(width)
+        for side, (is_wire, at) in enumerate(ends):
+            self.end_is_wire[slot:end, side] = is_wire
+            self.end_slot[slot:end, side] = (slot if is_wire and at < 0 else at) + lanes
+        return slot
+
+    def add_hidden_block(
+        self, end_is_wire: np.ndarray, end_slot: np.ndarray, uid: np.ndarray,
+        lane: np.ndarray, width: np.ndarray,
+    ) -> None:
+        """add_hidden for many wire slots at once (lanes included): the next len(uid)."""
+        first, k = len(self.wires), len(uid)
+        end = first + k
+        self._room(end)
         self.wires.extend([None] * k)
         self.alive[first:end] = True
         self.board[first:end] = False
         self.end_is_wire[first:end] = end_is_wire
         self.end_slot[first:end] = end_slot
         self.uid[first:end] = uid
+        self.lane[first:end] = lane
+        self.width[first:end] = width
 
     def handle(self, slot: int) -> Wire:
         """The Wire of this slot (made now for a hidden one)."""
@@ -248,21 +312,34 @@ class _WireSlots:
                 (FREE if e == slot else self.handle(int(e))) if w else self.pins.handle(int(e))
                 for w, e in zip(self.end_is_wire[slot].tolist(), self.end_slot[slot].tolist())
             ]
-            wire = Wire(ends[0], ends[1], int(self.uid[slot]), slot)
+            wire = Wire(ends[0], ends[1], int(self.uid[slot]), slot, int(self.width[slot]))
             wire.src, wire.dst = (wire if e is FREE else e for e in ends)
             self.wires[slot] = wire
         return wire
 
     def kill(self, slots: list[int]) -> None:
-        """These wires are gone."""
-        self.alive[slots] = False
+        """These wires are gone (by head slot: their lanes go too)."""
+        width = self.width
         for slot in slots:
+            w = width[slot]
+            if w == 1:
+                self.alive[slot] = False
+            else:
+                self.alive[slot : slot + int(w)] = False
             self.wires[slot] = None
 
     def set_ends(self, wire: Wire) -> None:
+        """Lane i of each end is the end's lane i (a free end: the wire's own)."""
+        slot, w = wire.slot, wire.width
+        if w == 1:
+            for side, end in enumerate(wire.ends):
+                self.end_is_wire[slot, side] = isinstance(end, Wire)
+                self.end_slot[slot, side] = end.slot
+            return
+        lanes = np.arange(w)
         for side, end in enumerate(wire.ends):
-            self.end_is_wire[wire.slot, side] = isinstance(end, Wire)
-            self.end_slot[wire.slot, side] = end.slot
+            self.end_is_wire[slot : slot + w, side] = isinstance(end, Wire)
+            self.end_slot[slot : slot + w, side] = end.slot + lanes
 
 
 class Pin:
@@ -270,7 +347,8 @@ class Pin:
     never changes about a pin (index, side, its part) it keeps itself: the editor
     asks all the time."""
 
-    __slots__ = ("_store", "slot", "index", "is_input", "_part")
+    # width: how many lanes (1, or a bus: see PartType.widths)
+    __slots__ = ("_store", "slot", "index", "is_input", "width", "_part")
 
     @property
     def part(self) -> Part:
@@ -281,15 +359,30 @@ class Pin:
         return part
 
     @property
-    def state(self) -> Level:
-        return Level(int(self._store.states[self.slot]))
+    def state(self) -> Level | Logic:
+        """A Level; a wide pin's is a Logic array of its lanes (lane 0 first)."""
+        s = self._store
+        w = self.width
+        if w == 1:
+            return Level(int(s.states[self.slot]))
+        return Logic.of_codes(s.states[self.slot : self.slot + w].copy())
 
     @state.setter
     def state(self, value) -> None:
-        """A Level, or a bool / 0 / 1."""
+        """A Level, or a bool / 0 / 1. A wide pin takes a Level (every lane), a Logic
+        array or list of its lanes, or a number (its bits: see Logic.of_ints)."""
         s = self._store
-        s.states[self.slot] = codes(value)
-        s.circuit._poked.append(self.slot)
+        w = self.width
+        if w == 1:
+            s.states[self.slot] = codes(value)
+            s.circuit._poked.append(self.slot)
+            return
+        lanes = slice(self.slot, self.slot + w)
+        if isinstance(value, (int, np.integer)) and not isinstance(value, (bool, Level)):
+            s.states[lanes] = Logic.of_ints(value, w).codes
+        else:
+            s.states[lanes] = np.broadcast_to(codes(value), (w,))
+        s.circuit._poked.append(np.arange(lanes.start, lanes.stop))
 
     @property
     def passive(self) -> bool:
@@ -379,18 +472,28 @@ class Part:
             self._pin_lists()
         return self._outs
 
+    @property
+    def layout(self) -> Layout:
+        """Its pins: names, widths and joins (see PartType.layout). Pin names are
+        layout.ins[i] / layout.outs[i] -- for most kinds the type's ins / outs."""
+        c = self._c
+        return c._shapes[c._shape[self.slot]].layout
+
     def _pin_lists(self) -> None:
-        c, t = self._c, self.type
+        c = self._c
         store = c._pins
-        handles, p0, n_in = store.pins, int(c._pin0[self.slot]), len(t.ins)
+        sh = c._shapes[c._shape[self.slot]]
+        handles, p0, n_in = store.pins, int(c._pin0[self.slot]), sh.n_in
+        off, widths = sh.offs, sh.widths
         out = []
-        for k in range(n_in + len(t.outs)):
-            s = p0 + k
+        for k in range(sh.n_pins):
+            s = p0 + off[k]
             pin = handles[s]
             if pin is None:  # (what store.handle does, knowing the answers already)
                 pin = handles[s] = Pin.__new__(Pin)
                 pin._store, pin.slot, pin._part = store, s, self
                 pin.index, pin.is_input = (k, True) if k < n_in else (k - n_in, False)
+                pin.width = widths[k]
             out.append(pin)
         self._ins, self._outs = out[:n_in], out[n_in:]
 
@@ -489,7 +592,8 @@ class Wire:
     src: Endpoint
     dst: Endpoint
     uid: int = 0  # stable identity, like Part.uid (wires can be endpoints of wires)
-    slot: int = -1  # its place in the circuit's wire arrays (see _WireSlots)
+    slot: int = -1  # its place in the circuit's wire arrays (see _WireSlots): its head
+    width: int = 1  # lanes: a bus is wider than 1 (its slots are slot, slot + 1, ...)
 
     @property
     def ends(self) -> tuple[Endpoint, Endpoint]:
@@ -529,6 +633,7 @@ class Circuit:
         self._alive = np.zeros(256, bool)
         self._owner = np.full(256, -1, np.int32)
         self._pin0 = np.zeros(256, np.int32)
+        self._shape = np.zeros(256, np.int32)  # index into _shapes: its pin layout
         self._label = np.full(256, None, object)
         self._props = np.full(256, None, object)
         self._handles = np.full(256, None, object)
@@ -538,9 +643,10 @@ class Circuit:
         self._links: dict[int, np.ndarray] = {}  # pin slot pairs joined into one net (k x 2)
         self._drives: dict[int, list[int]] = {}  # joined parts: per output, its driver pin
         self._types: list[PartType] = []
-        self._type_pins = np.zeros(0, np.intp)  # per type: its pin count (pin_slots_of)
         self._type_ids: dict[PartType, int] = {}
-        self._templates: dict[PartType, _Template] = {}
+        self._shapes: list[_Shape] = []  # pin layouts: a type and its pins' widths
+        self._shape_ids: dict[tuple, int] = {}  # (type, widths or None) -> shape id
+        self._sh_cols = (np.zeros(0, np.intp),) * 3  # per shape: pins, lanes, input lanes
         self._blueprints: dict[PartType, _Blueprint] = {}  # macro types: see _make
         self._linked: dict[int, None] = {}  # slots of parts with links (macros, joins)
         self._n_part_slots = 0
@@ -652,17 +758,25 @@ class Circuit:
         return self.add_parts([self.registry.get(kind)], [uid], live)[0]
 
     def add_parts(
-        self, types: list[PartType], uids: list[int | None], live: bool = True
+        self,
+        types: list[PartType],
+        uids: list[int | None],
+        live: bool = True,
+        props: list[dict | None] | None = None,
     ) -> list[Part]:
         """add_part for many parts at once, by type (registry.get(kind)): pins, settling
-        and the rest set up a whole type at a time rather than part by part."""
+        and the rest set up a whole type at a time rather than part by part. `props`:
+        each part's (copied; None: the defaults). Give them here rather than setting
+        them afterwards when they decide pin widths (PartType.widths)."""
         given = []
         for uid in uids:
             if uid is None:
                 uid = self._next_uid
             self._next_uid = max(self._next_uid, uid + 1)
             given.append(uid)
-        parts = [self._handle(s) for s in self._make_many(types, given)]
+        if props is not None:
+            props = [None if p is None else copy_props(p) for p in props]
+        parts = [self._handle(s) for s in self._make_many(types, given, props=props)]
         for part in parts:
             self._parts[part] = None
             self.part_by_uid[part.uid] = part
@@ -674,8 +788,8 @@ class Circuit:
     # ---- the part table ----------------------------------------------------
     # A part is a row, by part slot (never reused); Part objects are handles on rows,
     # made by _handle when something asks. Columns: type, uid, live, alive, owner (the
-    # macro instance it's inside, -1 on the board), its first pin slot (its pins are
-    # the next len(ins) + len(outs) slots), label, props (None inside a macro until
+    # macro instance it's inside, -1 on the board), its first pin slot (its pins' lanes
+    # are the next slots: see its shape), its shape (_Shape), label, props (None inside a macro until
     # asked for: then a copy of the body's). What few parts have is kept by slot in
     # dicts, as small int arrays: a macro's body parts and wires (_inner,
     # _inner_wires), links (pin slot pairs), joined outputs' driver pins (_drives).
@@ -697,7 +811,7 @@ class Circuit:
         return range(first, end)
 
     _ROW_COLS = (
-        "_settle", "_type_id", "_uid", "_live", "_alive", "_owner", "_pin0",
+        "_settle", "_type_id", "_uid", "_live", "_alive", "_owner", "_pin0", "_shape",
         "_label", "_props", "_handles",
     )  # fmt: skip
 
@@ -720,64 +834,147 @@ class Circuit:
         return part
 
     def _make_many(
-        self, types: list[PartType], uids: list[int], owner: int = -1
+        self,
+        types: list[PartType],
+        uids: list[int],
+        owner: int = -1,
+        props: list[dict | None] | None = None,
     ) -> list[int]:
         """_make for each (type, uid), in order: the same rows and pin slots as making
         them one by one (their slots). Plain types (no joins, no body) are added a run
-        at a time: rows and pins as arrays."""
+        at a time: rows and pins as arrays. `props`: each one's (None: the defaults);
+        on the board they become the part's own, inside a macro they're only read."""
         out: list[int] = []
         i, n = 0, len(types)
+        if props is None:
+            props = [None] * n
         while i < n:
             t = types[i]
-            if t.joins or getattr(t, "body", None) is not None:
-                out.append(self._make(t, uids[i], owner))
+            if _one_by_one(t):
+                out.append(self._make(t, uids[i], owner, props[i]))
                 i += 1
                 continue
             j = i
-            while j < n and not (types[j].joins or getattr(types[j], "body", None) is not None):
+            while j < n and not _one_by_one(types[j]):
                 j += 1
-            out += self._make_plain(types[i:j], uids[i:j], owner)
+            out += self._make_plain(types[i:j], uids[i:j], owner, props[i:j])
             i = j
         if out:
             self._kinds_dirty = self._batches_dirty = self._nets_dirty = True
         return out
 
-    def _make_plain(self, types: list[PartType], uids: list[int], owner: int) -> list[int]:
+    def _make_plain(
+        self, types: list[PartType], uids: list[int], owner: int, props: list[dict | None]
+    ) -> list[int]:
         """Rows and pins for a run of plain parts, as arrays (see _make_many)."""
         store = self._pins
         rows = self._new_rows(len(types))
-        templates: dict[PartType, _Template] = {}
-        tms = []
-        for t in types:
-            tm = templates.get(t)
-            if tm is None:
-                tm = templates[t] = self._templates.get(t) or self._template(t)
-            tms.append(tm)
-        counts = np.fromiter((len(tm.sides) for tm in tms), np.intp, len(tms))
+        # types whose widths read no props: one shape each
+        plain = {t: self._shape_of(t, None) for t in dict.fromkeys(types) if layout_props(t) == ()}
+        if len(plain) == len(dict.fromkeys(types)):
+            sids = [plain[t] for t in types]
+        else:
+            known: dict = {}  # type, or (type, the props its widths read) -> shape id
+            sids = []
+            for t, given in zip(types, props):
+                sid = plain.get(t)
+                if sid is None:
+                    keys = layout_props(t)
+                    if keys is None:  # (its own layout(): ask every time)
+                        sid = self._shape_of(t, given)
+                    else:
+                        key = t if given is None else (t, *(given.get(k) for k in keys))
+                        sid = known.get(key)
+                        if sid is None:
+                            sid = known[key] = self._shape_of(t, given)
+                sids.append(sid)
+        shapes = self._shapes
+        board = owner < 0
+        if board:  # (inside a macro, props were only read)
+            made = [shapes[sid].props() if given is None else given for sid, given in zip(sids, props)]
+        # Every column of every new pin slot is one gather from the shapes' own columns
+        # (a few shapes, many parts), not a concatenation of one small array per part.
+        sid_arr = np.array(sids, np.intp)
+        one = len(set(sids)) == 1  # (one shape: adding a part, or a run of one kind)
+        if one:
+            uniq, inv = sid_arr[:1], np.zeros(len(sids), np.intp)
+        else:
+            uniq, inv = np.unique(sid_arr, return_inverse=True)
+        used = [shapes[u] for u in uniq.tolist()]
+        lanes = np.array([sh.n_lanes for sh in used], np.intp)
+        counts = lanes[inv]
         sl = slice(rows.start, rows.stop)
-        self._type_id[sl] = [tm.type_id for tm in tms]
+        self._type_id[sl] = np.array([sh.type_id for sh in used], np.int32)[inv]
+        self._shape[sl] = sid_arr
         self._uid[sl] = uids
         self._live[sl] = False
         self._alive[sl] = True
         self._owner[sl] = owner
         self._pin0[sl] = store.n + np.cumsum(counts) - counts
-        self._label[sl] = [""] * len(tms)
-        if owner < 0:  # (on the board: props now; inside a macro, see _expand)
-            self._props[sl] = _objects([tm.props() for tm in tms])
-        store.new_block(
-            np.repeat(np.arange(rows.start, rows.stop, dtype=np.int32), counts),
-            np.concatenate([tm.index for tm in tms]) if tms else np.empty(0, np.int32),
-            np.concatenate([tm.is_input for tm in tms]) if tms else np.empty(0, bool),
-            np.concatenate([tm.initial for tm in tms]) if tms else np.empty(0, CODE),
-            np.concatenate([tm.weak for tm in tms]) if tms else np.empty(0, bool),
-        )
+        self._label[sl] = [""] * len(sids)
+        if board:  # (on the board: props now; inside a macro, see _expand)
+            self._props[sl] = _objects(made)
+        if one:
+            col = lambda name: np.tile(getattr(used[0], name), len(sids))  # noqa: E731
+        elif sids:
+            ends = np.cumsum(counts)
+            at = np.repeat((np.cumsum(lanes) - lanes)[inv] - (ends - counts), counts) + np.arange(int(ends[-1]))
+            col = lambda name: np.concatenate([getattr(sh, name) for sh in used])[at]  # noqa: E731
+        if sids:
+            store.new_block(
+                np.repeat(np.arange(rows.start, rows.stop, dtype=np.int32), counts),
+                col("index"), col("is_input"), col("initial"), col("weak"),
+                lane=col("lane"), width=col("width"),
+            )
         return list(rows)
 
-    def _template(self, t: PartType) -> _Template:
-        tm = self._templates[t] = _Template(t, self._type_of(t))
-        return tm
+    def _shape_of(self, t: PartType, props: dict | None) -> int:
+        """The shape (pin layout) of an instance of t with these props (None: t's
+        defaults), as an id into _shapes: from layout_of(t, props). If that raises,
+        the kind is faulted and the instance gets the class attributes' pins, each one
+        lane wide."""
+        try:
+            lay = layout_of(t, fresh_props(t) if props is None else props)
+        except Exception as e:
+            if t.kind not in self.faults:
+                self.faults[t.kind] = msg = f"{t.kind}.layout: {e}"
+                self.errors.append(msg)
+            lay = Layout(t.ins, t.outs, (1,) * (len(t.ins) + len(t.outs)))
+        key = (t, lay)
+        sid = self._shape_ids.get(key)
+        if sid is None:
+            sid = self._shape_ids[key] = len(self._shapes)
+            self._shapes.append(_Shape(t, lay, self._type_of(t)))
+        return sid
 
-    def _make(self, t: PartType, uid: int, owner: int = -1) -> int:
+    def layout_for(self, t: PartType, props: dict) -> Layout:
+        """The pins an instance of t with these props gets (see layout_of: if that
+        fails, the kind is faulted and it gets one-lane class attribute pins)."""
+        return self._shapes[self._shape_of(t, props)].layout
+
+    def reshaped(self, part: Part, props: dict) -> bool:
+        """Would `part` have other pins with these props (a settings edit: see
+        PartType.layout)? Then the editor rebuilds it."""
+        return self._shape_of(part.type, props) != int(self._shape[part.slot])
+
+    def _shape_cols(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Per shape id: (pins, lanes, input lanes)."""
+        if len(self._sh_cols[0]) != len(self._shapes):
+            self._sh_cols = tuple(
+                np.array(col, np.intp)
+                for col in zip(
+                    *((sh.n_pins, sh.n_lanes, sh.in_lanes) for sh in self._shapes)
+                )
+            )
+        return self._sh_cols
+
+    def _lanes_of(self, slots: np.ndarray) -> np.ndarray:
+        """Every lane slot of these parts' pins, part by part (not their drives)."""
+        lanes = self._shape_cols()[1][self._shape[slots]]
+        first = self._pin0[slots].astype(np.intp)
+        return np.repeat(first - (np.cumsum(lanes) - lanes), lanes) + np.arange(int(lanes.sum()))
+
+    def _make(self, t: PartType, uid: int, owner: int = -1, props: dict | None = None) -> int:
         """One part of any type (a macro's body is built too); its slot. A macro type's
         first instance is built part by part and recorded (_Blueprint); the rest are
         stamped from that: the same rows, pins and wires, as arrays."""
@@ -785,35 +982,46 @@ class Circuit:
         if body is not None:
             bp = self._blueprints.get(t)
             if bp is not None and bp.current(self.registry):
-                return self._stamp(bp, t, uid, owner)
+                return self._stamp(bp, t, uid, owner, props)
             marks = (self._n_part_slots, self._pins.n, len(self._wire_slots.wires))
-        slot = self._make_one(t, uid, owner)
+        slot = self._make_one(t, uid, owner, props)
         if body is not None:
             self._blueprints[t] = _Blueprint(self, *marks)
         return slot
 
-    def _make_one(self, t: PartType, uid: int, owner: int) -> int:
+    def _make_one(self, t: PartType, uid: int, owner: int, props: dict | None = None) -> int:
         slot = self._new_rows(1)[0]
         store = self._pins
+        if props is None:
+            props = fresh_props(t)
+        sid = self._shape_of(t, props)
+        sh = self._shapes[sid]
+        widths = sh.widths
         self._type_id[slot] = self._type_of(t)
+        self._shape[slot] = sid
         self._uid[slot], self._live[slot], self._alive[slot] = uid, False, True
         self._owner[slot], self._label[slot] = owner, ""
-        self._props[slot] = fresh_props(t)
+        self._props[slot] = props
         power_on = X if t.has("eval") else ZERO  # (the IN switch starts off)
-        joined = {name for group in t.joins for name in group}
+        joined = {k for group in sh.joins for k, _, _ in group}
+        n_in = sh.n_in
         self._pin0[slot] = store.n
-        for i in range(len(t.ins)):
-            store.new(slot, i, True)
-        for i, name in enumerate(t.outs):
-            store.new(slot, i, False, power_on, name in t.weak and name not in joined)
+        for i in range(n_in):
+            store.new(slot, i, True, width=widths[i])
+        for i, name in enumerate(sh.layout.outs):
+            store.new(
+                slot, i, False, power_on, name in t.weak and n_in + i not in joined, widths[n_in + i]
+            )
         if joined:
-            self._join(slot, t, power_on)
+            self._join(slot, t, sh, power_on)
         if getattr(t, "body", None) is not None:
             self._expand(slot, t)
         self._kinds_dirty = self._batches_dirty = self._nets_dirty = True
         return slot
 
-    def _stamp(self, bp: _Blueprint, t: PartType, uid: int, owner: int) -> int:
+    def _stamp(
+        self, bp: _Blueprint, t: PartType, uid: int, owner: int, props: dict | None = None
+    ) -> int:
         """Another instance of a macro, from its blueprint: rows, pins and wires at the
         next slots, offset from the recorded ones."""
         store, ws = self._pins, self._wire_slots
@@ -828,15 +1036,17 @@ class Circuit:
         self._owner[sl] = bp.owner + r0
         self._owner[r0] = owner
         self._pin0[sl] = bp.pin0 + p0
+        self._shape[sl] = bp.shape
         self._label[sl] = bp.label
         self._props[sl] = None  # (Part.props copies the body's)
-        self._props[r0] = fresh_props(t)
+        self._props[r0] = fresh_props(t) if props is None else props
         store.new_block(
             bp.pin_part + r0, bp.pin_index, bp.pin_is_input, bp.pin_states, bp.pin_weak,
-            bp.pin_reader, bp.pin_passive,
+            bp.pin_reader, bp.pin_passive, bp.pin_lane, bp.pin_width,
         )
         ws.add_hidden_block(
-            bp.end_is_wire, np.where(bp.end_is_wire, bp.end_slot + w0, bp.end_slot + p0), bp.wire_uid
+            bp.end_is_wire, np.where(bp.end_is_wire, bp.end_slot + w0, bp.end_slot + p0), bp.wire_uid,
+            bp.wire_lane, bp.wire_width,
         )
         for rel, inner, wires in bp.inner:
             self._inner[r0 + rel] = inner + r0
@@ -855,64 +1065,99 @@ class Circuit:
         body's parts get handles when something asks (Part.inner, hooks)."""
         body = t.body
         kinds = list(body.parts.items())
-        slots = self._make_many([self.registry.get(d[0]) for _, d in kinds], [u for u, _ in kinds], inst)
+        slots = self._make_many(
+            [self.registry.get(d[0]) for _, d in kinds], [u for u, _ in kinds], inst,
+            [d[4] for _, d in kinds],
+        )
         inner = dict(zip((u for u, _ in kinds), slots))  # (while building it)
         for (_uid, (_kind, label, _x, _y, _props)), s in zip(kinds, slots):
             if label:
                 self._label[s] = label
         self._props[np.array(slots, np.intp)] = None  # (Part.props copies the body's)
-        store = self._pins
-        wires: dict[int, int] = {}
+        store, ws = self._pins, self._wire_slots
+        widths = getattr(body, "wire_widths", {})
+        # per body part: its first pin slot and shape, as plain Python for the loop below
+        # (two dicts, not one of pairs: a pair per part is that many more objects for
+        # the garbage collector to walk)
+        first_of = dict(zip(inner, self._pin0[slots].tolist()))
+        shapes = self._shapes
+        shape_of = dict(zip(inner, (shapes[s] for s in self._shape[slots].tolist())))
+        wires: dict[int, int] = {}  # uid -> head slot
         mine = []
         for uid in sorted(body.wires):  # parents first
+            width = widths.get(uid, 1)
             ends = []
             for ref in body.wires[uid][:2]:
                 if ref[0] == "w":
-                    ends.append((True, -1 if ref[1] == uid else wires[ref[1]]))
+                    if ref[1] == uid:
+                        ends.append((True, -1))
+                        continue
+                    slot = wires.get(ref[1], -1)  # (-1: left out, so is this one)
+                    w = widths.get(ref[1], 1) if slot >= 0 else -1
+                    ends.append((True, slot))
                 else:
                     _, puid, is_input, index = ref
-                    p = inner[puid]
-                    first = int(self._pin0[p])
-                    ends.append((False, first + (0 if is_input else len(self._types[self._type_id[p]].ins)) + index))
-            wires[uid] = self._wire_slots.add_hidden(uid, ends)
-            mine.append(wires[uid])
+                    sh = shape_of[puid]
+                    k = index if is_input else sh.n_in + index
+                    ends.append((False, first_of[puid] + sh.offs[k]))
+                    w = sh.widths[k]
+                if w != width:
+                    break  # (ends of another width: a stale body. Left out, like a dead end)
+            else:
+                slot = wires[uid] = ws.add_hidden(uid, ends, width)
+                mine.append(slot)
         self._inner[inst] = np.array(slots, np.int32)
         self._inner_wires[inst] = np.array(mine, np.int32)
-        p0, n_in = int(self._pin0[inst]), len(t.ins)
-        links = [(p0 + i, self._out_pin(inner[port], 0)) for i, port in enumerate(t.in_ids)]
-        links += [(self._in_pin(inner[port], 0), p0 + n_in + i) for i, port in enumerate(t.out_ids)]
+        links = []
+        first, mine_sh = int(self._pin0[inst]), self._shapes[self._shape[inst]]
+        n_in = mine_sh.n_in
+        for i, port in enumerate(t.in_ids):  # instance input i <-> its IN's output
+            p0, sh = first_of[port], shape_of[port]
+            links += _pairs(first + mine_sh.offs[i], mine_sh.widths[i], p0 + sh.offs[sh.n_in], sh.widths[sh.n_in])
+        for i, port in enumerate(t.out_ids):  # its OUT's input <-> instance output i
+            p0, sh = first_of[port], shape_of[port]
+            k = n_in + i
+            links += _pairs(p0 + sh.offs[0], sh.widths[0], first + mine_sh.offs[k], mine_sh.widths[k])
         links = self._links[inst] = np.array(links, np.int32).reshape(-1, 2)
         store.passive[links.ravel()] = True
         store.reader[links.ravel()] = True
         self._linked[inst] = None
 
     def _in_pin(self, part: int, i: int) -> int:
-        return int(self._pin0[part]) + i
+        """Input i's (head) pin slot."""
+        return int(self._pin0[part]) + self._shapes[self._shape[part]].offs[i]
 
     def _out_pin(self, part: int, i: int) -> int:
-        return int(self._pin0[part]) + len(self._types[self._type_id[part]].ins) + i
+        """Output i's (head) pin slot."""
+        sh = self._shapes[self._shape[part]]
+        return int(self._pin0[part]) + sh.offs[sh.n_in + i]
 
-    def _join(self, slot: int, t: PartType, power_on: Level) -> None:
-        """Make each of the type's join groups one net: link its pins, turn its outputs into
-        pass-through pins, and give each of those a hidden pin to drive the net from."""
+    def _join(self, slot: int, t: PartType, sh: _Shape, power_on: Level) -> None:
+        """Make each of the layout's join groups one net: link its lanes and turn its
+        outputs' into pass-through ones. A part with an eval gets a hidden pin for each
+        joined output, to drive the net with what eval says (its joins are of whole
+        pins: see layout_of); one without just joins (a splitter)."""
         store = self._pins
-        p0, n_in = int(self._pin0[slot]), len(t.ins)
-        drives = [p0 + n_in + i for i in range(len(t.outs))]
-        named = {name: p0 + i for i, name in enumerate(t.ins)} | {
-            name: p0 + n_in + i for i, name in enumerate(t.outs)
-        }
+        p0, n_in = int(self._pin0[slot]), sh.n_in
+        heads = [p0 + off for off in sh.offs]
+        evals = t.has("eval")
+        drives = heads[n_in:]
         links = []
-        for group in t.joins:
-            pins = [named[name] for name in group]
-            for i, name in enumerate(t.outs):
-                if name in group:
-                    out = p0 + n_in + i
-                    store.passive[out] = True
-                    store.reader[out] = True
-                    drives[i] = store.new(slot, i, False, power_on, name in t.weak)
-                    pins.append(drives[i])
-            links += [(pins[0], p) for p in pins[1:]]
-        self._drives[slot] = drives
+        for group in sh.joins:
+            lanes = [list(range(heads[k] + first, heads[k] + first + n)) for k, first, n in group]
+            for (k, _first, _n), mine in zip(group, lanes):
+                if k < n_in:
+                    continue
+                store.passive[mine] = True  # (an output: it only shows the net now)
+                store.reader[mine] = True
+                if evals:
+                    i = k - n_in
+                    name = sh.layout.outs[i]
+                    drives[i] = store.new(slot, i, False, power_on, name in t.weak, sh.widths[k])
+                    lanes.append(list(range(drives[i], drives[i] + sh.widths[k])))
+            links += [(a, b) for other in lanes[1:] for a, b in zip(lanes[0], other)]
+        if evals:
+            self._drives[slot] = drives
         self._links[slot] = np.array(links, np.int32).reshape(-1, 2)
         self._linked[slot] = None
 
@@ -946,7 +1191,8 @@ class Circuit:
     def hidden_wires(self) -> list[Wire]:
         ws = self._wire_slots
         n = len(ws.wires)
-        return [ws.handle(s) for s in np.flatnonzero(ws.alive[:n] & ~ws.board[:n]).tolist()]
+        heads = ws.alive[:n] & ~ws.board[:n] & (ws.lane[:n] == 0)
+        return [ws.handle(s) for s in np.flatnonzero(heads).tolist()]
 
     def open_part(self, part: Part) -> None:
         """Make a ghost live (placed for real): open hooks, and settling starts.
@@ -988,21 +1234,21 @@ class Circuit:
             return np.empty(0, np.intp)
         if self._drives and any(s in self._drives for s in slots.tolist()):
             return np.array([d for s in slots.tolist() for d in self._drive_slots(s)], np.intp)
-        types = self._types
-        tids = self._type_id[slots]
-        n_in = np.array([len(types[t].ins) for t in range(len(types))], np.intp)[tids]
-        n_out = np.array([len(types[t].outs) for t in range(len(types))], np.intp)[tids]
-        first = self._pin0[slots].astype(np.intp) + n_in
+        _, lanes, in_lanes = self._shape_cols()
+        sh = self._shape[slots]
+        n_out = lanes[sh] - in_lanes[sh]  # (outputs' lanes come after the inputs')
+        first = self._pin0[slots].astype(np.intp) + in_lanes[sh]
         return np.repeat(first - (np.cumsum(n_out) - n_out), n_out) + np.arange(int(n_out.sum()))
 
     def _drive_slots(self, slot: int) -> list[int]:
-        """Where a part's outputs' eval values go (see Part.drives), as pin slots."""
+        """Where a part's outputs' eval values go (see Part.drives), as pin slots: every
+        lane."""
         extra = self._drives.get(slot)
         if extra is not None:
-            return extra
-        t = self._types[self._type_id[slot]]
-        first = int(self._pin0[slot]) + len(t.ins)
-        return list(range(first, first + len(t.outs)))
+            return [s for head in extra for s in self._pins.lanes(head).tolist()]
+        sh = self._shapes[self._shape[slot]]
+        first = int(self._pin0[slot]) + sh.in_lanes
+        return list(range(first, int(self._pin0[slot]) + sh.n_lanes))
 
     def close_part(self, part: Part) -> None:
         self._close(self._tree(part.slot))
@@ -1026,6 +1272,16 @@ class Circuit:
         """The circuit is going away (app closing): close every live part."""
         for part in self.parts:
             self.close_part(part)
+
+    def click_cell(self, part: Part, lane: int) -> bool:
+        """The user clicked cell `lane` of a placed part (Look.cells). False if its
+        type doesn't take cell clicks."""
+        t = part.type
+        if not t.has("click_cell") or not part.live:
+            return False
+        if t.kind not in self.faults:
+            self._guard(t, "click_cell", lambda: t.click_cell(part, lane))
+        return True
 
     def click(self, part: Part) -> bool:
         """The user clicked a placed part. False if its type doesn't take clicks."""
@@ -1059,7 +1315,7 @@ class Circuit:
             del self.part_by_uid[part.uid]
         self.revision += 1
         at = np.array(tree, np.intp)
-        self._pins.kill(self._pins_of(at).tolist())
+        self._pins.kill(self._lanes_of(at).tolist())
         self._wire_slots.kill([w for s in tree for w in np.asarray(self._inner_wires.get(s, ())).tolist()])
         self._settle[at] = 0
         self._alive[at] = False
@@ -1140,10 +1396,10 @@ class Circuit:
             self._guard(t, "action", lambda: t.action(Ctx(live, self.tick), name))
 
     def can_connect(self, a: Endpoint, b: Endpoint) -> bool:
-        """`a` or `b` may be FREE (a free end: see Wire)."""
+        """`a` or `b` may be FREE (a free end: see Wire). Ends must be equally wide."""
         if a is FREE or b is FREE:
             return True
-        if a is b:
+        if a is b or a.width != b.width:
             return False
         if isinstance(a, Pin) and isinstance(b, Pin):
             return a.is_input != b.is_input and a.part is not b.part
@@ -1162,7 +1418,12 @@ class Circuit:
         return True  # wire + wire: joins two nets
 
     def connect(
-        self, a: Endpoint, b: Endpoint, uid: int | None = None, check: bool = True
+        self,
+        a: Endpoint,
+        b: Endpoint,
+        uid: int | None = None,
+        check: bool = True,
+        width: int | None = None,
     ) -> tuple[Wire | None, list[Wire]]:
         """Connect two endpoints in either order. Returns (new_wire, replaced_wires).
         Either may be FREE: that end of the new wire is attached to nothing.
@@ -1174,9 +1435,23 @@ class Circuit:
         `check=False` skips can_connect: for rebuilding wiring that existed before
         (undo, paste). Some of it can't be drawn by hand -- cut-deletion can splice a
         wire that runs from a part back into itself -- but it must come back as it was.
+
+        The wire is as wide as its ends (`width` if both are FREE; default 1). Ends of
+        different widths (or not `width`, if given) never connect, checked or not.
         """
         if check and not self.can_connect(a, b):
             return None, []
+        wa = width if a is FREE else a.width
+        wb = wa if b is FREE else b.width
+        if wa is None:
+            wa = wb
+        if wa != wb or (width is not None and wa != width):
+            return None, []
+        width = wa
+        if width is None:
+            width = 1
+        elif width != 1 and not 1 <= width <= MAX_WIDTH:
+            raise ValueError(f"a wire can't be {width} lanes wide")
         # outputs are src, inputs are dst (see Wire)
         if (isinstance(b, Pin) and not b.is_input) or (
             isinstance(a, Pin) and a.is_input
@@ -1190,7 +1465,7 @@ class Circuit:
         if uid is None:
             uid = self._next_wire_uid
         self._next_wire_uid = max(self._next_wire_uid, uid + 1)
-        wire = Wire(a, b, uid)
+        wire = Wire(a, b, uid, width=width)
         wire.src, wire.dst = (wire if e is FREE else e for e in (a, b))
         self._wire_slots.add(wire, board=True)
         self._wires[wire] = None
@@ -1318,8 +1593,8 @@ class Circuit:
         n = len(ws.wires)
         found = np.zeros(n, bool)
         found[slots] = True
-        # the wires with an end on another wire, and those ends
-        kids = np.flatnonzero(ws.alive[:n] & ws.end_is_wire[:n].any(axis=1))
+        # the wires with an end on another wire, and those ends (heads: lane 0 on lane 0)
+        kids = np.flatnonzero(ws.alive[:n] & (ws.lane[:n] == 0) & ws.end_is_wire[:n].any(axis=1))
         is_wire = ws.end_is_wire[kids]
         on = np.where(is_wire, ws.end_slot[kids], 0)
         new = found
@@ -1431,6 +1706,16 @@ class Circuit:
         self._changed_all = True  # net numbers mean something else now; pins were reset
         self._carry()  # readers see their (new) nets now, not a tick later with stale values
 
+    def wire_lanes(self, wire: Wire) -> Logic:
+        """Every lane of a wire's value (lane 0 first), as of the last step: a bus's
+        nets, as a Logic array (a lane with no net reads Z)."""
+        lanes, _ = self.lanes_of_wires(np.array([wire.slot], np.intp))
+        nets = self.wire_nets(lanes)
+        codes = np.full(len(lanes), Z, CODE)
+        if len(self.net_value):
+            codes[nets >= 0] = self.net_value[nets[nets >= 0]]
+        return Logic.of_codes(codes)
+
     def wire_state(self, wire: Wire) -> tuple[Level, bool]:
         """(value, conflict) of the net this wire belongs to, as of the last step."""
         if self._nets_dirty:
@@ -1450,12 +1735,24 @@ class Circuit:
 
     def _pins_of(self, slots: np.ndarray, counts_too: bool = False):
         """pin_slots_of, by part slot (just the pins, unless `counts_too`)."""
-        if len(self._type_pins) != len(self._types):
-            self._type_pins = np.array([len(t.ins) + len(t.outs) for t in self._types], np.intp)
-        counts = self._type_pins[self._type_id[slots]]
-        first = self._pin0[slots].astype(np.intp)
-        flat = np.repeat(first - (np.cumsum(counts) - counts), counts) + np.arange(int(counts.sum()))
+        pins, lanes, _ = self._shape_cols()
+        sh = self._shape[slots]
+        counts = pins[sh]
+        flat = self._lanes_of(slots)
+        if int(lanes[sh].sum()) != len(flat) or len(flat) != int(counts.sum()):
+            flat = flat[self._pins.lane[flat] == 0]  # (buses: just their heads)
         return (flat, counts) if counts_too else flat
+
+    def lanes_of_pins(self, heads: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The lane slots of these pins (by head slot), pin after pin, and how many
+        each has: for showing a bus as a whole."""
+        w = self._pins.width[heads].astype(np.intp)
+        return np.repeat(heads - (np.cumsum(w) - w), w) + np.arange(int(w.sum())), w
+
+    def lanes_of_wires(self, heads: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """lanes_of_pins, for wires (wire slots): their lane slots, and how many each has."""
+        w = self._wire_slots.width[heads].astype(np.intp)
+        return np.repeat(heads - (np.cumsum(w) - w), w) + np.arange(int(w.sum())), w
 
     def pin_codes(self, slots: np.ndarray) -> np.ndarray:
         """The logic codes of these pin slots: Pin.state for many pins at once."""
@@ -1517,6 +1814,7 @@ class Circuit:
                 on = np.flatnonzero(
                     ws.alive[:n]
                     & ws.board[:n]
+                    & (ws.lane[:n] == 0)
                     & changed[np.maximum(net, 0)]
                     & (net >= 0)
                 )
@@ -1591,11 +1889,19 @@ class Circuit:
         if t.kind in self.faults:
             out[ok] = X
             return out
-        first = self._pin0[live].astype(np.intp)
-        ins = [Logic.of_codes(self._pins.states[first + i]) for i in range(len(t.ins))]
-        ctx = Ctx(_Handles(self, live), self.tick)
-        raw = self._guard(t, "face", lambda: _values(t.face(ctx, *ins), k, len(live), "face"))
-        out[ok] = X if raw is _FAILED else np.column_stack(raw)
+        rows = np.flatnonzero(ok)
+        sids = self._shape[live]
+        for sid in _in_order(sids):
+            m = sids == sid
+            sub, sh = live[m], self._shapes[sid]
+            first = self._pin0[sub].astype(np.intp)
+            ins = [
+                Logic.of_codes(self._pins.states[_lanes(first + sh.off[i], sh.widths[i])])
+                for i in range(sh.n_in)
+            ]
+            ctx = Ctx(_Handles(self, sub), self.tick)
+            raw = self._guard(t, "face", lambda: _values(t.face(ctx, *ins), k, len(sub), "face"))
+            out[rows[m]] = X if raw is _FAILED else np.column_stack(raw)
         return out
 
     # ---- part types --------------------------------------------------------
@@ -1612,22 +1918,29 @@ class Circuit:
                     slots = slots[self._live[slots]]
                 if not slots.size:
                     continue
-                first = self._pin0[slots].astype(np.intp)
-                n_in = len(t.ins)
-                if t.joins:  # (joined outputs drive from their own pins: Part.drives)
-                    drives = [self._drives[s] for s in slots.tolist()]
-                    outs = [np.array([d[i] for d in drives], np.intp) for i in range(len(t.outs))]
-                else:
-                    outs = [first + n_in + i for i in range(len(t.outs))]
-                self._batches.append(
-                    _Batch(
-                        t,
-                        _Handles(self, slots),
-                        [first + i for i in range(n_in)],
-                        outs,
-                        slots,
+                sids = self._shape[slots]
+                shapes = _in_order(sids)
+                for sid in shapes:  # (one batch per shape: its pins, a pin's lanes one array)
+                    sub = slots if len(shapes) == 1 else slots[sids == sid]
+                    sh = self._shapes[sid]
+                    w, n_in, n_out = sh.widths, sh.n_in, sh.n_pins - sh.n_in
+                    first = self._pin0[sub].astype(np.intp)
+                    if sh.joins:  # (joined outputs drive from their own pins: Part.drives)
+                        drives = [self._drives[s] for s in sub.tolist()]
+                        heads = [np.array([d[i] for d in drives], np.intp) for i in range(n_out)]
+                    else:
+                        heads = [first + sh.off[n_in + i] for i in range(n_out)]
+                    self._batches.append(
+                        _Batch(
+                            t,
+                            _Handles(self, sub),
+                            [_lanes(first + sh.off[i], w[i]) for i in range(n_in)],
+                            [_lanes(h, w[n_in + i]) for i, h in enumerate(heads)],
+                            sub,
+                            w[n_in:],
+                            not sh.tabulable,
+                        )
                     )
-                )
             n = self._n_part_slots
             self._batch_of = np.full(n, -1, np.intp)
             self._batch_pos = np.zeros(n, np.intp)
@@ -1686,9 +1999,43 @@ class Circuit:
 class _Batch:
     type: PartType
     parts: Sequence[Part]  # (handles, made when asked for: _Handles)
-    ins: list[np.ndarray]  # per input pin: the instances' pin slots
-    outs: list[np.ndarray]  # per output pin: where its values go (Part.drives)
+    ins: list[np.ndarray]  # per input pin: the instances' pin slots ((n, lanes) if wide)
+    outs: list[np.ndarray]  # per output pin: where its values go (Part.drives); as ins
     slots: np.ndarray  # the instances' part slots
+    out_widths: tuple[int, ...] = ()  # per output pin: its lanes (() : the type's, 1 each)
+    no_table: bool = False  # a bus, or pins other than the type's: no lookup table
+
+
+def _lanes(heads: np.ndarray, width: int) -> np.ndarray:
+    """Pin slots of these pins' lanes: the heads as they are for one lane, else (n, width)."""
+    return heads if width == 1 else heads[:, None] + np.arange(width)
+
+
+def _pairs(a: int, wa: int, b: int, wb: int) -> list[tuple[int, int]]:
+    """_lane_pairs, the widths given."""
+    if wa != wb:
+        return []
+    return [(a, b)] if wa == 1 else [(a + i, b + i) for i in range(wa)]
+
+
+def _lane_pairs(store: _PinStates, a: int, b: int) -> list[tuple[int, int]]:
+    """Link pins a and b (heads) lane by lane. Pins of different widths join nothing."""
+    w = store.width[a]
+    if store.width[b] != w:
+        return []
+    return [(a, b)] if w == 1 else [(a + i, b + i) for i in range(int(w))]
+
+
+def _one_by_one(t: PartType) -> bool:
+    """Made one at a time (_make), not a run at once: a macro, or a part with joins
+    (or its own layout(), which may have some)."""
+    return bool(t.joins) or getattr(t, "body", None) is not None or layout_props(t) is None
+
+
+def _in_order(ids: np.ndarray) -> list[int]:
+    """The distinct values, in order of first appearance."""
+    uniq, first = np.unique(ids, return_index=True)
+    return uniq[np.argsort(first)].tolist()
 
 
 def _by_uid(wires) -> list[Wire]:
@@ -1729,6 +2076,7 @@ class _Blueprint:
         self.uid = c._uid[rows].copy()
         self.owner = c._owner[rows] - r0
         self.pin0 = c._pin0[rows] - p0
+        self.shape = c._shape[rows].copy()
         self.label = c._label[rows].copy()
         st = c._pins
         self.pin_part = st.part[pins] - r0
@@ -1738,10 +2086,14 @@ class _Blueprint:
         self.pin_weak = st.weak[pins].copy()
         self.pin_reader = st.reader[pins].copy()
         self.pin_passive = st.passive[pins].copy()
+        self.pin_lane = st.lane[pins].copy()
+        self.pin_width = st.width[pins].copy()
         ws = c._wire_slots
         self.end_is_wire = ws.end_is_wire[wires].copy()
         self.end_slot = np.where(self.end_is_wire, ws.end_slot[wires] - w0, ws.end_slot[wires] - p0)
         self.wire_uid = ws.uid[wires].copy()
+        self.wire_lane = ws.lane[wires].copy()
+        self.wire_width = ws.width[wires].copy()
         # (few: the macro instances inside, joined parts)
         self.inner = [
             (s - r0, c._inner[s] - r0, c._inner_wires[s] - w0) for s in range(r0, r1) if s in c._inner
@@ -1761,21 +2113,36 @@ class _Blueprint:
             return False
 
 
-class _Template:
-    """What every new part of a plain type (no joins, no body) starts as: its type's
-    id, its pins' indices and sides, their power-on codes and weak flags, its props."""
+class _Shape:
+    """A pin layout: a type and its Layout (pin names, widths, joins). Lane slots go
+    input by input, then output by output, each pin's lanes in a row. Also what every
+    new plain part (no joins, no body) of the shape starts as, lane by lane: its pins'
+    indices, sides, power-on codes and weak flags; and its props."""
 
-    def __init__(self, t: PartType, type_id: int) -> None:
-        n_in, n_out = len(t.ins), len(t.outs)
-        self.type_id = type_id
-        self.sides = [(True, i) for i in range(n_in)] + [
-            (False, i) for i in range(n_out)
-        ]
-        self.index = np.array([i for _, i in self.sides], np.int32)
-        self.is_input = np.array([side for side, _ in self.sides], bool)
+    def __init__(self, t: PartType, lay: Layout, type_id: int) -> None:
+        n_in, n_out = len(lay.ins), len(lay.outs)
+        self.type, self.type_id, self.layout = t, type_id, lay
+        self.n_pins = n_in + n_out
+        self.widths = lay.widths
+        self.joins = lay.joins
+        self.wide = lay.wide
+        # an eval can be tabulated (sim/lut.py) only as the type's own, one-lane pins
+        self.tabulable = not lay.wide and (lay.ins, lay.outs) == (t.ins, t.outs)
+        w = np.array(self.widths, np.intp).reshape(-1)
+        self.off = np.cumsum(w) - w  # per pin (ins, then outs): its head, from the first
+        self.offs = tuple(self.off.tolist())  # (the same, for one at a time)
+        self.n_in = n_in
+        self.n_lanes = int(w.sum())
+        self.in_lanes = int(w[:n_in].sum())
+        pin = np.repeat(np.arange(self.n_pins), w)  # per lane: its pin
+        self.lane = (np.arange(self.n_lanes) - self.off[pin]).astype(np.int16)
+        self.width = w[pin].astype(np.int16)
+        self.is_input = pin < n_in
+        self.index = np.where(self.is_input, pin, pin - n_in).astype(np.int32)
         power_on = X if t.has("eval") else ZERO  # (the IN switch starts off)
-        self.initial = np.array([int(Z)] * n_in + [int(power_on)] * n_out, CODE)
-        self.weak = np.array([False] * n_in + [name in t.weak for name in t.outs], bool)
+        self.initial = np.where(self.is_input, CODE(Z), CODE(power_on)).astype(CODE)
+        weak = np.array([False] * n_in + [name in t.weak for name in lay.outs], bool)
+        self.weak = weak[pin]
         self.props = _props_maker(t)
 
 
@@ -1808,7 +2175,9 @@ def _priority(part: Part) -> int:
         return 0
 
 
-def _evaluate(t: PartType, ctx: Ctx, ins: list[np.ndarray]) -> list[np.ndarray]:
+def _evaluate(
+    t: PartType, ctx: Ctx, ins: list[np.ndarray], out_widths: tuple[int, ...] = ()
+) -> list[np.ndarray]:
     """Run t.eval on the input codes; the output codes, one array of ctx.n per pin.
 
     API 2 scripts get Logic arrays. API 1 scripts were written for plain bools, so
@@ -1816,7 +2185,9 @@ def _evaluate(t: PartType, ctx: Ctx, ins: list[np.ndarray]) -> list[np.ndarray]:
     of its inputs isn't a known 0 or 1: it can't know what its function does with X.
     """
     if t.api >= 2:
-        return _outputs(t, t.eval(ctx, *(Logic.of_codes(c) for c in ins)), ctx.n)
+        raw = t.eval(ctx, *(Logic.of_codes(c) for c in ins))
+        k = len(out_widths) if out_widths else len(t.outs)
+        return _values(raw, k, ctx.n, "eval", out_widths)
     outs = _outputs(t, t.eval(ctx, *(c == ONE for c in ins)), ctx.n)
     if t.pure and ins:
         unknown = np.logical_or.reduce([(c != ZERO) & (c != ONE) for c in ins])
@@ -1830,8 +2201,11 @@ def _outputs(t: PartType, raw: Any, n: int) -> list[np.ndarray]:
     return _values(raw, len(t.outs), n, "eval")
 
 
-def _values(raw: Any, k: int, n: int, hook: str) -> list[np.ndarray]:
-    """k values (one per output pin, or face mark) of n instances each, as codes."""
+def _values(
+    raw: Any, k: int, n: int, hook: str, widths: tuple[int, ...] = ()
+) -> list[np.ndarray]:
+    """k values (one per output pin, or face mark) of n instances each, as codes: (n,)
+    each, or (n, w) for an output w lanes wide (widths: per value; () : all 1)."""
     if k == 0:
         return []
     if k == 1 and not (isinstance(raw, tuple) and len(raw) == 1):
@@ -1840,4 +2214,22 @@ def _values(raw: Any, k: int, n: int, hook: str) -> list[np.ndarray]:
         )  # one value: anything but a 1-tuple is it (a scalar, list or array)
     if not isinstance(raw, tuple) or len(raw) != k:
         raise ValueError(f"{hook} returned {raw!r}; expected {k} value(s)")
-    return [np.broadcast_to(codes(v), (n,)) for v in raw]
+    if not widths or all(w == 1 for w in widths):
+        return [np.broadcast_to(codes(v), (n,)) for v in raw]
+    return [
+        np.broadcast_to(codes(v), (n,)) if w == 1 else _wide(v, n, w, hook)
+        for v, w in zip(raw, widths)
+    ]
+
+
+def _wide(v: Any, n: int, w: int, hook: str) -> np.ndarray:
+    """A wide output's value as (n, w) codes. Numbers aren't taken: 5 could be one lane
+    or bits (Logic.of_ints says which)."""
+    if not isinstance(v, (Logic, Level)) and np.asarray(v).dtype.kind not in "b":
+        if not (isinstance(v, (list, tuple)) and all(isinstance(x, (Logic, Level)) for x in v)):
+            raise ValueError(
+                f"{hook}: a {w}-lane output takes Logic (or Levels, or bools), not "
+                f"{type(v).__name__}: use Logic.of_ints for numbers"
+            )
+    c = codes(v)
+    return np.broadcast_to(c, (n, w))

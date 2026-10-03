@@ -18,5 +18,5 @@ def register(reg):
             eval=lambda *ins: reduce(and_, ins),
         )
     )  # 16 inputs: nothing gets enumerated
-    reg.add(part("SPLIT", ins=("a",), outs=("same", "flipped"), eval=lambda a: (a, ~a)))
+    reg.add(part("FORK", ins=("a",), outs=("same", "flipped"), eval=lambda a: (a, ~a)))
     reg.add(part("BOOM", ins=("a",), outs=("out",), eval=lambda a: 1 / 0))

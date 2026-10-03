@@ -28,8 +28,11 @@ nicely in git:
     Loading warns about the ones that aren't loaded now.
   - "kind" names a part type (pijl.parts); a placed macro has "macro": its name
     instead, so the two can never collide.
-  - "label", "props", "bends" and a wire's "color" (a name, see ui/theme.py
-    WIRE_COLORS) are left out when empty / default.
+  - A part's "props" leave out settings at their default value (when the types
+    are known: they always are, saved from the editor).
+  - "label", "props", "bends", a wire's "color" (a name, see ui/theme.py
+    WIRE_COLORS) and its "width" (lanes: a bus) are left out when empty / default.
+    A wire is as wide as the pins it's on; one whose ends aren't is dropped.
   - A wire end is a pin ({"part", "in"/"out": index}), a macro's pin
     ({"part", "pin": uid of the IN/OUT inside the macro that it comes from}, so
     it survives the macro's ports being moved around), or a point along another
@@ -56,7 +59,8 @@ from typing import Any
 
 from . import mods
 from .mods import active as active_mods
-from .parts import Registry, check_props
+from .parts import MAX_WIDTH, Registry, check_props
+from .parts.registry import layout_cached, static
 from .project import write_atomic
 from .snapshot import MACRO, EndRef, Point, Snapshot
 
@@ -129,6 +133,7 @@ def encode(
         if label:
             d["label"] = label
         d["pos"] = [_num(x), _num(y)]
+        props = _without_defaults(props, kind, types)
         if props:
             d["props"] = props
         parts.append(d)
@@ -144,6 +149,8 @@ def encode(
             d["bends"] = [_point(p) for p in bends]
         if uid in snap.wire_colors:
             d["color"] = snap.wire_colors[uid]
+        if snap.wire_widths.get(uid, 1) != 1:
+            d["width"] = snap.wire_widths[uid]
         wires.append(d)
     head: dict[str, Any] = {"pijl": FORMAT}
     if title is not None:
@@ -174,6 +181,11 @@ def decode(data: Any, types: Registry) -> Loaded:
         warn("unreadable list of mods, ignored")
 
     kinds: dict[int, Any] = {}  # part uid -> its PartType, for checking pin indices
+    # part uid -> its Layout (None: it has none), for parts not laid out as their type
+    # says (a bus, a SPLIT's pins: see PartType.layout)
+    layouts: dict[int, Any] = {}
+    maybe_wide = False  # a part or wire that's a bus (else every wire is 1 lane)
+    shapes: dict = {}  # (for layout_cached)
     for d in _list(data, "parts"):
         try:
             uid = _int(d["uid"])
@@ -202,6 +214,10 @@ def decode(data: Any, types: Registry) -> Loaded:
                 warn(f"part {uid} ({kind}): {why}")
             out.snapshot.parts[uid] = (kind, label, x, y, props)
             kinds[uid] = t
+            if not static(t):
+                lay = layouts[uid] = layout_cached(t, props, shapes)
+                if lay is None or lay.wide:
+                    maybe_wide = True
         except (KeyError, TypeError, ValueError) as e:
             warn(f"a part was unreadable ({_why(e)}), dropped")
 
@@ -215,7 +231,7 @@ def decode(data: Any, types: Registry) -> Loaded:
             uid = _int(d["uid"])
             if uid in out.snapshot.wires:
                 raise ValueError(f"duplicate uid {uid}")
-            ends = [_decode_end(d[k], uid, kinds, out.snapshot) for k in ("from", "to")]
+            ends = [_decode_end(d[k], uid, kinds, layouts, out.snapshot) for k in ("from", "to")]
             if any(ref is None for ref, _ in ends):
                 lost += 1
                 continue
@@ -235,7 +251,18 @@ def decode(data: Any, types: Registry) -> Loaded:
             color = d.get("color")
             if color is not None and not isinstance(color, str):
                 raise ValueError("bad color")
+            width = d.get("width", 1)
+            if width != 1:
+                if not 1 <= _int(width) <= MAX_WIDTH:
+                    raise ValueError(f"can't be {width} lanes wide")
+                maybe_wide = True
+            if maybe_wide:  # (else every end is one lane, like the wire)
+                for ref, _ in ends:
+                    if ref != ("w", uid) and _end_width(ref, layouts, out.snapshot) not in (width, None):
+                        raise ValueError(f"{width} lanes wide, but on an end that isn't")
             out.snapshot.wires[uid] = (src, dst, bends, src_pt, dst_pt)
+            if width != 1:
+                out.snapshot.wire_widths[uid] = width
             if color:
                 out.snapshot.wire_colors[uid] = (
                     color  # names the UI doesn't know draw as default
@@ -506,7 +533,7 @@ def _encode_end(
 
 
 def _decode_end(
-    d: Any, wire_uid: int, kinds: dict[int, Any], snap: Snapshot
+    d: Any, wire_uid: int, kinds: dict[int, Any], layouts: dict[int, Any], snap: Snapshot
 ) -> tuple[EndRef | None, Point | None]:
     """(ref, junction point); ref is None when the thing it points at is gone."""
     if not isinstance(d, dict):
@@ -534,9 +561,39 @@ def _decode_end(
         return None, None  # the macro doesn't have that pin (any more)
     is_input = "in" in d
     index = _int(d["in"] if is_input else d["out"])
-    if not 0 <= index < len(t.ins if is_input else t.outs):
-        return None, None  # the part type has fewer pins now
+    lay = layouts.get(part, t)  # (a Layout, or the type: both have ins and outs)
+    if lay is None or not 0 <= index < len(lay.ins if is_input else lay.outs):
+        return None, None  # the part type (or this one, as set) has fewer pins now
     return ("p", part, is_input, index), None
+
+
+def _without_defaults(props: dict, kind: str, types: Registry | None) -> dict:
+    """props minus the settings at their default value (loading puts those back: see
+    check_props), so a part saves only what was changed. Needs `types`; without, all."""
+    if not props or types is None:
+        return props
+    try:
+        settings = types.get(kind).settings
+    except KeyError:
+        return props
+    return {
+        k: v
+        for k, v in props.items()
+        if not (k in settings and type(v) is type(settings[k].initial) and v == settings[k].initial)
+    }
+
+
+def _end_width(ref: EndRef, layouts: dict[int, Any], snap: Snapshot) -> int | None:
+    """How wide the pin or wire this end is on is (None: can't tell)."""
+    if ref[0] == "w":
+        return snap.wire_widths.get(ref[1], 1)
+    _, part, is_input, index = ref
+    if part not in layouts:
+        return 1  # (laid out as its type says: one lane each)
+    lay = layouts[part]
+    if lay is None:
+        return None
+    return lay.widths[index if is_input else lay.n_in + index]
 
 
 def _list(data: dict, key: str) -> list:

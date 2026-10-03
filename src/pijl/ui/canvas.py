@@ -95,6 +95,9 @@ class InstanceBuffer:
         # show_pins / show_wires: most buffers (text, tags, overlays) never need them.
         self.pin_src: np.ndarray | None = None
         self.wire_src: np.ndarray | None = None
+        # (a pin slot, as pin_src, but always just that one lane: a bus's pin_src shows
+        # every lane of the bus it's the head of; bit cells show one each)
+        self.lane_src: np.ndarray | None = None
         self.f = {name: self.data[name] for name in kind.dtype.names}
         self.any_dirty = False
         self.realloc = True  # upload everything (new, or grown)
@@ -185,7 +188,7 @@ class InstanceBuffer:
             self.state[slot] = 0
             self.state_dirty = True
         self.used[slot] = False
-        for src in (self.pin_src, self.wire_src):
+        for src in (self.pin_src, self.wire_src, self.lane_src):
             if src is not None and src[slot] >= 0:
                 src[slot] = -1
                 self.gen += 1
@@ -202,7 +205,7 @@ class InstanceBuffer:
         self.state[slots] = 0
         self.state_dirty = True
         self.used[slots] = False
-        for src in (self.pin_src, self.wire_src):
+        for src in (self.pin_src, self.wire_src, self.lane_src):
             if src is not None:
                 src[slots] = -1
         self.gen += 1
@@ -221,6 +224,7 @@ class InstanceBuffer:
             ("dirty", 0),
             ("pin_src", -1),
             ("wire_src", -1),
+            ("lane_src", -1),
         ):
             old = getattr(self, name)
             if old is None:
@@ -236,6 +240,13 @@ class InstanceBuffer:
         if self.pin_src is None:
             self.pin_src = np.full(len(self.data), -1, np.int32)
         self.pin_src[slots] = pins
+        self.gen += 1
+
+    def show_lanes(self, slots, lanes) -> None:
+        """These slots show these single lanes (pin slots in the circuit; see lane_src)."""
+        if self.lane_src is None:
+            self.lane_src = np.full(len(self.data), -1, np.int32)
+        self.lane_src[slots] = lanes
         self.gen += 1
 
     def show_wires(self, slots, wires) -> None:

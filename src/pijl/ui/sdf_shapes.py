@@ -16,7 +16,7 @@ Colors: each shape has an off and an on color and a `state` byte choosing
 between them (so a pin lighting up is a one-byte write), and an `opacity`
 (multiplied in; ghosts). `color = c` sets both to c. The state byte can also ask
 for a pattern instead of either color: X, Z or a conflict (see SHOW_* and
-_PATTERN).
+_PATTERN) -- or for a blend of the two: a bus with some lanes 1 (see partial()).
 """
 
 from __future__ import annotations
@@ -51,6 +51,25 @@ SHOW_OFF, SHOW_ON, SHOW_X, SHOW_Z, SHOW_FIGHT = 0, 255, 1, 2, 3
 SHOW_BY_CODE = np.array(
     [SHOW_Z, SHOW_OFF, SHOW_ON, SHOW_X], np.uint8
 )  # by logic code (pijl.logic)
+# SHOW_PART .. SHOW_ON - 1: lit that far between off (SHOW_PART) and on (SHOW_ON)
+SHOW_PART = 4
+
+
+def partial(ones: np.ndarray, lanes: np.ndarray) -> np.ndarray:
+    """State bytes for buses with `ones` of `lanes` lanes at 1 (the rest 0): off, on, or
+    a blend in between -- never quite off or on unless it is."""
+    span = SHOW_ON - 1 - (SHOW_PART + 1)
+    mid = SHOW_PART + 1 + (ones * span) // np.maximum(lanes, 1)
+    return np.where(ones == 0, SHOW_OFF, np.where(ones == lanes, SHOW_ON, mid)).astype(np.uint8)
+
+# (GLSL) how far lit a state byte is, 0 to 1: off and the patterns 0, on 1, a bus between
+_LIT = f"""
+float lit(int s) {{
+    if (s == {SHOW_ON}) return 1.0;
+    if (s < {SHOW_PART}) return 0.0;
+    return float(s - {SHOW_PART}) / {float(SHOW_ON - SHOW_PART)};
+}}
+"""
 
 
 def show(value, fight: bool = False) -> int:
@@ -131,15 +150,16 @@ flat out vec4 cf;
 flat out vec4 ce;
 flat out int show;
 {UNIFORMS}
+{_LIT}
 void main() {{
     {_CORNER}
     local = corner * rect.zw;
     size = rect.zw;
     bw = border;
     show = int(state * 255.0 + 0.5);
-    bool on = show == {SHOW_ON};
-    cf = on ? fill_on : fill;
-    ce = on ? edge_on : edge;
+    float on = lit(show);
+    cf = mix(fill, fill_on, on);
+    ce = mix(edge, edge_on, on);
     cf.a *= flags.y;
     ce.a *= flags.y;
     world = rect.xy + lift * lift_offset + local;
@@ -208,11 +228,12 @@ out vec2 world;
 flat out vec4 c;
 flat out int show;
 {UNIFORMS}
+{_LIT}
 void main() {{
     {_CORNER}
     local = (corner * 2.0 - 1.0) * {PAD};
     show = int(state * 255.0 + 0.5);
-    c = show == {SHOW_ON} ? color_on : color;
+    c = mix(color, color_on, lit(show));
     c.a *= flags.y;
     world = center + lift * lift_offset + local * radius;
     gl_Position = window.projection * window.view * vec4(world, 0.0, 1.0);
@@ -268,6 +289,7 @@ flat out vec4 c0;
 flat out vec4 c1;
 flat out int show;
 {UNIFORMS}
+{_LIT}
 void main() {{
     {_CORNER}
     vec2 d = b - a;
@@ -281,9 +303,9 @@ void main() {{
     uv = vec2(u, v);
     ext = vec2(len, radius);
     show = int(state * 255.0 + 0.5);
-    bool on = show == {SHOW_ON};
-    c0 = on ? ca_on : ca;
-    c1 = on ? cb_on : cb;
+    float on = lit(show);
+    c0 = mix(ca, ca_on, on);
+    c1 = mix(cb, cb_on, on);
     c0.a *= flags.y;
     c1.a *= flags.y;
     world = a + lift * lift_offset + dir * u + n * v;

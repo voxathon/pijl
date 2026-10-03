@@ -158,9 +158,10 @@ class _Server:
 
     def hello(self) -> None:
         h = self.h
-        names = [h.macro.title, str(h.circuit.config), *h.inputs, *h.outputs]
+        # (a bus is its lanes, each a pin here: "d[0]", "d[1]", ...)
+        names = [h.macro.title, str(h.circuit.config), *h.in_lanes, *h.out_lanes]
         body = b"".join(n.encode() + b"\0" for n in names)
-        self.send(HELLO, 0, 0, HELLO_HEAD.pack(MAGIC, VERSION, 0, len(h.inputs), len(h.outputs)), body)
+        self.send(HELLO, 0, 0, HELLO_HEAD.pack(MAGIC, VERSION, 0, len(h.in_lanes), len(h.out_lanes)), body)
 
     def error(self, msg: str) -> None:
         self.send(ERROR, 0, 0, ERROR_HEAD.pack(self.frame), msg.encode())
@@ -205,7 +206,7 @@ class _Server:
         if side not in (IN, OUT):
             raise _Bad(f"PORT: side {side} (0 is inputs, 1 outputs)")
         idx = np.frombuffer(body, "<u4", count, PORT_HEAD.size).astype(np.intp)
-        n = len(self.h.inputs if side == IN else self.h.outputs)
+        n = len(self.h.in_lanes if side == IN else self.h.out_lanes)
         if (idx >= n).any():
             raise _Bad(f"PORT: pin {int(idx.max())}, but there are {n} {('inputs', 'outputs')[side]} (from 0)")
         self.ports[port] = (side, idx)

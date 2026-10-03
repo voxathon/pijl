@@ -209,3 +209,24 @@ def _(m):
 
     m.Registry.load_folder = load_folder
 ```
+
+## Pin layouts (buses, SPLIT)
+
+A part type's pins are plain data. `PartType.widths` is a dict (`{"d": 8}`, or
+`{"d": "width"}` to read an instance's prop), and each registered type gets its
+own copy, so editing one type's dict in place doesn't touch any other type. The
+engine reads an instance's pins only through `PartType.layout(props)`. That
+returns a dict with `"ins"`, `"outs"`, `"widths"` and `"joins"`; any key left out
+means the class attribute. Override it to give a part pins that depend on its
+settings, as SPLIT does (`parts/templates/wiring/split.py`). Joins may name lane
+ranges: `"bus[0:4]"`. Three things to know:
+
+- Pins are read when an instance is made. Patching a type afterwards doesn't
+  reshape instances that already exist. A settings edit in the editor that gives
+  a part other pins rebuilds it.
+- The registry checks the layout an instance with the default props gets. If
+  `layout()` later raises or returns something impossible (a width outside 1 to
+  64, a join of unknown or unequally wide lanes), that kind is disabled in the
+  circuit like a hook that raised, and gets its class attribute pins, one lane each.
+- A part with an `eval` joins whole outputs only (its eval value drives them). A
+  part without one, like SPLIT, may join any lanes.

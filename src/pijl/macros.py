@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import Callable
 
 from .parts import Look, PartType, Registry
+from .parts.registry import layout_cached
 from .snapshot import MACRO, Snapshot
 
 
@@ -47,10 +48,25 @@ class MacroType(PartType):
         self.out_ids = _ports(body, types, "out")
         self.ins = _names(body, self.in_ids)
         self.outs = _names(body, self.out_ids)
+        # each pin as wide as its port (names may repeat, so not by `widths`)
+        seen: dict = {}
+        self._widths = tuple(
+            _port_width(body, types[uid], uid, seen) for uid in self.in_ids + self.out_ids
+        )
         # the macros used directly in the body
         self.uses = frozenset(
             d[0][len(MACRO) :] for d in body.parts.values() if d[0].startswith(MACRO)
         )
+
+
+    def layout(self, props) -> dict:
+        return {"ins": self.ins, "outs": self.outs, "widths": self._widths, "joins": ()}
+
+
+def _port_width(body: Snapshot, t: PartType, uid: int, seen: dict) -> int:
+    """How many lanes a port's one pin has."""
+    lay = layout_cached(t, body.parts[uid][4], seen)
+    return lay.widths[0] if lay is not None and lay.widths else 1
 
 
 def _ports(body: Snapshot, types: dict[int, PartType], side: str) -> tuple[int, ...]:

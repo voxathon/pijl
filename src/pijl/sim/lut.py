@@ -92,7 +92,7 @@ class _Plan:
         self.other: list[_Batch] = []  # batches that still run a kind at a time ...
         self.other_numbered: list[tuple[int, _Batch]] = []  # ... with their numbers
         for b, batch in enumerate(all_batches):
-            table = None if batch.type.kind in c.faults else tabulate(batch.type)
+            table = None if batch.type.kind in c.faults or batch.no_table else tabulate(batch.type)
             if table is None:
                 self.other.append(batch)
                 self.other_numbered.append((b, batch))

@@ -16,6 +16,10 @@ That makes the two hot paths plain bitwise work:
 The codes are an engine detail: the code 1 means the *value* 0. Part scripts only
 ever see Logic arrays and Levels, whose & | ^ ~ do four-state logic, so
 `lambda a, b: ~(a & b)` is a correct four-state NAND as written.
+
+A wide pin (a bus: PartType.widths) is a row of lanes, so its Logic array has a
+second axis: shape (instances, lanes), lane 0 the least significant bit. The
+operators work lane by lane; ints() and Logic.of_ints() go to and from numbers.
 """
 
 from __future__ import annotations
@@ -121,6 +125,15 @@ class Logic:
     def full(cls, n: int, level: Level) -> Logic:
         return cls.of_codes(np.full(n, level.value, CODE))
 
+    @classmethod
+    def of_ints(cls, values: Any, width: int) -> Logic:
+        """Numbers as `width` lanes each (lane 0 = bit 0): shape values.shape + (width,).
+        Bits past `width` are dropped; negative numbers are two's complement."""
+        v = np.asarray(values)
+        v = v.astype(np.int64).view(np.uint64) if v.dtype.kind in "ib" else v.astype(np.uint64)
+        bits = (v[..., None] >> np.arange(width, dtype=np.uint64)) & np.uint64(1)
+        return cls.of_codes((bits + 1).astype(CODE))
+
     @property
     def codes(self) -> np.ndarray:
         if self._codes is None:
@@ -196,6 +209,8 @@ class Logic:
         return _level(Logic.of_codes(self.codes[i]))
 
     def __iter__(self):
+        if self.codes.ndim > 1:  # (rows of lanes)
+            return (Logic.of_codes(row) for row in self.codes)
         return (Level(int(c)) for c in self.codes)
 
     def __bool__(self) -> bool:
@@ -204,9 +219,14 @@ class Logic:
         )
 
     def __repr__(self) -> str:
-        if self.codes.ndim == 0:
-            return f"Logic({Level(int(self.codes))})"
-        return f"Logic({''.join('Z01X'[c] for c in self.codes.tolist())})"
+        c = self.codes
+        if c.ndim == 0:
+            return f"Logic({Level(int(c))})"
+        if c.ndim == 1:
+            return f"Logic({''.join('Z01X'[v] for v in c.tolist())})"
+        # rows of lanes: each row written most significant lane first, like a number
+        rows = c.reshape(-1, c.shape[-1])[:, ::-1].tolist()
+        return f"Logic[{', '.join(''.join('Z01X'[v] for v in r) for r in rows)}]"
 
 
 def _gate_in(v) -> tuple[np.ndarray, np.ndarray]:
@@ -223,6 +243,25 @@ def _gate_in(v) -> tuple[np.ndarray, np.ndarray]:
         return ~on, on
     z = ~(lo | hi)
     return lo | z, hi | z
+
+
+def ints(value: Logic) -> tuple[np.ndarray, np.ndarray]:
+    """Lanes as numbers: (values, known) over the last axis (lane 0 = bit 0). values is
+    uint64, built from the lanes that are 1 (X and Z count as 0); known says whether
+    every lane was a known 0 or 1."""
+    v = value if isinstance(value, Logic) else Logic(value)
+    w = v.shape[-1]
+    weights = np.uint64(1) << np.arange(w, dtype=np.uint64)
+    values = np.bitwise_or.reduce(np.where(v.is1, weights, np.uint64(0)), axis=-1)
+    return values.astype(np.uint64), v.known.all(axis=-1)
+
+
+def stack(lanes) -> Logic:
+    """Lanes side by side (lane 0 first): one value per lane, each a Logic array (or a
+    Level, or bools) of the same shape. stack([a, b])[..., 0] is a."""
+    cs = [codes(v) for v in lanes]
+    cs = np.broadcast_arrays(*cs)
+    return Logic.of_codes(np.stack(cs, axis=-1).astype(CODE))
 
 
 def where(cond, a, b) -> Logic:

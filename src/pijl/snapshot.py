@@ -35,6 +35,9 @@ class Snapshot:
     wire_colors: dict[int, str] = field(
         default_factory=dict
     )  # wire uid -> color name; absent = default
+    wire_widths: dict[int, int] = field(
+        default_factory=dict
+    )  # wire uid -> lanes (a bus); absent = 1
 
 
 EMPTY = Snapshot({}, {})

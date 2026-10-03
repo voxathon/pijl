@@ -43,6 +43,7 @@ def test_builtins_are_the_ports_plus_the_template_scripts():
         "CLK",
         "PULLUP",
         "PULLDOWN",
+        "SPLIT",
     ]  # ports, then by path
     assert {t.category for t in reg} == {"I/O", "GATES", "WIRING"}
     assert {t.api for t in reg} == {2}
@@ -51,7 +52,7 @@ def test_builtins_are_the_ports_plus_the_template_scripts():
 def test_scripts_load_recursively_and_helpers_are_skipped():
     reg = load(SCRIPTS / "good")
     assert reg.errors == []
-    assert {"COUNTER", "BRIDGE", "INV", "HIGH", "AND16", "SPLIT", "BOOM"} <= set(
+    assert {"COUNTER", "BRIDGE", "INV", "HIGH", "AND16", "FORK", "BOOM"} <= set(
         reg.types
     )
 
@@ -112,7 +113,7 @@ def test_every_gate_on_arrays():
 def test_scalars_many_inputs_and_many_outputs(circuit):
     high = [circuit.add_part("HIGH") for _ in range(3)]
     wide = circuit.add_part("AND16")
-    split = circuit.add_part("SPLIT")
+    split = circuit.add_part("FORK")
     circuit.connect(high[0].outputs[0], split.inputs[0])
     settle(circuit, 3)
     assert all(h.outputs[0].state is ONE for h in high)

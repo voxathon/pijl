@@ -124,9 +124,9 @@ from pyglet.window import key, mouse
 
 from .. import mods
 from ..macros import Catalog
-from ..parts import Choice, Number, Toggle
+from ..logic import ints
+from ..parts import MAX_WIDTH, Choice, Number, Toggle
 from ..parts import load as load_parts
-from ..parts.registry import copy_props
 from ..project import (
     Project,
     last_project,
@@ -155,9 +155,12 @@ from .document import (
     describe,
     instantiate,
     instantiate_keyed,
+    free_tree,
     internal_wires,
+    reshape,
     restore,
     rewire,
+    set_wire_width,
 )
 from .duplicate import DOWN, RIGHT, Cell, Tiling, tiled
 from .grid import Grid, snap_step
@@ -177,6 +180,7 @@ from .text_field import SELECTION_ALPHA, TextMouse, TextTarget, shortcut
 from .sync import ViewSync
 from .views import (
     PartTable,
+    cell_at,
     PartView,
     Layers,
     Point,
@@ -366,6 +370,15 @@ class Editor(pyglet.window.Window):
             batch=self.hud,
         )
         self.bar = StatusBar(self.hud, self.width)
+        # the width and value of the bus under the cursor (see _update_bus_readout)
+        self.bus_readout = pyglet.text.Label(
+            "",
+            font_name="Consolas",
+            font_size=10,
+            color=T.HELP_TEXT,
+            anchor_y="top",
+            batch=self.hud,
+        )
         # runtime numbers for the bar, summed over STATS_EVERY seconds
         self.stats = {
             "frames": 0,
@@ -501,14 +514,14 @@ class Editor(pyglet.window.Window):
                 for spec in specs:
                     types.append(c.registry.get(spec[0]))  # (KeyError: no such kind)
             finally:  # (what did get added gets its view, even if a later kind was missing)
+                # (props go in with the parts: they may decide pin widths)
                 parts = c.add_parts(
-                    types, [s[3] for s in specs[: len(types)]], live=False
+                    types, [s[3] for s in specs[: len(types)]], live=False,
+                    props=[s[5] for s in specs[: len(types)]],
                 )
-                for part, (_kind, _x, _y, _uid, label, props) in zip(parts, specs):
-                    if label:
-                        part.label = label
-                    if props is not None:
-                        part.props = copy_props(props)
+                for part, spec in zip(parts, specs):
+                    if spec[4]:
+                        part.label = spec[4]
                 if live:  # (opened with their own props, not the defaults)
                     c.open_parts(parts)
                 views = PartView.many(
@@ -622,12 +635,13 @@ class Editor(pyglet.window.Window):
         uid: int | None = None,
         color: str | None = None,
         check: bool = True,
+        width: int | None = None,
     ) -> Wire | None:
         """Connect two endpoints (pins, wires or FREE); `bends` are ordered from a to b.
         `a_pos` / `b_pos` say where on a wire endpoint the junction sits (or where a
-        free end is).
+        free end is). `width`: lanes, for a wire with both ends free (else its ends say).
         `check=False`: rebuilding wiring that existed before (see Circuit.connect)."""
-        wire, replaced = self.circuit.connect(a, b, uid, check)
+        wire, replaced = self.circuit.connect(a, b, uid, check, width)
         for old in replaced:
             self._drop_wire_view(old)
         if wire is not None:
@@ -1242,6 +1256,12 @@ class Editor(pyglet.window.Window):
                 if plugged
                 else []
             )
+            tree = free_tree(self.circuit, w)
+            width = (  # (a tree on pins is as wide as they are)
+                [MenuItem(f"Width: {w.width}...", lambda: self._wire_width_prompt(tree))]
+                if tree
+                else []
+            )
             self._open_menu(
                 x,
                 y,
@@ -1249,6 +1269,7 @@ class Editor(pyglet.window.Window):
                     MenuItem("Edit", lambda: self._start_wire_edit(wire)),
                     MenuItem("Branch", lambda: self._start_wiring(wire.wire, at)),
                     *unplug,
+                    *width,
                     MenuItem(
                         "Recolor",
                         submenu=self._recolor_items(
@@ -1461,9 +1482,11 @@ class Editor(pyglet.window.Window):
                 if abs(x - px) + abs(y - py) < T.DRAG_THRESHOLD_PX:
                     self._board_menu(x, y, wx, wy)  # (wx, wy: where it was pressed)
         elif button == mouse.LEFT and self.mode is Mode.PRESSING_PART:
-            # A click without movement: clickable parts (switches) get the click,
-            # everything else gets selected.
-            if not self.circuit.click(self.active.part):
+            # A click without movement: clickable parts (switches) get the click --
+            # a bit cell (Look.cells) its own -- and everything else gets selected.
+            lane = cell_at(self.active, *self.camera.screen_to_world(x, y))
+            done = lane is not None and self.circuit.click_cell(self.active.part, lane)
+            if not done and not self.circuit.click(self.active.part):
                 self.selection.set(parts=[self.active])
             self.mode, self.active = Mode.IDLE, None
         elif button == mouse.LEFT and self.mode is Mode.BOX_SELECTING:
@@ -1810,7 +1833,50 @@ class Editor(pyglet.window.Window):
         Touched.parts.update(
             v.part.uid for v in views
         )  # (settings don't change colors: no repaint)
+        self._reshape([v.part for v in views])
         return True
+
+    def _reshape(self, parts: list[Part]) -> list[Part]:
+        """After a settings edit: rebuild the parts whose pins it changed (a width, a
+        SPLIT pattern), dropping wires that don't fit any more -- all part of the same
+        undo step. Returns the parts as they are now (rebuilt ones are new handles)."""
+        c = self.circuit
+        redo = [p for p in parts if c.reshaped(p, p.props)]
+        if not redo:
+            return parts
+        selected = {v.part.uid for v in self.selection.parts}
+        self.selection.clear()
+        views = reshape(self, redo)
+        Touched.parts.update(p.uid for p in redo)
+        self.selection.set(
+            parts=[self.part_views[c.part_by_uid[u]] for u in sorted(selected) if u in c.part_by_uid]
+        )
+        log_edit.info("rebuilt %d part(s) with new pins", len(views))
+        return [c.part_by_uid[p.uid] for p in parts]
+
+    def _wire_width_prompt(self, tree: list[Wire]) -> None:
+        """Type how many lanes a free-floating wire tree is (see free_tree)."""
+        p = Prompt(
+            self.hud,
+            self.width,
+            self.height,
+            "Wire width" + (f" ({len(tree)} wires)" if len(tree) > 1 else ""),
+            text=str(tree[0].width),
+            max_len=2,
+            hint=f"lanes, 1 to {MAX_WIDTH}   Enter: set   Esc: cancel",
+        )
+
+        def enter(p: Prompt) -> None:
+            text = p.text.strip()
+            if not text.isdigit() or not 1 <= int(text) <= MAX_WIDTH:
+                self._report(f"{text!r}: a wire is 1 to {MAX_WIDTH} lanes wide")
+                return
+            self.selection.clear()
+            views = set_wire_width(self, tree, int(text))
+            self.selection.set(wires=views)
+            self._close_prompt()
+
+        self._open_prompt(p, enter)
 
     def _setting_prompt(self, views: list[PartView], key: str, s, value) -> None:
         """Type a Text setting's new value (mixed values start out empty)."""
@@ -1912,6 +1978,7 @@ class Editor(pyglet.window.Window):
         Touched.parts.update(
             p.uid for p in parts
         )  # (no repaint: settings don't change colors)
+        parts[:] = self._reshape(parts)  # (the popover keeps editing these)
         self._record()
 
     def _close_popover(self, take_typed: bool = False) -> None:
@@ -3104,10 +3171,43 @@ class Editor(pyglet.window.Window):
         if self.inside and not self.inside[0].inst.live:
             self._leave_inside(everything=True)  # (its instance is gone)
         self.view_sync(self.circuit, self.world, self.part_table)
+        self._update_bus_readout()
         self.probe.update(
             self.hover_view if self.pin_label_mode != PIN_LABELS_HIDDEN else None
         )
         self._tally(dt, sim, time.perf_counter() - t_start - sim)
+
+    def _update_bus_readout(self) -> None:
+        """The bus under the cursor (a wire, a pin, or an IN / OUT showing bit cells):
+        its width and value, next to the cursor. Every frame: the value moves."""
+        text = ""
+        if (
+            self.mode in (Mode.IDLE, Mode.WIRING, Mode.PRESSING_WIRE)
+            and self.mouse_in
+            and not self.inside
+            and not self.picker.contains(*self.mouse)
+        ):
+            wx, wy = self.camera.screen_to_world(*self.mouse)
+            value = None
+            pin = self.pin_at(wx, wy)
+            if pin is not None:
+                value = pin.state if pin.width > 1 else None
+            elif (view := self.part_at(wx, wy)) is not None:
+                cells = view.part.type.look.cells
+                lay = view.part.layout
+                if cells in lay.ins + lay.outs:
+                    k = (lay.ins + lay.outs).index(cells)
+                    p = view.part.pins[k]
+                    value = p.state if p.width > 1 else None
+            elif (wire := self.wire_at(wx, wy)) is not None and wire.wire.width > 1:
+                value = self.circuit.wire_lanes(wire.wire)
+            if value is not None:
+                text = _bus_text(value)
+        r = self.bus_readout
+        if r.text != text:
+            r.text = text
+        if text:
+            r.x, r.y = self.mouse[0] + 16, self.mouse[1] - 10
 
     def on_resize(self, width, height):
         super().on_resize(width, height)  # keeps the projection matrix in sync
@@ -3858,6 +3958,18 @@ def _crumb(part: Part) -> str:
     """An instance in the breadcrumb: its title, and its label if it has one."""
     name = part.type.title
     return f"{name} ({part.label})" if part.label else name
+
+
+def _bus_text(value) -> str:
+    """A bus's value for the readout: its lanes and number, or (some lane not 0 or 1)
+    its lanes, most significant first."""
+    lanes = value.codes.tolist()
+    n, known = ints(value)
+    shown = "".join("Z01X"[c] for c in reversed(lanes))
+    if not known:
+        return f"{len(lanes)} lanes  {shown}"
+    v = int(n)
+    return f"{len(lanes)} lanes  0x{v:0{(len(lanes) + 3) // 4}X}  {v}  {shown}"
 
 
 @dataclass

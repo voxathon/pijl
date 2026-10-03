@@ -57,10 +57,19 @@ it, `config` is the engine's code paths (see `pijl/sim/config.py`).
 Pins are named like the macro's pins (the ports' labels; unlabeled ones are
 numbered), in pin order.
 
+A bus (a pin several lanes wide) is set by name with a number (`set(d=200)`,
+`d=0xC8` on the command line), a Level or `X` / `Z` (every lane), and reads as a
+Logic array of its lanes (`pijl.logic.ints` turns it into a number). The command
+line prints it as binary, most significant lane first, and JSON gives its number
+(or the lanes as a string if any isn't 0 or 1). Everything that takes one
+character per pin (`set_bits`, `bits`, `--raw`, `--table`, the binary pipe,
+`truth_table()`) treats a bus as its lanes, each one a pin of its own named
+`d[0]`, `d[1]`, ...: lane 0 first. `h.in_lanes` and `h.out_lanes` list those names.
+
 ## The command line
 
 ```bash
-pijl list                          # the project's macros and their pins
+pijl list                          # the project's macros and their pins (a bus: name:lanes)
 pijl list --projects
 pijl run "half adder" a=1 b=0      # one shot -> sum=1 carry=0
 pijl run "half adder" 10           # all inputs in pin order, as bits

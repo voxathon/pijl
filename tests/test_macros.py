@@ -232,9 +232,9 @@ def test_macro_instances_in_files_and_pins_by_port_uid():
     defs = {"ha": half_adder()}
     board = Snapshot(
         {
-            1: ("IN", "", 0.0, 0.0, {}),
+            1: ("IN", "", 0.0, 0.0, {"width": 1}),
             2: ("macro:ha", "", 100.0, 0.0, {}),
-            3: ("OUT", "", 200.0, 0.0, {}),
+            3: ("OUT", "", 200.0, 0.0, {"width": 1}),
         },
         {1: w(1, 0, 2, 1), 2: w(2, 1, 3, 0)},
     )  # into b, carry out

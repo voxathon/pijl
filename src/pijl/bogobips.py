@@ -793,9 +793,9 @@ def _measure(
             else:
                 fresh = k.script(n, np.random.default_rng(args.seed), args.flips)
                 if layer == "pipe":
-                    rate = _pipe(root, macro, len(h.inputs), len(h.outputs), fresh, ticks, args.seconds, config)
+                    rate = _pipe(root, macro, len(h.in_lanes), len(h.out_lanes), fresh, ticks, args.seconds, config)
                 else:
-                    rate = _bin(root, macro, len(h.inputs), fresh, ticks, args.seconds, config)
+                    rate = _bin(root, macro, len(h.in_lanes), fresh, ticks, args.seconds, config)
             cells[layer] = _si(rate * work)
             rates[layer] = rate * work
         except Failed as e:

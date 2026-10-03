@@ -55,7 +55,7 @@ __all__ = [
 # they grow across boards and the two timelines can be told apart by which came last.
 STAMPS = itertools.count(1)
 
-# One undo step: for parts, wires and wire colors, what the uids it touches looked like
+# One undo step: for parts, wires, wire colors and wire widths (buses), what the uids it touches looked like
 # before and after, as two dicts (uid -> value). A uid missing from one of them was
 # absent then. (Two dicts instead of uid -> (before, after) pairs: a step that adds or
 # removes a big batch is one dict of the values, not a pair per uid as well.)
@@ -65,7 +65,7 @@ STAMPS = itertools.count(1)
 # a copy of every part twice (see _compress). Undo takes the delta off again.
 Move = tuple[np.ndarray, float, float]
 Section = tuple[dict[int, object], dict[int, object], tuple[Move, ...]]
-Change = tuple[Section, Section, Section]
+Change = tuple[Section, Section, Section, Section]
 
 # How much the undo history may hold, in values (a part's or wire's data on one side
 # of a step; a moved uid counts as 1/16: it's 8 bytes in a move, not a tuple). About
@@ -98,7 +98,7 @@ def capture(
         else sorted(views, key=lambda v: v.part.uid)
     )
     parts = {v.part.uid: part_data(v) for v in views}
-    out, colors = {}, {}
+    out, colors, widths = {}, {}, {}
     # (the whole board: wires attached to nothing at all too)
     if whole:
         some = sorted(editor.wire_views.values(), key=lambda v: v.wire.uid)
@@ -116,7 +116,9 @@ def capture(
         out[view.wire.uid] = data
         if view.color:
             colors[view.wire.uid] = view.color
-    return Snapshot(parts, out, colors)
+        if view.wire.width != 1:
+            widths[view.wire.uid] = view.wire.width
+    return Snapshot(parts, out, colors, widths)
 
 
 def _cut_loose(view: WireView, data: WireData, parts: set, wires: set) -> WireData:
@@ -132,11 +134,12 @@ def _cut_loose(view: WireView, data: WireData, parts: set, wires: set) -> WireDa
 
 def changes(
     editor: Editor, parts: Iterable[int], wires: Iterable[int]
-) -> tuple[dict, dict, dict]:
+) -> tuple[dict, dict, dict, dict]:
     """What those parts and wires (uids) look like now, for History.record: their
-    data, their wire colors -- or None where they're gone (or a wire has no color)."""
+    data, their wire colors and widths -- or None where they're gone (or a wire has no
+    color, or is one lane wide)."""
     c = editor.circuit
-    pd, wd, cd = {}, {}, {}
+    pd, wd, cd, xd = {}, {}, {}, {}
     for uid in parts:
         part = c.part_by_uid.get(uid)
         view = editor.part_views.get(part) if part is not None else None
@@ -146,7 +149,8 @@ def changes(
         view = editor.wire_views.get(wire) if wire is not None else None
         wd[uid] = wire_data(view) if view is not None else None
         cd[uid] = view.color if view is not None and view.color else None
-    return pd, wd, cd
+        xd[uid] = wire.width if view is not None and wire.width != 1 else None
+    return pd, wd, cd, xd
 
 
 def part_data(view: PartView) -> PartData:
@@ -198,7 +202,7 @@ def rewire(editor: Editor, view: WireView, side: str, target, at) -> Wire:
     w = view.wire
     family = [w, *c.descendants(w)]
     datas = [
-        (x.uid, wire_data(editor.wire_views[x]), editor.wire_views[x].color)
+        (x.uid, wire_data(editor.wire_views[x]), editor.wire_views[x].color, x.width)
         for x in family
     ]
     src, dst, bends, src_pt, dst_pt = datas[0][1]
@@ -208,12 +212,12 @@ def rewire(editor: Editor, view: WireView, side: str, target, at) -> Wire:
         src, src_pt = ref, pt
     else:
         dst, dst_pt = ref, pt
-    datas[0] = (w.uid, (src, dst, bends, src_pt, dst_pt), datas[0][2])
+    datas[0] = (w.uid, (src, dst, bends, src_pt, dst_pt), datas[0][2], datas[0][3])
     editor.remove_wire(view)  # (the whole family)
     made: dict[int, Wire] = {}
     lookup = collections.ChainMap(made, c.wire_by_uid)
     with editor.wire_batch():
-        for uid, (src, dst, bends, src_pt, dst_pt), color in datas:
+        for uid, (src, dst, bends, src_pt, dst_pt), color, width in datas:
             made[uid] = editor.connect(
                 _resolve(src, c.part_by_uid, lookup, uid),
                 _resolve(dst, c.part_by_uid, lookup, uid),
@@ -222,10 +226,88 @@ def rewire(editor: Editor, view: WireView, side: str, target, at) -> Wire:
                 dst_pt,
                 color=color,
                 check=False,
+                width=width,
             )
     new = made[w.uid]
     editor.refresh_wires([editor.wire_views[new]])
     return new
+
+
+def reshape(editor: Editor, parts: list) -> list:
+    """Rebuild these parts with the pins their props give them now (a settings edit
+    changed their layout: see PartType.layout), keeping the wires on them that still
+    fit -- same pin, same width -- and dropping the rest, with whatever hangs off
+    those. Returns the new views (the parts are new too: same uids). Undo puts the
+    old pins and wires back (restore() rebuilds a part whose pins differ)."""
+    c = editor.circuit
+    lays = {p.uid: c.layout_for(p.type, p.props) for p in parts}
+    family = sorted({w for p in parts for w in wires_on(c, p)}, key=lambda w: w.uid)
+    mine = {w.uid for w in family}
+    kept: dict[int, int] = {}  # wire uid -> width
+    wires, colors, widths = {}, {}, {}
+    for w in family:  # (parents first: a branch goes if its trunk did)
+        view = editor.wire_views[w]
+        data = wire_data(view)
+        width = None
+        for ref in data[:2]:
+            if ref == ("w", w.uid):
+                continue  # a free end: fits anything
+            if ref[0] == "w":
+                end = kept.get(ref[1], -1) if ref[1] in mine else c.wire_by_uid[ref[1]].width
+            elif ref[1] in lays:
+                lay = lays[ref[1]]
+                names = lay.ins if ref[2] else lay.outs
+                end = -1 if ref[3] >= len(names) else lay.widths[ref[3] if ref[2] else lay.n_in + ref[3]]
+            else:
+                part = c.part_by_uid[ref[1]]
+                end = (part.inputs if ref[2] else part.outputs)[ref[3]].width
+            if end < 0 or (width is not None and end != width):
+                break
+            width = end
+        else:
+            kept[w.uid] = width or w.width
+            wires[w.uid] = data
+            if view.color:
+                colors[w.uid] = view.color
+            if kept[w.uid] != 1:
+                widths[w.uid] = kept[w.uid]
+    target = Snapshot(
+        {p.uid: part_data(editor.part_views[p]) for p in parts}, wires, colors, widths
+    )
+    restore(editor, target, only=([p.uid for p in parts], mine))
+    return [editor.part_views[c.part_by_uid[p.uid]] for p in parts]
+
+
+def set_wire_width(editor: Editor, wires: list, width: int) -> list:
+    """Make these wires (a tree attached to no pin: see free_tree) `width` lanes wide.
+    Returns their new views (the wires are made anew: same uids)."""
+    c = editor.circuit
+    family = sorted(wires, key=lambda w: w.uid)
+    views = [editor.wire_views[w] for w in family]
+    target = Snapshot(
+        {},
+        {w.uid: wire_data(v) for w, v in zip(family, views)},
+        {w.uid: v.color for w, v in zip(family, views) if v.color},
+        {w.uid: width for w in family} if width != 1 else {},
+    )
+    restore(editor, target, only=((), [w.uid for w in family]))
+    return [editor.wire_views[c.wire_by_uid[w.uid]] for w in family]
+
+
+def free_tree(c, wire: Wire) -> list[Wire] | None:
+    """Every wire joined to this one through wire ends (trunks and branches), if none
+    of them is on a pin: a free-floating tree, whose width is its own to choose. Else
+    None (its pins say how wide it is)."""
+    seen, todo = {wire}, [wire]
+    while todo:
+        w = todo.pop()
+        for end in (w.src, w.dst, *c.ends_on(w)):
+            if isinstance(end, Pin):
+                return None
+            if end is not w and end not in seen:
+                seen.add(end)
+                todo.append(end)
+    return sorted(seen, key=lambda w: w.uid)
 
 
 def restore(
@@ -253,13 +335,20 @@ def _restore(
         part = c.part_by_uid.get(uid)
         return editor.part_views[part] if part is not None else None
 
-    # 1. parts that shouldn't exist. Their wires (and branches) go with them; any of
-    #    those the target does have get rebuilt in step 4.
+    # 1. parts that shouldn't exist -- or exist with other pins than the target's props
+    #    give them (a width or a SPLIT pattern changed: see PartType.layout), which are
+    #    made anew in step 3. Their wires (and branches) go with them; any of those the
+    #    target does have get rebuilt in step 4.
     doomed = [
         view
         for uid in part_uids - target.parts.keys()
         if (view := view_of(uid)) is not None
     ]
+    for uid in part_uids & target.parts.keys():
+        view = view_of(uid)
+        if view is not None and c.reshaped(view.part, target.parts[uid][4]):
+            doomed.append(view)
+            wire_uids.update(w.uid for w in wires_on(c, view.part))
     wire_uids.update(w.uid for w in editor.remove_parts(doomed))
     # 2. wires that shouldn't exist -- or exist with different endpoints (cut-deletion
     #    splices a branch onto its trunk, re-pointing the trunk's far end). Those are
@@ -269,7 +358,11 @@ def _restore(
         if wire is None:
             continue  # gone already (or never here)
         data = target.wires.get(uid)
-        if data is None or (_ref(wire.src, wire), _ref(wire.dst, wire)) != data[:2]:
+        if (
+            data is None
+            or (_ref(wire.src, wire), _ref(wire.dst, wire)) != data[:2]
+            or wire.width != target.wire_widths.get(uid, 1)
+        ):
             wire_uids.update(w.uid for w in editor.remove_wire(editor.wire_views[wire]))
     # 3. parts: add missing (all at once), update moved/relabeled/re-propped
     moved = set()
@@ -320,6 +413,7 @@ def _restore(
                     uid=uid,
                     color=target.wire_colors.get(uid),
                     check=False,
+                    width=target.wire_widths.get(uid, 1),
                 )
                 continue
             view = editor.wire_views[wire]
@@ -381,6 +475,7 @@ def _instantiate(
                 dst_pt,
                 color=clip.wire_colors.get(uid),
                 check=False,
+                width=clip.wire_widths.get(uid, 1),
             )
     if not _colored(clip):
         # The copies are wired only to each other: with no colors among them, paint()
@@ -408,7 +503,10 @@ class History:
         self, initial: Snapshot, limit: int = 500, max_values: int = MAX_VALUES
     ) -> None:
         self.current = Snapshot(
-            dict(initial.parts), dict(initial.wires), dict(initial.wire_colors)
+            dict(initial.parts),
+            dict(initial.wires),
+            dict(initial.wire_colors),
+            dict(initial.wire_widths),
         )
         self.undo_stack: list[
             tuple[Change, int, int]
@@ -418,14 +516,15 @@ class History:
         self.max_values = max_values
         self.state = 0
 
-    def _sections(self) -> tuple[dict, dict, dict]:
-        return self.current.parts, self.current.wires, self.current.wire_colors
+    def _sections(self) -> tuple[dict, dict, dict, dict]:
+        cur = self.current
+        return cur.parts, cur.wires, cur.wire_colors, cur.wire_widths
 
-    def _diff(self, parts: dict, wires: dict, colors: dict) -> Change:
+    def _diff(self, parts: dict, wires: dict, colors: dict, widths: dict) -> Change:
         """The entries that differ from `current`: (before, after) per section (no
         moves yet: see _compress)."""
         out = []
-        for now, cur in zip((parts, wires, colors), self._sections()):
+        for now, cur in zip((parts, wires, colors, widths), self._sections()):
             before, after = {}, {}
             for uid, new in now.items():
                 old = cur.get(uid)
@@ -438,7 +537,12 @@ class History:
         return tuple(out)
 
     def record(
-        self, parts: dict, wires: dict, colors: dict, moves: tuple = ((), ())
+        self,
+        parts: dict,
+        wires: dict,
+        colors: dict,
+        widths: dict | None = None,
+        moves: tuple = ((), ()),
     ) -> bool:
         """A new step: what these uids look like now (see changes()); None = gone.
         No-op (returns False) if that's what they looked like already.
@@ -446,7 +550,7 @@ class History:
         `moves`: (part moves, wire moves), each a list of (uids, dx, dy): uids that
         only moved, exactly (see views.Touched.moved), and aren't in parts / wires.
         They're shifted here, without their data being taken again."""
-        change = self._diff(parts, wires, colors)
+        change = self._diff(parts, wires, colors, widths or {})
         if _empty(change) and not any(moves):
             return False
         _apply(self._sections(), change, 1)
@@ -470,13 +574,17 @@ class History:
                 u: snap.wire_colors.get(u)
                 for u in cur.wire_colors.keys() | snap.wire_colors.keys()
             },
+            {
+                u: snap.wire_widths.get(u)
+                for u in cur.wire_widths.keys() | snap.wire_widths.keys()
+            },
         )
 
-    def amend(self, parts: dict, wires: dict, colors: dict) -> bool:
+    def amend(self, parts: dict, wires: dict, colors: dict, widths: dict | None = None) -> bool:
         """Like record, but folded into the newest step (a run of small tweaks = one undo step)."""
         if not self.undo_stack:
-            return self.record(parts, wires, colors)
-        change = self._diff(parts, wires, colors)
+            return self.record(parts, wires, colors, widths)
+        change = self._diff(parts, wires, colors, widths or {})
         if _empty(change):
             return False
         top, before, _ = self.undo_stack[-1]
@@ -571,14 +679,14 @@ def _size(change: Change) -> int:
 def describe(change: Change) -> str:
     """A step in a few words, for the log: "+3 parts, -1 wire, 40 moved"."""
     out = []
-    for (before, after, moves), what in zip(change, ("part", "wire", "color")):
+    for (before, after, moves), what in zip(change, ("part", "wire", "color", "width")):
         added = len(after.keys() - before.keys())
         gone = len(before.keys() - after.keys())
         changed = len(before.keys() & after.keys())
         moved = sum(len(uids) for uids, _, _ in moves)
-        if what == "color":
+        if what in ("color", "width"):
             if added or gone or changed:
-                out.append(f"{added + gone + changed} wire color{'s' * (added + gone + changed > 1)}")
+                out.append(f"{added + gone + changed} wire {what}{'s' * (added + gone + changed > 1)}")
             continue
         for n, sign in ((added, "+"), (gone, "-"), (changed, "~")):
             if n:
@@ -644,8 +752,8 @@ def _wire_delta(a: tuple, b: tuple) -> tuple[float, float] | None:
     return pb[0][0] - pa[0][0], pb[0][1] - pa[0][1]
 
 
-_SHIFTS: tuple[Callable, ...] = (_shift_part, _shift_wire, None)
-_DELTAS: tuple[Callable | None, ...] = (_part_delta, _wire_delta, None)
+_SHIFTS: tuple[Callable, ...] = (_shift_part, _shift_wire, None, None)
+_DELTAS: tuple[Callable | None, ...] = (_part_delta, _wire_delta, None, None)
 
 
 def _compress(change: Change) -> Change:
@@ -759,9 +867,15 @@ def _expand(change: Change, sections: tuple[dict, dict, dict]) -> Change:
 
 
 def change_uids(change: Change) -> tuple[set[int], set[int]]:
-    """The part and wire uids an undo step touches (wire colors count as wires)."""
-    parts, wires, colors = change
-    return section_uids(parts), section_uids(wires) | section_uids(colors)
+    """The part and wire uids an undo step touches (wire colors and widths count as wires)."""
+    parts, wires, colors, widths = change
+    return section_uids(parts), section_uids(wires) | section_uids(colors) | section_uids(widths)
+
+
+def wires_on(c, part) -> list[Wire]:
+    """The wires with an end on one of the part's pins, and everything hanging off them."""
+    on = [w for pin in part.pins for w in c.ends_on(pin)]
+    return [*on, *c.descendants(*on)]
 
 
 def _ref(end, wire: Wire) -> EndRef:

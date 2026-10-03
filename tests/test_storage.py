@@ -20,10 +20,10 @@ REG = builtin_registry()
 def board() -> Snapshot:
     """a, b -> NAND -> LED, with a branch off the first wire into a NOT."""
     parts = {
-        1: ("IN", "a", 200.0, 360.0, {}),
-        2: ("IN", "b", 200.0, 220.0, {}),
+        1: ("IN", "a", 200.0, 360.0, {"width": 1}),
+        2: ("IN", "b", 200.0, 220.0, {"width": 1}),
         3: ("NAND", "", 380.0, 280.0, {}),
-        4: ("OUT", "q", 580.5, 290.25, {}),
+        4: ("OUT", "q", 580.5, 290.25, {"width": 1}),
         5: ("NOT", "", 380.0, 500.0, {}),
     }
     wires = {
@@ -77,8 +77,8 @@ def test_wire_colors_roundtrip():
 
 
 def test_text_is_stable_and_one_line_per_item():
-    text = dumps(encode(board()))
-    assert text == dumps(encode(roundtrip(board())))
+    text = dumps(encode(board(), REG))  # (with the types, as the editor saves)
+    assert text == dumps(encode(roundtrip(board()), REG))
     lines = text.splitlines()
     assert lines[:2] == ["{", f'  "pijl": {FORMAT},']
     assert (
@@ -92,7 +92,7 @@ def test_text_is_stable_and_one_line_per_item():
         and '"bends": []' not in text
         and '"props"' not in text
     )
-    assert json.loads(text) == encode(board())
+    assert json.loads(text) == encode(board(), REG)
 
 
 # ---- forgiving loads -----------------------------------------------------------------

@@ -88,7 +88,7 @@ def some(c: Circuit, dirty: np.ndarray, bid: np.ndarray, numbered) -> list[np.nd
         else:  # (never skipped)
             parts, ins, outs_at = batch.parts, batch.ins, batch.outs
         ctx = Ctx(parts, c.tick, now)
-        outs = c._guard(t, "eval", lambda: _evaluate(t, ctx, [states[idx] for idx in ins]))
+        outs = c._guard(t, "eval", lambda: _evaluate(t, ctx, [states[idx] for idx in ins], batch.out_widths))
         if outs is not _FAILED:
             results.append((outs_at, outs))
     for outs_at, outs in results:
@@ -112,7 +112,7 @@ def _results(c: Circuit, batches):
         if t.kind in c.faults:
             continue
         ctx = Ctx(batch.parts, c.tick, now)
-        outs = c._guard(t, "eval", lambda: _evaluate(t, ctx, [states[idx] for idx in batch.ins]))
+        outs = c._guard(t, "eval", lambda: _evaluate(t, ctx, [states[idx] for idx in batch.ins], batch.out_widths))
         if outs is not _FAILED:
             results.append((batch, outs))
     return results

@@ -10,7 +10,7 @@ from __future__ import annotations
 from functools import cache
 from pathlib import Path
 
-from .contract import API, GRID_STEP, Ctx, Look, Mark, PartType, part
+from .contract import API, GRID_STEP, MAX_WIDTH, Ctx, Layout, Look, Mark, PartType, layout_of, part
 from .registry import Registry, check_props, fresh_props, load
 from .settings import Action, Choice, Number, Setting, Text, Toggle
 
@@ -30,7 +30,9 @@ __all__ = [
     "Choice",
     "Ctx",
     "GRID_STEP",
+    "Layout",
     "Look",
+    "MAX_WIDTH",
     "Mark",
     "Number",
     "PartType",
@@ -42,6 +44,7 @@ __all__ = [
     "builtin_registry",
     "check_props",
     "fresh_props",
+    "layout_of",
     "load",
     "part",
 ]

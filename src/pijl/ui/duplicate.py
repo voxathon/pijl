@@ -145,7 +145,7 @@ def tiled(unit: Snapshot, offsets: list[Point]) -> tuple[Snapshot, int]:
     def pt(p: Point | None, dx: float, dy: float) -> Point | None:
         return None if p is None else (p[0] + dx, p[1] + dy)
 
-    parts, wires, colors = {}, {}, {}
+    parts, wires, colors, widths = {}, {}, {}, {}
     for k, (dx, dy) in enumerate(offsets):
         base = k * stride
         for uid, (kind, label, x, y, props) in unit.parts.items():
@@ -160,7 +160,9 @@ def tiled(unit: Snapshot, offsets: list[Point]) -> tuple[Snapshot, int]:
             )
         for uid, color in unit.wire_colors.items():
             colors[base + uid] = color
-    return Snapshot(parts, wires, colors), stride
+        for uid, width in unit.wire_widths.items():
+            widths[base + uid] = width
+    return Snapshot(parts, wires, colors, widths), stride
 
 
 def _across(wires: list[WireView]) -> int:

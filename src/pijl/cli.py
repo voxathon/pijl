@@ -3,7 +3,7 @@
     pijl                          the launcher (see launcher.py; --tui: in the terminal)
     pijl gui                      the editor, skipping the launcher
     pijl prefs [KEY=VALUE...]     show or change the preferences (see prefs.py)
-    pijl list [--projects]        the project's macros and their pins
+    pijl list [--projects]        the project's macros and their pins (a bus: name:lanes)
     pijl bench bogobips           the shift register benchmark (see bogobips.py)
     pijl run MACRO [VALUES...]    run a macro headless (see below)
 
@@ -52,7 +52,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO, TextIO
 
 if TYPE_CHECKING:
     from .engine import Harness
-    from .logic import Level
+    from .logic import Level, Logic
 
 log = logging.getLogger("pijl.app")
 
@@ -279,6 +279,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _list(engine, args) -> int:
+    from .parts import layout_of
     from .project import project_names
 
     if args.projects:
@@ -292,7 +293,10 @@ def _list(engine, args) -> int:
             print(f"{title}  (can't load: {e.args[0] if e.args else e})")
             continue
         name = title if title == id else f"{title} [{id}]"
-        print(f"{name}  ({', '.join(t.ins) or '-'}) -> ({', '.join(t.outs) or '-'})")
+        lay = layout_of(t, {})
+        pins = [n if w == 1 else f"{n}:{w}" for n, w in zip(lay.ins + lay.outs, lay.widths)]  # (a bus: name:lanes)
+        ins, outs = pins[: lay.n_in], pins[lay.n_in :]
+        print(f"{name}  ({', '.join(ins) or '-'}) -> ({', '.join(outs) or '-'})")
     return 0
 
 
@@ -401,10 +405,10 @@ def _raw(h: Harness, run, inp: BinaryIO, out: BinaryIO) -> int:
     the inputs given so far change; on its own: run, change nothing). "@n=L" drives
     input n (counting from 1) right away, without running: "@7=1@9=0;" changes two
     inputs, then runs. "?" answers with every output's level, one character each,
-    no newline. Whitespace is ignored. Answers are flushed whenever the input there
+    no newline. A bus is its lanes here, each counting as an input (lane 0 first). Whitespace is ignored. Answers are flushed whenever the input there
     is has been worked off. Read a chunk at a time: a long vector costs a few slice
     copies, not a Python step per character."""
-    n = len(h.inputs)
+    n = len(h.in_lanes)
     vec = bytearray()
     answer = bytearray()
     pending = b""
@@ -473,7 +477,9 @@ def _apply(h: Harness, text: str) -> None:
                 raise _BadInput("a JSON line must be an object")
             h.set(values)
         elif text and "=" not in text and all(c in "01xXzZ" for c in text):
-            h.set_all(text)
+            if len(text) != len(h.in_lanes):  # (a bus: one character per lane)
+                raise _BadInput(f"{len(h.in_lanes)} inputs, got {len(text)} levels")
+            h.set_bits(text)
         else:
             values: dict[str, Any] = {}
             for word in _words(text):
@@ -499,15 +505,15 @@ def _words(text: str) -> list[str]:
 
 
 def _table(h: Harness, run, as_json: bool, out: TextIO) -> None:
-    n = len(h.inputs)
+    n = len(h.in_lanes)  # (a bus: its lanes)
     if n > 16:
         raise _BadInput(f"{n} inputs is {2**n} rows; that's too many for a table")
     if not as_json:
-        print(" ".join(h.inputs) + " | " + " ".join(h.outputs), file=out)
+        print(" ".join(h.in_lanes) + " | " + " ".join(h.out_lanes), file=out)
     for row in range(2**n):
-        h.set_all([(row >> (n - 1 - i)) & 1 for i in range(n)])
+        h.set_bits(format(row, f"0{n}b") if n else "")
         run()
-        ins, outs = h.driven(), h.read()
+        ins, outs = h.lanes_driven(), h.lanes_read()
         if as_json:
             print(json.dumps({"in": _json_levels(ins), "out": _json_levels(outs)}), file=out, flush=True)
         else:
@@ -516,16 +522,36 @@ def _table(h: Harness, run, as_json: bool, out: TextIO) -> None:
             print(f"{left} | {right}", file=out, flush=True)
 
 
-def _answer(values: dict[str, Level], as_json: bool, out: TextIO) -> None:
+def _answer(values: dict[str, Level | Logic], as_json: bool, out: TextIO) -> None:
     if as_json:
         line = json.dumps(_json_levels(values))
     else:
-        line = " ".join(f"{_quote(k)}={v}" for k, v in values.items())
+        line = " ".join(f"{_quote(k)}={_text(v)}" for k, v in values.items())
     print(line, file=out, flush=True)
 
 
-def _json_levels(values: dict[str, Level]) -> dict[str, int | str]:
-    return {k: int(bool(v)) if str(v) in "01" else str(v) for k, v in values.items()}
+def _text(v: Level | Logic) -> str:
+    """A level; a bus as its lanes, most significant first (like a binary number)."""
+    from .logic import Logic
+
+    if isinstance(v, Logic):
+        return "".join("Z01X"[c] for c in v.codes.tolist()[::-1])
+    return str(v)
+
+
+def _json_levels(values: dict[str, Level | Logic]) -> dict[str, int | str]:
+    """0 / 1 as numbers, X / Z as strings; a bus as its number, or (some lane not 0
+    or 1) its lanes as a string, most significant first."""
+    from .logic import Logic, ints
+
+    out: dict[str, int | str] = {}
+    for k, v in values.items():
+        if isinstance(v, Logic):
+            n, known = ints(v)
+            out[k] = int(n) if known else _text(v)
+        else:
+            out[k] = int(bool(v)) if str(v) in "01" else str(v)
+    return out
 
 
 def _quote(name: str) -> str:

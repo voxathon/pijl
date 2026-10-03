@@ -35,7 +35,7 @@ from typing import Any
 
 import numpy as np
 
-from .logic import CODE, Level
+from .logic import CODE, Level, Logic
 from .macros import Catalog, MacroType
 from .parts import TEMPLATES, Registry
 from .parts import load as load_parts
@@ -65,6 +65,37 @@ _CODE_OF = np.full(256, 255, CODE)
 for _i, _c in enumerate("Z01X"):
     _CODE_OF[ord(_c)] = _CODE_OF[ord(_c.lower())] = _i
 _CHAR_OF = np.frombuffer(b"Z01X", np.uint8)
+
+
+def _drive(pin, value: Any) -> None:
+    """Pin.state = value, with level()'s spellings for a one-lane pin. A bus takes a
+    number, a Level or Logic, or text: "X" / "Z" (every lane), or a number ("200",
+    "0xC8", "0b11001000")."""
+    if pin.width == 1:
+        pin.state = level(value)
+        return
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("x", "z"):
+            value = _LEVELS[text]
+        else:
+            try:
+                value = int(text, 0)
+            except ValueError:
+                raise ValueError(f"{value!r} isn't a number or X / Z (for a {pin.width}-lane bus)") from None
+    elif isinstance(value, bool):
+        raise ValueError(f"{value!r} for a {pin.width}-lane bus: give a number")
+    pin.state = value
+
+
+def _lane_names(names: tuple[str, ...], widths: list[int]) -> tuple[str, ...]:
+    return tuple(n if w == 1 else f"{n}[{i}]" for n, w in zip(names, widths) for i in range(w))
+
+
+def _lane_slots(pins: list) -> np.ndarray:
+    if not pins:
+        return np.empty(0, np.intp)
+    return np.concatenate([np.arange(p.slot, p.slot + p.width) for p in pins]).astype(np.intp)
 
 
 def level(value: Any) -> Level:
@@ -168,8 +199,18 @@ class Harness:
         self.inputs: tuple[str, ...] = macro.ins
         self.outputs: tuple[str, ...] = macro.outs
         part = c.add_parts([macro], [None])[0]
-        self._ins = c.add_parts([catalog.get("IN")] * len(self.inputs), [None] * len(self.inputs))
-        self._outs = c.add_parts([catalog.get("OUT")] * len(self.outputs), [None] * len(self.outputs))
+        # IN / OUT as wide as the pins they're on (buses: props["width"])
+        widths = [p.width for p in part.pins]
+        n_in = len(self.inputs)
+        props = [{"width": w} if w > 1 else None for w in widths]
+        self._ins = c.add_parts([catalog.get("IN")] * n_in, [None] * n_in, props=props[:n_in])
+        self._outs = c.add_parts([catalog.get("OUT")] * len(self.outputs), [None] * len(self.outputs), props=props[n_in:])
+        self.wide = any(w > 1 for w in widths)  # has a bus
+        # One bit per *lane* (set_bits, bits, truth tables, the binary pipe): a bus is
+        # its lanes, as if each were a pin of its own -- "d[0]" ... "d[7]", lane 0
+        # first. Without buses these are just the pin names.
+        self.in_lanes = _lane_names(self.inputs, widths[:n_in])
+        self.out_lanes = _lane_names(self.outputs, widths[n_in:])
         for i, sw in enumerate(self._ins):
             c.connect(sw.outputs[0], part.inputs[i])
         for i, led in enumerate(self._outs):
@@ -179,9 +220,9 @@ class Harness:
             "harness for %s: %d in, %d out, %s", macro.title, len(self.inputs), len(self.outputs), c.config
         )
         self.last_ticks: int | None = 0  # what the last settle() took (None: gave up)
-        # pin slots, for set_bits / bits: no handles or Levels per pin on the fast path
-        self._in_slots = np.array([sw.outputs[0].slot for sw in self._ins], np.intp)
-        self._out_slots = np.array([led.inputs[0].slot for led in self._outs], np.intp)
+        # lane slots, for set_bits / bits: no handles or Levels per pin on the fast path
+        self._in_slots = _lane_slots([sw.outputs[0] for sw in self._ins])
+        self._out_slots = _lane_slots([led.inputs[0] for led in self._outs])
 
     # ---- pins by name -------------------------------------------------------------
 
@@ -197,10 +238,11 @@ class Harness:
         raise KeyError(f"{self.macro.title} has no {side} {key!r} (it has: {', '.join(names) or 'none'})")
 
     def set(self, values: Mapping[str | int, Any] | None = None, /, **named: Any) -> None:
-        """Drive inputs. Not run yet: settle() or step() for that."""
+        """Drive inputs. Not run yet: settle() or step() for that. A bus takes a number
+        (its bits), a Level (every lane) or a Logic array of its lanes."""
         for key, value in {**(values or {}), **named}.items():
             i = self._index(self.inputs, key, "input")
-            self._ins[i].outputs[0].state = level(value)
+            _drive(self._ins[i].outputs[0], value)
 
     def set_all(self, values: Iterable[Any]) -> None:
         """Drive every input, in pin order (e.g. a string of bits, "1010")."""
@@ -208,39 +250,55 @@ class Harness:
         if len(values) != len(self.inputs):
             raise ValueError(f"{self.macro.title} has {len(self.inputs)} inputs, got {len(values)} values")
         for sw, value in zip(self._ins, values):
-            sw.outputs[0].state = level(value)
+            _drive(sw.outputs[0], value)
 
     def set_bits(self, bits: str | bytes, start: int = 0) -> None:
         """Drive inputs start, start + 1, ... from a string of 0 / 1 / X / Z, one per
-        pin: the fast way (no Levels made). Inputs past the string keep their values."""
+        pin (per lane of a bus: see in_lanes): the fast way (no Levels made). Inputs
+        past the string keep their values."""
         raw = np.frombuffer(bits.encode() if isinstance(bits, str) else bytes(bits), np.uint8)
         codes = _CODE_OF[raw]
         if start < 0 or start + len(codes) > len(self._in_slots):
             raise ValueError(
-                f"{self.macro.title} has {len(self._in_slots)} inputs; can't set {len(codes)} from #{start + 1}"
+                f"{self.macro.title} has {len(self._in_slots)} {'input lanes' if self.wide else 'inputs'}; "
+                f"can't set {len(codes)} from #{start + 1}"
             )
         if (codes == 255).any():
             raise ValueError(f"{bytes(raw).decode(errors='replace')!r}: levels are 0, 1, X and Z")
         self.circuit.write_pins(self._in_slots[start : start + len(codes)], codes)
 
     def bits(self) -> str:
-        """Every output as one string of 0 / 1 / X / Z, in pin order (the fast read)."""
+        """Every output as one string of 0 / 1 / X / Z, in pin order, a bus lane by lane
+        (out_lanes): the fast read."""
         return _CHAR_OF[self.circuit._pins.states[self._out_slots]].tobytes().decode()
 
-    def get(self, name: str | int) -> Level:
-        """One output's level (as of the last step)."""
+    def get(self, name: str | int) -> Level | Logic:
+        """One output's level (as of the last step); a bus's is a Logic array of its
+        lanes (pijl.logic.ints makes it a number)."""
         return self._outs[self._index(self.outputs, name, "output")].inputs[0].state
 
-    def read(self) -> dict[str, Level]:
+    def read(self) -> dict[str, Level | Logic]:
         """Every output, by name. (Pins sharing a name: the first one wins; use get("#n").)"""
         out: dict[str, Level] = {}
         for name, led in zip(self.outputs, self._outs):
             out.setdefault(name, led.inputs[0].state)
         return out
 
-    def driven(self) -> dict[str, Level]:
+    def driven(self) -> dict[str, Level | Logic]:
         """What the inputs are being driven with right now."""
         return {name: sw.outputs[0].state for name, sw in zip(self.inputs, self._ins)}
+
+    def lanes_driven(self) -> dict[str, Level]:
+        """driven(), a bus lane by lane (in_lanes)."""
+        codes = self.circuit._pins.states[self._in_slots].tolist()
+        return {name: Level(c) for name, c in zip(self.in_lanes, codes)}
+
+    def lanes_read(self) -> dict[str, Level]:
+        """read(), a bus lane by lane (out_lanes)."""
+        out: dict[str, Level] = {}
+        for name, c in zip(self.out_lanes, self.circuit._pins.states[self._out_slots].tolist()):
+            out.setdefault(name, Level(c))
+        return out
 
     # ---- time ---------------------------------------------------------------------
 
@@ -277,15 +335,18 @@ class Harness:
     def truth_table(self, ticks: int | None = None) -> Iterator[tuple[dict[str, Level], dict[str, Level]]]:
         """Every 0/1 combination of the inputs (first input = most significant bit),
         in counting order, with the outputs each settles to. The state carries over
-        from row to row, as it would on a real bench."""
-        n = len(self.inputs)
+        from row to row, as it would on a real bench. A bus counts as its lanes
+        (in_lanes, out_lanes)."""
+        n = len(self.in_lanes)
         if n > 20:
             raise ValueError(f"{n} inputs is {2**n} rows: too many for a truth table")
         for row in range(2**n):
-            bits = [(row >> (n - 1 - i)) & 1 for i in range(n)]
-            self.set_all(bits)
-            outs = self.apply(ticks=ticks)
-            yield self.driven(), outs
+            self.set_bits(format(row, f"0{n}b") if n else "")
+            if ticks is None:
+                self.settle()
+            else:
+                self.step(ticks)
+            yield self.lanes_driven(), self.lanes_read()
 
     @property
     def problems(self) -> list[str]:
