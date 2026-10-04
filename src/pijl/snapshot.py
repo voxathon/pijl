@@ -26,6 +26,9 @@ EndRef = tuple
 # (junction points are None for pin ends: those follow from the part's position;
 # a free end's point is where it is)
 WireData = tuple[EndRef, EndRef, tuple[Point, ...], Point | None, Point | None]
+# A labeled box drawn behind everything (editor-only: the sim never sees it):
+# label, x, y (bottom left), width, height, color name (None: neutral)
+BoxData = tuple[str, float, float, float, float, str | None]
 
 
 @dataclass(frozen=True)
@@ -38,6 +41,7 @@ class Snapshot:
     wire_widths: dict[int, int] = field(
         default_factory=dict
     )  # wire uid -> lanes (a bus); absent = 1
+    boxes: dict[int, BoxData] = field(default_factory=dict)  # box uid -> its data
 
 
 EMPTY = Snapshot({}, {})

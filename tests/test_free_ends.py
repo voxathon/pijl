@@ -254,8 +254,8 @@ def test_right_click_on_empty_board_offers_a_new_wire(board):
     ed.dispatch_event("on_mouse_release", x, y, mouse.RIGHT, 0)
     del ed._open_menu
     assert ed.mode.name == "MENU"
-    ((item,),) = opened
-    assert item.text == "New wire"
+    ((item, *rest),) = opened
+    assert item.text == "New wire" and [i.text for i in rest] == ["New box"]
     ed._close_menu()
     item.action()
     assert ed.mode.name == "WIRING" and ed.wire_start is FREE and ed.wire_start_pos == (400, 400)

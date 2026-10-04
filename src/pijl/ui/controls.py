@@ -70,6 +70,17 @@ CONTROLS: list[tuple[str, list[tuple[str, str]]]] = [
         ],
     ),
     (
+        "Boxes",
+        [
+            ("B", "put a box around the selection, and label it"),
+            ("right-click -> New box", "then drag out its rectangle"),
+            ("click inside a box", "select what's in it (drag there: box-select as usual)"),
+            ("drag a box's header", "move it with everything in it"),
+            ("drag a box's edge / corner", "resize it"),
+            ("double-click the header", "label it (right-click: recolor, remove, ...)"),
+        ],
+    ),
+    (
         "Editing",
         [
             ("Ctrl+C / Ctrl+X", "copy / cut"),

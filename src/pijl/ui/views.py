@@ -59,6 +59,7 @@ class Touched:
 
     parts: set[int] = set()
     wires: set[int] = set()
+    boxes: set[int] = set()  # (boxes.py: no colors, no moves-as-deltas, few of them)
     paint_parts: set[int] = set()
     paint_wires: set[int] = set()
     # Rigid moves (put_down): (part uids, wire uids, dx, dy), where every one of them
@@ -90,14 +91,21 @@ class Touched:
         cls.paint_wires |= uids
 
     @classmethod
+    def take_boxes(cls) -> set[int]:
+        out, cls.boxes = cls.boxes, set()
+        return out
+
+    @classmethod
     def take_moves(cls) -> list[tuple[list[int], list[int], float, float]]:
         out, cls.moved = cls.moved, []
         return out
 
     @classmethod
     def take(cls) -> tuple[set[int], set[int], set[int], set[int]]:
-        """(parts, wires, paint_parts, paint_wires), and start over."""
+        """(parts, wires, paint_parts, paint_wires), and start over (boxes too: take
+        them first with take_boxes to keep them)."""
         cls.moved = []
+        cls.boxes = set()
         out = cls.parts, cls.wires, cls.paint_parts, cls.paint_wires
         cls.parts, cls.wires, cls.paint_parts, cls.paint_wires = (
             set(),
@@ -113,6 +121,8 @@ class Layers:
     buffers by these; the few pyglet shapes left (overlay) draw after all of them."""
 
     def __init__(self) -> None:
+        self.boxes = pyglet.graphics.Group(order=-3)  # boxes (see boxes.py): behind it all
+        self.box_text_order = -2  # their labels' SDFText layer
         self.wire_halo = pyglet.graphics.Group(
             order=-1
         )  # glow under selected / edited wires

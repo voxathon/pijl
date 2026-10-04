@@ -27,6 +27,7 @@ import pyglet
 
 from ..sim import Part, Pin
 from . import theme as T
+from .boxes import BoxView
 from .canvas import Canvas
 from .paint import paint
 from .sdf_text import SDFLabel, SDFText
@@ -51,6 +52,8 @@ SCENE = (
     "wire_views",
     "selection",
     "view_sync",
+    "box_views",
+    "box_text",
 )
 
 
@@ -120,6 +123,11 @@ def build_scene(inst: Part, pin_labels: bool) -> dict[str, Any]:
             specs.append((wire, src, list(bends), dst, body.wire_colors.get(uid)))
         wire_views = dict(zip((s[0] for s in specs), WireView.many(specs, wire_table)))
         paint(_Painted([s[0] for s in specs], part_views, wire_views))
+    box_text = SDFText(world, layers.box_text_order)
+    box_views = {
+        uid: BoxView(uid, data, world, layers, box_text)
+        for uid, data in getattr(body, "boxes", {}).items()
+    }
     return {
         "world": world,
         "layers": layers,
@@ -132,6 +140,8 @@ def build_scene(inst: Part, pin_labels: bool) -> dict[str, Any]:
         "wire_views": wire_views,
         "selection": Selection(),
         "view_sync": ViewSync(),
+        "box_views": box_views,
+        "box_text": box_text,
     }
 
 

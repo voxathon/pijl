@@ -64,6 +64,11 @@ Controls
                            are junctions (its own ends and branches off it): drag to slide
                            them along their wire (Alt: grab a junction hidden under a bend).
                            Enter or a click elsewhere finishes, Esc reverts. See wire_edit.py.
+  Boxes                   labeled rectangles behind the board (boxes.py): B boxes the
+                           selection, or board menu -> New box and drag one out. A click
+                           inside one selects what's in it (dragging there still box-
+                           selects); drag its header to carry it all, its edges to resize;
+                           double-click the header (or right-click) to label / recolor it
   Ctrl+C / Ctrl+X         copy / cut the selected parts (+ wires running between them)
   Ctrl+V                   paste: the copy follows the cursor like a new part; click to place
                            (shift+click: place and keep another copy), Esc/right-click cancels
@@ -111,10 +116,10 @@ import logging
 import math
 import sys
 import time
-from pathlib import Path
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
+from pathlib import Path
 
 import numpy as np
 import pyglet
@@ -123,8 +128,8 @@ from pyglet.math import Mat4
 from pyglet.window import key, mouse
 
 from .. import mods
-from ..macros import Catalog
 from ..logic import ints
+from ..macros import Catalog
 from ..parts import MAX_WIDTH, Choice, Number, Toggle
 from ..parts import load as load_parts
 from ..project import (
@@ -134,12 +139,15 @@ from ..project import (
     remember_project,
     write_atomic,
 )
-from ..storage import NAME_MAX, FormatError, MacroStore, check_name
-from ..sim import FREE, Part, Circuit, Pin, Wire
+from ..sim import FREE, Circuit, Part, Pin, Wire
 from ..snapshot import (
     MACRO,
 )  # library entries (and part kinds) of saved macros: "macro:<name>"
+from ..storage import NAME_MAX, FormatError, MacroStore, check_name
 from . import theme as T
+from .boxes import HEADER as BOX_HEADER
+from .boxes import PAD as BOX_PAD
+from .boxes import BoxView, resized
 from .camera import MIN_LEVEL, Camera
 from .canvas import Canvas
 from .controls import ControlsSheet
@@ -153,9 +161,10 @@ from .document import (
     change_uids,
     changes,
     describe,
-    instantiate,
-    instantiate_keyed,
     free_tree,
+    instantiate,
+    instantiate_boxes,
+    instantiate_keyed,
     internal_wires,
     reshape,
     restore,
@@ -176,23 +185,23 @@ from .sdf_text import SDFText
 from .selection import Selection
 from .spatial import SpatialIndex, ordered
 from .status_bar import BAR_H, StatusBar
-from .text_field import SELECTION_ALPHA, TextMouse, TextTarget, shortcut
 from .sync import ViewSync
+from .text_field import SELECTION_ALPHA, TextMouse, TextTarget, shortcut
 from .views import (
-    PartTable,
-    cell_at,
-    PartView,
     Layers,
+    PartTable,
+    PartView,
     Point,
     Polyline,
     Touched,
     WireTable,
     WireView,
     arc_length_at,
-    points_before,
+    cell_at,
     delete_views,
     lift,
     paused_gc,
+    points_before,
     project_onto,
     put_down,
     set_pin_labels,
@@ -250,6 +259,9 @@ class Mode(Enum):
         auto()
     )  # a Prompt box is up (save as / open / unsaved changes); see _open_prompt
     POPOVER = auto()  # editing a Number setting in its popover; see _open_popover
+    PRESSING_BOX = auto()  # mouse down on a box's header: a click selects it + contents, a drag carries them
+    RESIZING_BOX = auto()  # dragging a box's edge or corner
+    DRAWING_BOX = auto()  # New box: press + drag out its rectangle (DRAGGING once pressed)
 
 
 # Modes where the keys belong to something else (typing, a list), or the board should
@@ -343,6 +355,7 @@ class Editor(pyglet.window.Window):
         self.world = Canvas(pyglet.graphics.Batch())  # parts and wires; see canvas.py
         self.layers = Layers()
         self.text = SDFText(self.world, self.layers.text_order)
+        self.box_text = SDFText(self.world, self.layers.box_text_order)  # box labels
         self.hud = pyglet.graphics.Batch()
         self.library = self._load_library()
         self.picker = PartPicker(
@@ -394,6 +407,8 @@ class Editor(pyglet.window.Window):
 
         self.part_views: dict[Part, PartView] = {}
         self.wire_views: dict[Wire, WireView] = {}
+        self.box_views: dict[int, BoxView] = {}  # by uid (boxes.py)
+        self.next_box_uid = 1  # (never reused within a board's history)
         # Where every view is, for hit testing without looking at all of them (views keep it current)
         self.part_index = SpatialIndex()
         self.wire_index = SpatialIndex()
@@ -432,7 +447,7 @@ class Editor(pyglet.window.Window):
         self.end_from: tuple[Point, Pin | Wire | None] | None = None  # (spot, unplugged from)
         self.end_moved = False
         self.end_skip: set[Wire] = set()  # the carried wire and its branches: no targets
-        self.end_hover = False  # the cursor is a hand over a free end
+        self.end_hover = None  # the cursor shape set for what's under it (a free end, a box edge)
         # the last left press on empty board (time, screen point): a second one there
         # soon after is a double-click, which starts a wire from nothing
         self.empty_click: tuple[float, Point] = (0.0, (0.0, 0.0))
@@ -473,11 +488,23 @@ class Editor(pyglet.window.Window):
         ] = []  # see _begin_move
         self.stretched_tail: list[WireView] = []
         self.box_start: Point = (0.0, 0.0)  # world point where the box drag began
-        self.box_base: tuple[set, set] = (
+        self.box_base: tuple[set, set, set] = (
+            set(),
             set(),
             set(),
         )  # selection to add to (shift) or empty
         self.box_shapes: tuple[shapes.Rectangle, shapes.Box] | None = None
+        # boxes (boxes.py): the box whose inside a box-select started in (a plain click
+        # there selects its contents), the one whose header is pressed / that's being
+        # resized (with the grabbed edges and its rect when grabbed), and the boxes
+        # moving with a drag or carried with a paste
+        self.box_click: BoxView | None = None
+        self.box_press: BoxView | None = None
+        self.header_click: tuple[float, Point] = (0.0, (0.0, 0.0))  # (a double-click labels it)
+        self.resizing: tuple[BoxView, tuple[int, int], tuple] | None = None
+        self.draw_from: Point | None = None  # New box: where the drag started
+        self.drag_boxes: list[BoxView] = []
+        self.placing_boxes: list[BoxView] = []
         self.hud_box_group = pyglet.graphics.Group(order=8)  # below menus
         # prompt box (Mode.PROMPT)
         self.prompt: Prompt | None = None
@@ -741,7 +768,99 @@ class Editor(pyglet.window.Window):
         self.remove_parts(
             sorted(self.selection.parts, key=lambda v: v.part.uid), unplug=True
         )
+        self.remove_boxes(list(self.selection.boxes))
         self.selection.clear()
+
+    # ---- boxes (boxes.py) ------------------------------------------------------
+
+    def add_box(self, data: tuple, uid: int | None = None) -> BoxView:
+        if uid is None:
+            uid = self.next_box_uid
+        self.next_box_uid = max(self.next_box_uid, uid + 1)
+        view = self.box_views[uid] = BoxView(uid, data, self.world, self.layers, self.box_text)
+        Touched.boxes.add(uid)
+        return view
+
+    def remove_boxes(self, views: list[BoxView]) -> None:
+        for view in views:
+            self.selection.discard(view)
+            view.delete()
+            del self.box_views[view.uid]
+            Touched.boxes.add(view.uid)
+
+    def box_at(self, wx: float, wy: float) -> BoxView | None:
+        """The box under this point: the smallest, if they overlap (nested boxes win)."""
+        hits = [b for b in self.box_views.values() if b.contains(wx, wy)]
+        return min(hits, key=lambda b: b.w * b.h) if hits else None
+
+    def box_edge_at(self, wx: float, wy: float) -> tuple[BoxView, tuple[int, int]] | None:
+        """A box edge or corner near this point, to resize by (the smallest box's)."""
+        hits = [
+            (b, edges)
+            for b in self.box_views.values()
+            if (edges := b.edges_at(wx, wy, self.slop * 0.6)) is not None
+        ]
+        return min(hits, key=lambda h: h[0].w * h[0].h) if hits else None
+
+    def box_contents(self, box: BoxView) -> tuple[set, set, set]:
+        """(parts, wires, boxes) inside `box`, itself included: parts whose middle is in
+        it, wires and boxes wholly in it. What's in a box is only ever where things are."""
+        x0, y0, x1, y1 = box.rect
+        parts = {
+            v
+            for v in self.part_index.query(x0, y0, x1, y1)
+            if x0 <= v.x + v.w / 2 <= x1 and y0 <= v.y + v.h / 2 <= y1
+        }
+        wires = {v for v in self.wire_index.query(x0, y0, x1, y1) if v.inside(x0, y0, x1, y1)}
+        boxes = {b for b in self.box_views.values() if _within(b.rect, box.rect)}
+        return parts, wires, boxes
+
+    def _select_box(self, box: BoxView, add: bool = False) -> None:
+        parts, wires, boxes = self.box_contents(box)
+        if add:
+            sel = self.selection
+            parts, wires, boxes = sel.parts | parts, sel.wires | wires, sel.boxes | boxes
+        self.selection.set(parts, wires, boxes)
+
+    def _wrap_selection(self) -> None:
+        """A new box around the selection (B), and type its label."""
+        sel = self.selection
+        rects = [(v.x, v.y, v.x + v.w, v.y + v.h) for v in sel.parts]
+        rects += [b.rect for b in sel.boxes]
+        for v in sel.wires:
+            xs, ys = zip(*v.points)
+            rects.append((min(xs), min(ys), max(xs), max(ys)))
+        if not rects:
+            return
+        x0 = min(r[0] for r in rects) - BOX_PAD
+        y0 = min(r[1] for r in rects) - BOX_PAD
+        x1 = max(r[2] for r in rects) + BOX_PAD
+        y1 = max(r[3] for r in rects) + BOX_PAD + BOX_HEADER
+        step = T.GRID  # (on the grid, so it lines up with what's placed on it)
+        x0, y0 = math.floor(x0 / step) * step, math.floor(y0 / step) * step
+        x1, y1 = math.ceil(x1 / step) * step, math.ceil(y1 / step) * step
+        box = self.add_box(("", x0, y0, x1 - x0, y1 - y0, None))
+        self.selection.set(sel.parts, sel.wires, sel.boxes | {box})
+        self._start_edit(box)
+
+    def _box_items(self, box: BoxView) -> list[MenuItem]:
+        """Menu rows for a box (its header's menu; the board menu inside it)."""
+
+        def recolor(c: str | None) -> None:
+            box.set_color(c)
+            Touched.boxes.add(box.uid)
+
+        def delete_all() -> None:
+            self._select_box(box)
+            self.delete_selection()
+
+        return [
+            MenuItem("Label box...", lambda: self._start_edit(box)),
+            MenuItem("Recolor box", submenu=self._recolor_items(box.color, recolor)),
+            MenuItem("Select what's in it", lambda: self._select_box(box)),
+            MenuItem("Remove box (keep what's in it)", lambda: self.remove_boxes([box])),
+            MenuItem("Delete box and what's in it", delete_all, danger=True),
+        ]
 
     def pin_pos(self, pin: Pin) -> Point:
         return self.part_views[pin.part].pin_pos(pin)
@@ -1090,6 +1209,16 @@ class Editor(pyglet.window.Window):
                 self._cancel()
             return
 
+        if self.mode is Mode.DRAWING_BOX:
+            if button == mouse.LEFT and not in_picker and self.draw_from is None:
+                self.draw_from = self.snapped(wx, wy)
+                box = self.add_box(("", *self.draw_from, 1.0, 1.0, None))
+                self.resizing = (box, (1, 1), (box.x, box.y, box.w, box.h))
+                self._update_drawn_box()
+            elif button == mouse.RIGHT:
+                self._cancel()
+            return
+
         if self.mode in (
             Mode.PRESSING_PART,
             Mode.DRAGGING_PART,
@@ -1097,6 +1226,8 @@ class Editor(pyglet.window.Window):
             Mode.PRESSING_WIRE,
             Mode.PICKER_PRESS,
             Mode.PICKER_DRAG,
+            Mode.PRESSING_BOX,
+            Mode.RESIZING_BOX,
         ):
             return  # another button while the left one is held down: ignore (middle already panned)
 
@@ -1140,6 +1271,18 @@ class Editor(pyglet.window.Window):
                         (x, y),
                     )
                     self.mode = Mode.PRESSING_WIRE
+            elif hit := self.box_edge_at(wx, wy):
+                box, edges = hit
+                self.resizing = (box, edges, (box.x, box.y, box.w, box.h))
+                self.mode = Mode.RESIZING_BOX
+            elif (box := self.box_at(wx, wy)) and box.in_header(wx, wy):
+                if modifiers & key.MOD_SHIFT and not modifiers & key.MOD_CTRL:
+                    self._select_box(box, add=True)
+                    return
+                self.box_press = box
+                self.grab = (box.x - wx, box.y - wy)
+                self.press_at = (x, y)
+                self.mode = Mode.PRESSING_BOX
             elif self._double_click_empty(x, y) and not (
                 modifiers & key.MOD_SHIFT and not modifiers & key.MOD_CTRL
             ):  # (Shift alone adds to the selection; Ctrl snaps, Ctrl+Shift to the subgrid)
@@ -1148,12 +1291,17 @@ class Editor(pyglet.window.Window):
                 self.empty_click = (time.monotonic(), (x, y))
                 shift = modifiers & key.MOD_SHIFT
                 self.box_base = (
-                    (set(self.selection.parts), set(self.selection.wires))
+                    (
+                        set(self.selection.parts),
+                        set(self.selection.wires),
+                        set(self.selection.boxes),
+                    )
                     if shift
-                    else (set(), set())
+                    else (set(), set(), set())
                 )
                 if not shift:
                     self.selection.clear()  # a plain click on empty space ends here: cleared
+                self.box_click = self.box_at(wx, wy)  # (let go without dragging: its contents)
                 self.box_start = (wx, wy)
                 self.press_at = (x, y)
                 self.mode = Mode.BOX_SELECTING
@@ -1190,7 +1338,16 @@ class Editor(pyglet.window.Window):
         def new_wire() -> None:
             self._start_wiring(FREE, self.snapped(wx, wy) if self.snapping else at)
 
-        self._open_menu(x, y, [MenuItem("New wire", new_wire)])
+        def new_box() -> None:
+            self.mode, self.draw_from = Mode.DRAWING_BOX, None
+            self.set_mouse_cursor(self.get_system_mouse_cursor(self.CURSOR_CROSSHAIR))
+
+        items = [MenuItem("New wire", new_wire), MenuItem("New box", new_box)]
+        if self.selection:
+            items.append(MenuItem("Box the selection", self._wrap_selection))
+        if box := self.box_at(wx, wy):
+            items += self._box_items(box)
+        self._open_menu(x, y, items)
 
     def _item_menu(
         self, x: float, y: float, wx: float, wy: float, modifiers: int
@@ -1279,6 +1436,11 @@ class Editor(pyglet.window.Window):
                     MenuItem("Delete", lambda: self.cut_wire(wire, at), danger=True),
                 ],
             )
+        elif (box := self.box_at(wx, wy)) and box.in_header(wx, wy):
+            # (only on the header: inside, right-drag still pans, and a right-click
+            # gets the board menu with the box's rows in it)
+            self.selection.set(boxes=[box])
+            self._open_menu(x, y, self._box_items(box))
         else:
             return False
         return True
@@ -1402,6 +1564,10 @@ class Editor(pyglet.window.Window):
             px, py = self.press_at
             if abs(x - px) + abs(y - py) >= T.DRAG_THRESHOLD_PX:
                 self._begin_group_drag(self.active)
+        elif self.mode is Mode.PRESSING_BOX:
+            px, py = self.press_at
+            if abs(x - px) + abs(y - py) >= T.DRAG_THRESHOLD_PX:
+                self._begin_group_drag(self.box_press)
         elif self.mode is Mode.PRESSING_WIRE:
             px, py = self.press_at
             if abs(x - px) + abs(y - py) >= T.DRAG_THRESHOLD_PX:
@@ -1435,11 +1601,16 @@ class Editor(pyglet.window.Window):
             self.prompt.hover(x, y)
             return
         if self.mode is Mode.IDLE and not self.inside:
-            over = self.free_end_at(*self.camera.screen_to_world(x, y)) is not None
+            wx, wy = self.camera.screen_to_world(x, y)
+            over = None
+            if self.free_end_at(wx, wy) is not None:
+                over = self.CURSOR_HAND
+            elif self.box_views and not self.part_at(wx, wy) and (hit := self.box_edge_at(wx, wy)):
+                over = _RESIZE_CURSORS[hit[1]]
             if over != self.end_hover:
                 self.end_hover = over
                 self.set_mouse_cursor(
-                    self.get_system_mouse_cursor(self.CURSOR_HAND) if over else None
+                    self.get_system_mouse_cursor(over) if over else None
                 )
         hover_ok = self.mode in (
             Mode.IDLE,
@@ -1490,7 +1661,31 @@ class Editor(pyglet.window.Window):
                 self.selection.set(parts=[self.active])
             self.mode, self.active = Mode.IDLE, None
         elif button == mouse.LEFT and self.mode is Mode.BOX_SELECTING:
+            if self.box_shapes is None and self.box_click is not None:
+                # a click, not a drag, inside a box: what's in it
+                self._select_box(self.box_click, add=bool(modifiers & key.MOD_SHIFT))
             self._end_box()
+        elif button == mouse.LEFT and self.mode is Mode.PRESSING_BOX:
+            box, self.box_press, self.mode = self.box_press, None, Mode.IDLE
+            t, (px, py) = self.header_click
+            if (
+                time.monotonic() - t < DOUBLE_CLICK
+                and abs(x - px) + abs(y - py) < T.DRAG_THRESHOLD_PX
+            ):
+                self.header_click = (0.0, (0.0, 0.0))
+                self._start_edit(box)
+            else:
+                self.header_click = (time.monotonic(), (x, y))
+                self._select_box(box)
+        elif button == mouse.LEFT and self.mode is Mode.RESIZING_BOX:
+            self._end_resize()
+        elif button == mouse.LEFT and self.mode is Mode.DRAWING_BOX and self.resizing:
+            box = self._end_resize()
+            self.set_mouse_cursor(None)
+            if box.w < 2 * T.GRID or box.h < 2 * T.GRID:  # a click: a box of a usual size
+                box.set_rect(box.x, box.y - 80, 160, 80 + box.h)
+            self.selection.set(boxes=[box])
+            self._start_edit(box)
         elif button == mouse.LEFT and self.mode is Mode.PRESSING_WIRE:
             self.selection.set(wires=[self.pressed_wire])  # a click, not a drag: select
             self.wire_click = (time.monotonic(), (x, y))
@@ -1641,7 +1836,9 @@ class Editor(pyglet.window.Window):
         elif symbol in (key.DELETE, key.BACKSPACE) and self.mode is Mode.IDLE:
             self.delete_selection()
         elif symbol == key.A and modifiers & key.MOD_CTRL and self.mode is Mode.IDLE:
-            self.selection.set(self.part_views.values(), self.wire_views.values())
+            self.selection.set(
+                self.part_views.values(), self.wire_views.values(), self.box_views.values()
+            )
         elif symbol == key.S and modifiers & key.MOD_CTRL and self.mode is Mode.IDLE:
             self._save_as()  # prefilled with the current name: Enter just saves
         elif symbol == key.O and modifiers & key.MOD_CTRL and self.mode is Mode.IDLE:
@@ -1660,8 +1857,10 @@ class Editor(pyglet.window.Window):
             and symbol in (key.C, key.X)
             and self.mode is Mode.IDLE
         ):
-            if self.selection.parts or self.selection.wires:
-                self.clipboard = capture(self, self.selection.parts, self.selection.wires)
+            if self.selection:
+                self.clipboard = capture(
+                    self, self.selection.parts, self.selection.wires, self.selection.boxes
+                )
                 if symbol == key.X:
                     self.delete_selection()
         elif (
@@ -1673,6 +1872,8 @@ class Editor(pyglet.window.Window):
             self._start_paste()
         elif modifiers & key.MOD_CTRL and symbol == key.D and self.mode is Mode.IDLE:
             self._duplicate()
+        elif symbol == key.B and not modifiers & key.MOD_CTRL and self.mode is Mode.IDLE:
+            self._wrap_selection()
         elif symbol == key.BACKSPACE and self.mode is Mode.WIRING:
             self._pop_bend_or_cancel()
         elif symbol == key.TAB:
@@ -2070,10 +2271,11 @@ class Editor(pyglet.window.Window):
         self.set_mouse_cursor(None)
         self.mode = Mode.IDLE
 
-    def _start_edit(self, view: PartView) -> None:
+    def _start_edit(self, view: PartView | BoxView) -> None:
         self.mode = Mode.EDITING_LABEL
         self.edit_view = view
-        self.edit = LineEdit(view.part.label, LABEL_MAX)
+        label = view.label if isinstance(view, BoxView) else view.part.label
+        self.edit = LineEdit(label, LABEL_MAX)
         self.edit.select_all()  # typing replaces the old label
         self.caret = shapes.Rectangle(
             0, 0, 1, 1, color=T.CARET, batch=self.world.batch, group=self.layers.overlay
@@ -2126,10 +2328,14 @@ class Editor(pyglet.window.Window):
 
     def _finish_edit(self, commit: bool) -> None:
         view = self.edit_view
-        if commit:
-            view.part.label = self.edit.text.strip()
-        view.refresh_name()  # shows the committed label, or reverts to the old one
-        view.name.move_to(*view.name_pos())
+        if isinstance(view, BoxView):
+            view.set_label(self.edit.text.strip() if commit else view.label)
+            Touched.boxes.add(view.uid)
+        else:
+            if commit:
+                view.part.label = self.edit.text.strip()
+            view.refresh_name()  # shows the committed label, or reverts to the old one
+            view.name.move_to(*view.name_pos())
         pyglet.clock.unschedule(self._blink_caret)
         self.caret.delete()
         self.edit_sel.delete()
@@ -2622,7 +2828,7 @@ class Editor(pyglet.window.Window):
         paint(
             self, {v.part.uid for v in views}, {w.wire.uid for w in wires}
         )  # ghosts show their colors too
-        self._carry(views, wires, again=self._start_paste)
+        self._carry(views, wires, again=self._start_paste, boxes=instantiate_boxes(self, self.clipboard))
         self.placing_kind = None
         self.column = None
 
@@ -2700,24 +2906,34 @@ class Editor(pyglet.window.Window):
         self.selection.set(t.all_parts(), t.all_wires())
         t.signature = self._selection_signature()
 
-    def _carry(self, views: list[PartView], wires: list[WireView], again) -> None:
-        """Attach new (ghost) parts + wires to the cursor, centered on it, until a click."""
+    def _carry(
+        self, views: list[PartView], wires: list[WireView], again, boxes: list[BoxView] = ()
+    ) -> None:
+        """Attach new (ghost) parts + wires (+ boxes) to the cursor, centered on it, until a click."""
         self.selection.clear()
         for v in views:
             v.set_ghost(True)
         for w in wires:
             w.set_ghost(True)
+        for b in boxes:
+            b.set_ghost(True)
         pts = [p for w in wires for p in w.points]
         xs = [x for v in views for x in (v.x, v.x + v.w)] + [p[0] for p in pts]
         ys = [y for v in views for y in (v.y, v.y + v.h)] + [p[1] for p in pts]
+        xs += [x for b in boxes for x in b.rect[::2]]
+        ys += [y for b in boxes for y in b.rect[1::2]]
         x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
         # The first part is the anchor (wires alone: the first wire's start): Ctrl snaps
         # *its* origin, so a pasted layout that was on the grid lands on the grid again.
-        ax, ay = (views[0].x, views[0].y) if views else wires[0].points[0]
+        if views:
+            ax, ay = views[0].x, views[0].y
+        else:
+            ax, ay = wires[0].points[0] if wires else (boxes[0].x, boxes[0].y)
         self.grab = (ax - (x0 + x1) / 2, ay - (y0 + y1) / 2)
         self.drag_origin = (ax, ay)
-        self._begin_move(views, wires)
+        self._begin_move(views, wires, boxes)
         self.placing_views, self.placing_wires, self.place_again = views, wires, again
+        self.placing_boxes = list(boxes)
         self.mode = Mode.PLACING_PART
         self._follow_cursor()
 
@@ -2733,6 +2949,9 @@ class Editor(pyglet.window.Window):
             self.circuit.open_part(v.part)
         for w in wires:
             w.set_ghost(False)
+        boxes, self.placing_boxes = self.placing_boxes, []
+        for b in boxes:
+            b.set_ghost(False)
         self.placing_views, self.placing_wires, self.place_again = [], [], None
         kind, column = self.placing_kind, self.column
         self.placing_kind, self.column = None, None
@@ -2741,9 +2960,9 @@ class Editor(pyglet.window.Window):
             self._start_placing(kind, column.rows, column.gap[DOWN])
         elif again:
             place_again()
-        elif wires or len(views) > 1:
+        elif wires or boxes or len(views) > 1:
             self.selection.set(
-                views, wires
+                views, wires, boxes
             )  # a paste stays selected, ready to move/delete
             if column is not None:
                 # A placed column is a Ctrl+D block: Ctrl+scroll keeps spacing it, Ctrl+D
@@ -2763,25 +2982,38 @@ class Editor(pyglet.window.Window):
         for uid in _pin_part_uids((d,) for side in change[1][:2] for d in side.values()):
             Touched.part(uid)
 
-    def _begin_group_drag(self, grabbed: PartView) -> None:
-        """Start moving the selection, or just `grabbed` if it isn't part of it."""
+    def _begin_group_drag(self, grabbed: PartView | BoxView) -> None:
+        """Start moving the selection, or just `grabbed` if it isn't part of it (a box:
+        with what's in it)."""
         if grabbed not in self.selection:
-            self.selection.set(parts=[grabbed])
+            if isinstance(grabbed, BoxView):
+                self._select_box(grabbed)
+            else:
+                self.selection.set(parts=[grabbed])
         group = self.selection.parts
         self.drag_origin = (grabbed.x, grabbed.y)
         # Wires with BOTH ends in the group move rigidly with it, bends included.
         # Wires with one end outside keep their bends; only that end follows.
-        self._begin_move(list(group), internal_wires(self, group))
+        # (Selected wires on no part at all go along too.)
+        wires = set(internal_wires(self, group))
+        wires.update(v for v in self.selection.wires if all(e is v.wire for e in v.wire.ends))
+        self._begin_move(list(group), sorted(wires, key=lambda v: v.wire.uid), list(self.selection.boxes))
+        self.box_press = None
         self.mode = Mode.DRAGGING_PART
 
-    def _begin_move(self, views: list[PartView], wires: list[WireView]) -> None:
+    def _begin_move(
+        self, views: list[PartView], wires: list[WireView], boxes: list[BoxView] = ()
+    ) -> None:
         """Start moving `views` and the `wires` running inside the group. They're *lifted*
         (see canvas.py): until _end_move they're drawn shifted by the canvas's offset and
         keep their old coordinates, so a mouse move costs one offset change -- plus
         re-shaping the few wires stretched between the group and the rest of the board."""
         self.drag_group, self.drag_wires = list(views), list(wires)
+        self.drag_boxes = list(boxes)
         self.drag_delta = (0.0, 0.0)
         lift(views, wires, True)
+        for box in self.drag_boxes:
+            box.set_lifted(True)
         c, parts, inside = (
             self.circuit,
             {v.part for v in views},
@@ -2837,6 +3069,12 @@ class Editor(pyglet.window.Window):
         self.world.offset = (0.0, 0.0)
         # (lifted, they kept their coordinates: from where they were picked up)
         put_down(self.drag_group, self.drag_wires, dx, dy)
+        for box in self.drag_boxes:
+            box.set_lifted(False)
+            if dx or dy:
+                box.move_by(dx, dy)
+                Touched.boxes.add(box.uid)
+        self.drag_boxes = []
         # exact final attachment, as if it had been moved step by step
         live = [v for v, *_ in self.stretched if v.wire in self.wire_views]
         self.refresh_wires([*live, *self.drag_wires])
@@ -2889,7 +3127,8 @@ class Editor(pyglet.window.Window):
             self.camera.screen_to_world(x0, y0),
             self.camera.screen_to_world(x1, y1),
         )
-        base_parts, base_wires = self.box_base
+        base_parts, base_wires, base_boxes = self.box_base
+        box = (wx0, wy0, wx1, wy1)
         self.selection.set(
             base_parts
             | {
@@ -2903,6 +3142,7 @@ class Editor(pyglet.window.Window):
                 for v in self.wire_index.query(wx0, wy0, wx1, wy1)
                 if v.inside(wx0, wy0, wx1, wy1)
             },
+            base_boxes | {b for b in self.box_views.values() if _within(b.rect, box)},
         )
 
     def _end_box(self) -> None:
@@ -2910,7 +3150,24 @@ class Editor(pyglet.window.Window):
             for shape in self.box_shapes:
                 shape.delete()
             self.box_shapes = None
+        self.box_click = None
         self.mode = Mode.IDLE
+
+    def _update_resize(self) -> None:
+        box, edges, rect = self.resizing
+        box.set_rect(*resized(rect, edges, self.snapped(*self.camera.screen_to_world(*self.mouse))))
+
+    def _update_drawn_box(self) -> None:
+        """New box: the rectangle from where the drag started to the cursor."""
+        box = self.resizing[0]
+        (ax, ay), (bx, by) = self.draw_from, self.snapped(*self.camera.screen_to_world(*self.mouse))
+        box.set_rect(min(ax, bx), min(ay, by), max(abs(bx - ax), 1.0), max(abs(by - ay), 1.0))
+
+    def _end_resize(self) -> BoxView:
+        box = self.resizing[0]
+        Touched.boxes.add(box.uid)
+        self.resizing, self.draw_from, self.mode = None, None, Mode.IDLE
+        return box
 
     @property
     def snapping(self) -> bool:
@@ -2943,6 +3200,10 @@ class Editor(pyglet.window.Window):
             self._move_group()
         elif self.mode is Mode.BOX_SELECTING:
             self._update_box()
+        elif self.mode is Mode.RESIZING_BOX:
+            self._update_resize()
+        elif self.mode is Mode.DRAWING_BOX and self.resizing:
+            self._update_drawn_box()
         elif self.mode is Mode.WIRING:
             self._update_preview()
         elif self.mode is Mode.DRAGGING_END:
@@ -3092,6 +3353,16 @@ class Editor(pyglet.window.Window):
             self._close_prompt()
         elif self.mode is Mode.POPOVER:
             self._close_popover()
+        elif self.mode is Mode.RESIZING_BOX:
+            box, _, rect = self.resizing
+            box.set_rect(*rect)  # never mind: back as it was
+            self.resizing = None
+        elif self.mode is Mode.DRAWING_BOX:
+            if self.resizing:
+                self.remove_boxes([self.resizing[0]])
+            self.resizing = self.draw_from = None
+            self.set_mouse_cursor(None)
+        self.box_press = None
         self.pressed_wire = None
         self.picker_row = None
         if self.mode is Mode.DRAGGING_END:
@@ -3104,6 +3375,8 @@ class Editor(pyglet.window.Window):
             left = [w for w in self.placing_wires if self.wire_views.get(w.wire) is w]
             if left:
                 self.remove_wires(left)  # ... but not the ones on no part
+            self.remove_boxes(self.placing_boxes)
+            self.placing_boxes = []
             self.placing_views, self.placing_wires, self.place_again = [], [], None
             self.placing_kind, self.column = None, None
         if self.preview is not None:
@@ -3133,7 +3406,7 @@ class Editor(pyglet.window.Window):
             and self.history is not None
             and self.mode is Mode.IDLE
             and not self.inside  # (nothing there is the board's)
-            and (Touched.parts or Touched.wires or Touched.moved)
+            and (Touched.parts or Touched.wires or Touched.moved or Touched.boxes)
         ):
             self._record()
         if event_type in self._EDIT_EVENTS and self.history is not None:
@@ -3245,6 +3518,7 @@ class Editor(pyglet.window.Window):
     def _board_bounds(self) -> tuple[float, float, float, float] | None:
         """The box around every part and wire, or None for an empty board."""
         boxes = [b for b in (self.part_index.bounds(), self.wire_index.bounds()) if b]
+        boxes += [b.rect for b in self.box_views.values()]
         if not boxes:
             return None
         return (
@@ -3381,9 +3655,10 @@ class Editor(pyglet.window.Window):
 
     def _record_touched(self, amend: bool) -> bool:
         moves = Touched.take_moves()
+        boxes = Touched.take_boxes()
         parts, wires, paint_parts, paint_wires = Touched.take()
         moves = self._move_steps(moves, parts, wires, amend)
-        now = changes(self, parts, wires)
+        now = changes(self, parts, wires, boxes)
         # parts at the ends of a changed wire, before and after: their pins' colors may change
         # (before: from the history, so ask before recording updates it)
         before = self.history.current.wires
@@ -3448,6 +3723,7 @@ class Editor(pyglet.window.Window):
         self.selection.clear()
         self.tiling = None
         restore(self, EMPTY)  # removes (and closes) everything
+        self.next_box_uid = 1
         # A fresh circuit and view tables: their slots are never reused (a stale handle
         # mustn't see a newer part), so without this every board opened since start
         # would still take up its rows.
@@ -4030,3 +4306,26 @@ def run(project: str | None = None, settle_ticks: int = SETTLE_TICKS) -> bool:
     mods.settled()  # (it's up: no crash to blame on the mods)
     pyglet.app.run()
     return editor.relaunch
+
+
+def _within(inner: tuple, outer: tuple) -> bool:
+    """Is rect `inner` (x0, y0, x1, y1) wholly in `outer`?"""
+    return (
+        outer[0] <= inner[0]
+        and outer[1] <= inner[1]
+        and inner[2] <= outer[2]
+        and inner[3] <= outer[3]
+    )
+
+
+# the cursor over a box's edges (boxes.BoxView.edges_at)
+_RESIZE_CURSORS = {
+    (-1, 0): pyglet.window.Window.CURSOR_SIZE_LEFT_RIGHT,
+    (1, 0): pyglet.window.Window.CURSOR_SIZE_LEFT_RIGHT,
+    (0, -1): pyglet.window.Window.CURSOR_SIZE_UP_DOWN,
+    (0, 1): pyglet.window.Window.CURSOR_SIZE_UP_DOWN,
+    (-1, -1): pyglet.window.Window.CURSOR_SIZE_DOWN_LEFT,
+    (1, -1): pyglet.window.Window.CURSOR_SIZE_DOWN_RIGHT,
+    (-1, 1): pyglet.window.Window.CURSOR_SIZE_UP_LEFT,
+    (1, 1): pyglet.window.Window.CURSOR_SIZE_UP_RIGHT,
+}

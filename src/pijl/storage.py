@@ -157,7 +157,36 @@ def encode(
         head["title"] = title
     if mods:
         head["mods"] = list(mods)
-    return {**head, "parts": parts, "wires": wires}
+    out = {**head, "parts": parts, "wires": wires}
+    if snap.boxes:
+        out["boxes"] = [_encode_box(uid, snap.boxes[uid]) for uid in sorted(snap.boxes)]
+    return out
+
+
+def _encode_box(uid: int, box: tuple) -> dict[str, Any]:
+    label, x, y, w, h, color = box
+    d: dict[str, Any] = {"uid": uid}
+    if label:
+        d["label"] = label
+    d["rect"] = [_num(x), _num(y), _num(w), _num(h)]
+    if color:
+        d["color"] = color
+    return d
+
+
+def _decode_box(d: Any) -> tuple[int, tuple]:
+    uid = _int(d["uid"])
+    label, color = d.get("label", ""), d.get("color")
+    if not isinstance(label, str) or not (color is None or isinstance(color, str)):
+        raise ValueError("bad label or color")
+    rect = d["rect"]
+    if not (isinstance(rect, list) and len(rect) == 4):
+        raise TypeError(f"{rect!r} isn't a rectangle")
+    x, y = _pair(rect[:2])
+    w, h = _pair(rect[2:])
+    if w <= 0 or h <= 0:
+        raise ValueError("empty rectangle")
+    return uid, (label, x, y, w, h, color or None)
 
 
 def decode(data: Any, types: Registry) -> Loaded:
@@ -271,6 +300,14 @@ def decode(data: Any, types: Registry) -> Loaded:
             warn(f"a wire was unreadable ({_why(e)}), dropped")
     if lost:
         warn(f"{lost} wire(s) lost an end (a dropped part or wire), dropped")
+    for d in _list(data, "boxes"):
+        try:
+            uid, box = _decode_box(d)
+            if uid in out.snapshot.boxes:
+                raise ValueError(f"duplicate uid {uid}")
+            out.snapshot.boxes[uid] = box
+        except (KeyError, TypeError, ValueError) as e:
+            warn(f"a box was unreadable ({_why(e)}), dropped")
     return out
 
 
@@ -304,6 +341,7 @@ def dumps(data: dict[str, Any]) -> str:
         + block("parts")
         + ",\n"
         + block("wires")
+        + (",\n" + block("boxes") if data.get("boxes") else "")
         + "\n}\n"
     )
 
