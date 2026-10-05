@@ -63,6 +63,79 @@ files are copied over the old ones, and anything else in its folder stays.
   place. The mod draws nothing itself: its parts use `Look.size`, `Look.face` and
   the `face()` hook from the part contract (`pijl/parts/contract.py`), which part
   scripts can use too.
+- **netlist** ("Netlists") wires up a box from text. Type it in the console (`):
+  a line that isn't a command is a netlist line, for the console's box. `run NAME`
+  and a box can keep a whole script on itself: `edit` opens it in your text editor
+  and `run` runs it (also in the box's right-click menu, under Netlist). The script
+  is saved, copied and undone along with the box. `CLK.q -> R*.clk` fans one pin out,
+  `A*.q -> B*.d` wires pairs in name order, `regs/R0.q` reaches into the box
+  labeled "regs", `<NAND>*.a` picks parts by kind, and `chain ADD*: cout -> cin`
+  links each part to the next. `net DATA: R*.q, ALU.a` makes all of those pins
+  one net (several outputs too, for tristate buses), and `bus DATA: ...` does the
+  same with a straight free-floating spine that every pin taps onto. Pins that are
+  wired already join a net through the wires they have. A part's name is its label, or its kind if it has
+  none, looked for in the box first and then on the whole board. Pins go by name
+  or by `in1`, `in2`, ... `out1`, ... counted from the top. Case doesn't matter. Wires are
+  routed around parts and other wires; a pin feeding several inputs gets a trunk
+  with branches. An input it can't reach gets a straight-ish orange wire instead. A run wires everything or nothing, as one undo step. The language is
+  described at the top of `netlist/lang.py`.
+
+## Console commands
+
+The console (` in the editor) runs commands. Add your own from a mod:
+
+```python
+@after_import("pijl.ui.console")
+def _(con):
+    @con.command("hello", "hello [NAME]: say hello")
+    def hello(ctx, rest):
+        ctx.say(f"hello {rest or 'world'}")   # ctx.error(...) prints it red
+```
+
+A command gets a context: `ctx.editor`, `ctx.box` (the box the line is for: the one
+box selected, else the box under the cursor, else None for the whole board) and
+`ctx.say(text, kind)`. A line's first word picks the command, case ignored. A line
+that doesn't start with one goes to `con.fallback(fn)` handlers, newest first, until
+one returns True (that's how netlist takes bare lines). If a command raises, the
+error is printed in the console and logged, and the editor carries on. Edits a
+command makes are one undo step, like any other.
+
+## Menu rows
+
+Add rows to the editor's right-click menus without patching it:
+
+```python
+@after_import("pijl.ui.menus")
+def _(menus):
+    from pijl.ui.menu import MenuItem
+
+    @menus.items("box")                 # or "part", "wire", "board"
+    def rows(editor, box):
+        return [MenuItem("Shout", lambda: editor._notice(box.label.upper()))]
+```
+
+The function gets the editor and what the menu is for: a list of part views for
+"part" (one, or a selection of parts of one kind), the wire view for "wire", the box
+view for "box" (its header's menu, and the board menu inside it), and the world point
+`(x, y)` for "board". Your rows go in above the menu's Delete rows. It's asked each
+time the menu opens. If it raises, the error is logged and shown, and the menu opens
+without your rows. Whatever a row's action changes on the board is one undo step.
+
+## Data on boxes
+
+A box can carry data for mods. It's saved with the box (also inside macro files),
+goes along when the box is copied, and every change is an undo step:
+
+```python
+editor.set_box_data(box, "my_mod", {"anything": ["JSON", 1, True]})
+box.mod_data.get("my_mod")              # read it
+editor.set_box_data(box, "my_mod", None)  # drop it
+```
+
+Use your mod's name as the key. Values must be plain JSON (`set_box_data` stores a
+copy and raises TypeError otherwise). Don't change `box.mod_data` in place: the undo
+history shares it. A board saved with data from a mod that isn't loaded keeps that
+data untouched.
 
 ## Logging
 

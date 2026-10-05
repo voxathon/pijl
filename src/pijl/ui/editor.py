@@ -134,6 +134,7 @@ from ..parts import MAX_WIDTH, Choice, Number, Toggle
 from ..parts import load as load_parts
 from ..project import (
     Project,
+    data_root,
     last_project,
     project_names,
     remember_project,
@@ -150,6 +151,7 @@ from .boxes import PAD as BOX_PAD
 from .boxes import BoxView, resized
 from .camera import MIN_LEVEL, Camera
 from .canvas import Canvas
+from .console import Console, Context, run_line
 from .controls import ControlsSheet
 from .document import (
     EMPTY,
@@ -176,6 +178,7 @@ from .grid import Grid, snap_step
 from .inside import Level, PinProbe, build_scene, free_scene, put_scene, take_scene
 from .library import Library, LibraryHistory, Step
 from .line_edit import LineEdit
+from . import menus
 from .menu import RAINBOW, ContextMenu, MenuItem
 from .paint import paint
 from .picker import PartPicker, Row
@@ -383,6 +386,13 @@ class Editor(pyglet.window.Window):
             batch=self.hud,
         )
         self.bar = StatusBar(self.hud, self.width)
+        # the console (` opens it: console.py)
+        self.console = Console(self.hud, data_root() / "console_history.txt")
+        self._console_at: tuple | None = None  # where it was laid out last
+        self._console_box = None  # the box its lines are for, last time it looked
+        # when ` opened / closed it: its own character comes right after as text (on
+        # most layouts: a dead key sends none, so only text that quick is dropped)
+        self._eat_text = 0.0
         # the width and value of the bus under the cursor (see _update_bus_readout)
         self.bus_readout = pyglet.text.Label(
             "",
@@ -781,6 +791,21 @@ class Editor(pyglet.window.Window):
         Touched.boxes.add(uid)
         return view
 
+    def set_box_data(self, box: BoxView, key: str, value) -> None:
+        """Keep `value` (plain JSON: dicts, lists, strings, numbers, bools, None) on
+        `box` under `key` (a mod's name), or drop that key with None. It's saved with
+        the box, goes along when it's copied, and the change is an undo step."""
+        import json
+
+        data = dict(box.mod_data)
+        if value is None:
+            data.pop(key, None)
+        else:
+            data[key] = json.loads(json.dumps(value))  # (a copy, and JSON or a TypeError)
+        if data != box.mod_data:
+            box.mod_data = data  # (a new dict: the history may hold the old one)
+            Touched.boxes.add(box.uid)
+
     def remove_boxes(self, views: list[BoxView]) -> None:
         for view in views:
             self.selection.discard(view)
@@ -839,7 +864,7 @@ class Editor(pyglet.window.Window):
         step = T.GRID  # (on the grid, so it lines up with what's placed on it)
         x0, y0 = math.floor(x0 / step) * step, math.floor(y0 / step) * step
         x1, y1 = math.ceil(x1 / step) * step, math.ceil(y1 / step) * step
-        box = self.add_box(("", x0, y0, x1 - x0, y1 - y0, None))
+        box = self.add_box(("", x0, y0, x1 - x0, y1 - y0, None, {}))
         self.selection.set(sel.parts, sel.wires, sel.boxes | {box})
         self._start_edit(box)
 
@@ -858,6 +883,7 @@ class Editor(pyglet.window.Window):
             MenuItem("Label box...", lambda: self._start_edit(box)),
             MenuItem("Recolor box", submenu=self._recolor_items(box.color, recolor)),
             MenuItem("Select what's in it", lambda: self._select_box(box)),
+            *menus.extra("box", self, box),
             MenuItem("Remove box (keep what's in it)", lambda: self.remove_boxes([box])),
             MenuItem("Delete box and what's in it", delete_all, danger=True),
         ]
@@ -1049,6 +1075,8 @@ class Editor(pyglet.window.Window):
         if button == mouse.LEFT and target is not None and target.contains(x, y):
             self.text_mouse.press(target, x, y, bool(modifiers & key.MOD_SHIFT))
             return
+        if self.mode is Mode.IDLE and self.console.contains(x, y):
+            return  # (on the console: not the board under it)
         wx, wy = self.camera.screen_to_world(x, y)
         in_picker = self.picker.hit(x, y)  # None unless the cursor is over the picker
         tool = (
@@ -1212,7 +1240,7 @@ class Editor(pyglet.window.Window):
         if self.mode is Mode.DRAWING_BOX:
             if button == mouse.LEFT and not in_picker and self.draw_from is None:
                 self.draw_from = self.snapped(wx, wy)
-                box = self.add_box(("", *self.draw_from, 1.0, 1.0, None))
+                box = self.add_box(("", *self.draw_from, 1.0, 1.0, None, {}))
                 self.resizing = (box, (1, 1), (box.x, box.y, box.w, box.h))
                 self._update_drawn_box()
             elif button == mouse.RIGHT:
@@ -1345,6 +1373,7 @@ class Editor(pyglet.window.Window):
         items = [MenuItem("New wire", new_wire), MenuItem("New box", new_box)]
         if self.selection:
             items.append(MenuItem("Box the selection", self._wrap_selection))
+        items += menus.extra("board", self, (wx, wy))
         if box := self.box_at(wx, wy):
             items += self._box_items(box)
         self._open_menu(x, y, items)
@@ -1393,6 +1422,7 @@ class Editor(pyglet.window.Window):
                     )
                 )
             items += self._settings_items(group)
+            items += menus.extra("part", self, group)
             items.append(
                 MenuItem(
                     "Delete", lambda: self.remove_parts(group, unplug=True), danger=True
@@ -1433,6 +1463,7 @@ class Editor(pyglet.window.Window):
                             wire.color, lambda c: setattr(wire, "color", c)
                         ),
                     ),
+                    *menus.extra("wire", self, wire),
                     MenuItem("Delete", lambda: self.cut_wire(wire, at), danger=True),
                 ],
             )
@@ -1717,6 +1748,10 @@ class Editor(pyglet.window.Window):
 
     def on_mouse_scroll(self, x, y, scroll_x, scroll_y):
         self.mouse = (x, y)
+        if self.mode is Mode.IDLE and self.console.contains(x, y):
+            if scroll_y:
+                self.console.page(1 if scroll_y > 0 else -1)
+            return
         if self.mode is Mode.POPOVER:
             return  # (it's pinned to where it opened: don't let the board move away under it)
         if self.mode is Mode.PROMPT:
@@ -1759,9 +1794,29 @@ class Editor(pyglet.window.Window):
 
     def on_key_press(self, symbol, modifiers):
         # Deliberately NOT calling super(): pyglet's default closes the window on Esc.
+        self._eat_text = 0.0
         target = self._text_target()
         if target is not None and shortcut(target, symbol, modifiers, self):
             return  # Ctrl+A / C / X / V in a text field
+        if (
+            symbol == key.GRAVE
+            and self.mode is Mode.IDLE
+            and not modifiers & (key.MOD_CTRL | key.MOD_ALT)
+        ):
+            self.console.toggle()
+            self._eat_text = time.monotonic()
+            return
+        if self._console_typing():
+            if symbol == key.ESCAPE:
+                self.console.set_open(False)
+            elif symbol in (key.ENTER, key.NUM_ENTER):
+                self._console_enter()
+            elif symbol in (key.UP, key.DOWN):
+                self.console.walk(-1 if symbol == key.UP else 1)
+            elif symbol in (key.PAGEUP, key.PAGEDOWN):
+                self.console.page(1 if symbol == key.PAGEUP else -1)
+            if not (modifiers & key.MOD_CTRL and symbol in (key.Z, key.Y)):
+                return  # (the keys are the console's; undo / redo still reach the board)
         if self.mode is Mode.POPOVER:
             # Typing goes through on_text / on_text_motion. No editor shortcuts while it's up.
             if symbol in (key.ENTER, key.NUM_ENTER):
@@ -1888,6 +1943,14 @@ class Editor(pyglet.window.Window):
             self._follow_cursor()  # un-snap / back to the normal grid
 
     def on_text(self, text):
+        if self._eat_text:
+            quick = time.monotonic() - self._eat_text < 0.05
+            self._eat_text = 0.0
+            if quick:
+                return
+        if self._console_typing():
+            self.console.type_text(text)
+            return
         if self.mode is Mode.POPOVER:
             self.popover.type_text(text)
         elif self.mode is Mode.PROMPT:
@@ -1901,6 +1964,9 @@ class Editor(pyglet.window.Window):
             self.picker.search_input(text)
 
     def on_text_motion(self, motion, select=False):
+        if self._console_typing():
+            self.console.motion(motion, select)
+            return
         if self.mode is Mode.POPOVER:
             self.popover.motion(motion, select)
         elif self.mode is Mode.PROMPT:
@@ -1919,6 +1985,8 @@ class Editor(pyglet.window.Window):
 
     def _text_target(self) -> TextTarget | None:
         """The text field being typed in, if any (see text_field.py)."""
+        if self._console_typing():
+            return self.console.target()
         if self.mode is Mode.SEARCHING:
             return self.picker.search_target()
         if self.mode is Mode.RENAMING:
@@ -1930,6 +1998,46 @@ class Editor(pyglet.window.Window):
         if self.mode is Mode.EDITING_LABEL:
             return self._label_target()
         return None
+
+    # ---- the console (console.py) -------------------------------------------
+
+    def _console_typing(self) -> bool:
+        """Keys and text go to the console: it's open and nothing else is going on."""
+        return self.console.open and self.mode is Mode.IDLE
+
+    def console_box(self) -> BoxView | None:
+        """The box console lines are for: the one box in the selection, else the box
+        under the cursor, else None (the whole board). While the cursor is on the
+        console or the picker, the box it was over last."""
+        boxes = self.selection.boxes
+        if len(boxes) == 1:
+            return next(iter(boxes))
+        x, y = self.mouse
+        if self.mouse_in and not self.console.contains(x, y) and not self.picker.contains(x, y):
+            self._console_box = self.box_at(*self.camera.screen_to_world(x, y))
+        if self._console_box is not None and self._console_box.uid not in self.box_views:
+            self._console_box = None  # (deleted since)
+        return self._console_box
+
+    def _update_console(self, dt: float) -> None:
+        c = self.console
+        at = (self.picker.width, self.width, BAR_H)
+        if at != self._console_at:
+            self._console_at = at
+            c.layout(*at)
+        if c.open:
+            c.tick(dt)
+            box = self.console_box()
+            c.set_scope("board" if box is None else box.label or "box")
+
+    def _console_enter(self) -> None:
+        line = self.console.take()
+        if not line.strip():
+            return
+        if self.inside:
+            self.console.say("leave the macro you're looking inside first", "error")
+            return
+        run_line(Context(self, self.console_box(), self.console.say), line)
 
     # ---- helpers -----------------------------------------------------------
 
@@ -3430,6 +3538,7 @@ class Editor(pyglet.window.Window):
         self._update_caption()
         self.status.x = self.picker.width + 8  # follows the panel sliding in / out
         self.bar.place(self.picker.width, self.width)
+        self._update_console(dt)
         self._move_keys(dt)
         self._update_zoom_floor(self._board_bounds())
         t0 = time.perf_counter()
@@ -3549,6 +3658,7 @@ class Editor(pyglet.window.Window):
         k = self.keys
         busy = (
             self.mode in KEYS_TYPE
+            or self._console_typing()
             or k[key.LCTRL]
             or k[key.RCTRL]
             or k[key.LALT]

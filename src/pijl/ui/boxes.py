@@ -51,7 +51,8 @@ class BoxView:
         text: SDFText,
     ) -> None:
         self.uid = uid
-        self.label, self.x, self.y, self.w, self.h, self.color = data
+        self.label, self.x, self.y, self.w, self.h, self.color, *rest = data
+        self.mod_data: dict = rest[0] if rest else {}  # see snapshot.BoxData
         self.selected = False
         self.ghost = False
         self.body = Rect(0, 0, 1, 1, BORDER, (0, 0, 0, 0), (0, 0, 0, 0), canvas, layers.boxes)
@@ -65,7 +66,7 @@ class BoxView:
 
     @property
     def data(self) -> BoxData:
-        return self.label, self.x, self.y, self.w, self.h, self.color
+        return self.label, self.x, self.y, self.w, self.h, self.color, self.mod_data
 
     @property
     def rect(self) -> tuple[float, float, float, float]:
@@ -73,7 +74,8 @@ class BoxView:
         return self.x, self.y, self.x + self.w, self.y + self.h
 
     def set_data(self, data: BoxData) -> None:
-        label, x, y, w, h, color = data
+        label, x, y, w, h, color, *rest = data
+        self.mod_data = rest[0] if rest else {}
         if label != self.label:
             self.set_label(label)
         if color != self.color:

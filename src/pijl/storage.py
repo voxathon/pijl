@@ -164,13 +164,15 @@ def encode(
 
 
 def _encode_box(uid: int, box: tuple) -> dict[str, Any]:
-    label, x, y, w, h, color = box
+    label, x, y, w, h, color, *rest = box
     d: dict[str, Any] = {"uid": uid}
     if label:
         d["label"] = label
     d["rect"] = [_num(x), _num(y), _num(w), _num(h)]
     if color:
         d["color"] = color
+    if rest and rest[0]:
+        d["data"] = rest[0]  # (what mods keep on it: see snapshot.BoxData)
     return d
 
 
@@ -186,7 +188,10 @@ def _decode_box(d: Any) -> tuple[int, tuple]:
     w, h = _pair(rect[2:])
     if w <= 0 or h <= 0:
         raise ValueError("empty rectangle")
-    return uid, (label, x, y, w, h, color or None)
+    data = d.get("data", {})
+    if not isinstance(data, dict) or not all(isinstance(k, str) for k in data):
+        raise ValueError("its data isn't a dict of mod names")
+    return uid, (label, x, y, w, h, color or None, data)
 
 
 def decode(data: Any, types: Registry) -> Loaded:

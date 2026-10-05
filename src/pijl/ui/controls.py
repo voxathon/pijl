@@ -127,6 +127,7 @@ CONTROLS: list[tuple[str, list[tuple[str, str]]]] = [
             ("  Esc / Backspace", "back out of it (one level)"),
             ("«  (picker header)", "tuck the part picker away"),
             ("Ctrl+F", "search the picker; Enter picks the top match, Esc clears"),
+            ("`", "the console: type commands (help lists them); Up / Down: history"),
             ("in a text field", "Shift+arrows / drag select; Ctrl+A / C / X / V"),
             ("refresh (picker header)", "pick up macros changed outside the editor"),
         ],

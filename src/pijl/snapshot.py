@@ -27,8 +27,10 @@ EndRef = tuple
 # a free end's point is where it is)
 WireData = tuple[EndRef, EndRef, tuple[Point, ...], Point | None, Point | None]
 # A labeled box drawn behind everything (editor-only: the sim never sees it):
-# label, x, y (bottom left), width, height, color name (None: neutral)
-BoxData = tuple[str, float, float, float, float, str | None]
+# label, x, y (bottom left), width, height, color name (None: neutral), and what mods
+# keep on it (mod name -> plain JSON data; {}: nothing). That dict is never changed in
+# place (Editor.set_box_data makes a new one), so snapshots can share it.
+BoxData = tuple[str, float, float, float, float, str | None, dict[str, Any]]
 
 
 @dataclass(frozen=True)

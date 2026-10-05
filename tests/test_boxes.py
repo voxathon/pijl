@@ -11,16 +11,16 @@ from pijl.snapshot import Snapshot
 from pijl.storage import decode, dumps, encode
 from pijl.ui.document import History
 
-BOX = ("adder", 100.0, 200.0, 300.0, 150.0, "green")
+BOX = ("adder", 100.0, 200.0, 300.0, 150.0, "green", {})
 
 
 def test_boxes_save_and_load():
-    snap = Snapshot({}, {}, boxes={3: BOX, 5: ("", 0.5, 0.0, 40.0, 40.0, None)})
+    snap = Snapshot({}, {}, boxes={3: BOX, 5: ("", 0.5, 0.0, 40.0, 40.0, None, {"m": {"k": [1]}})})
     text = dumps(encode(snap))
     data = json.loads(text)
     assert data["boxes"] == [
         {"uid": 3, "label": "adder", "rect": [100, 200, 300, 150], "color": "green"},
-        {"uid": 5, "rect": [0.5, 0, 40, 40]},
+        {"uid": 5, "rect": [0.5, 0, 40, 40], "data": {"m": {"k": [1]}}},
     ]
     loaded = decode(data, None)
     assert loaded.warnings == [] and loaded.snapshot.boxes == snap.boxes
@@ -285,4 +285,27 @@ def test_boxes_survive_save_and_load(board):
     box.set_color("blue")
     snap = capture(ed)
     loaded = decode(json.loads(dumps(encode(snap))), ed.circuit.registry)
-    assert loaded.snapshot.boxes == {box.uid: ("pair", box.x, box.y, box.w, box.h, "blue")}
+    assert loaded.snapshot.boxes == {box.uid: ("pair", box.x, box.y, box.w, box.h, "blue", {})}
+
+
+def test_box_data_is_saved_undone_and_copied(board):
+    from pijl.ui.document import capture
+
+    ed = board
+    _, _, _, box = wrapped(ed)
+    ed._record()
+    ed.set_box_data(box, "mymod", {"script": "A.q -> B.a"})
+    ed._record()
+    assert box.mod_data == {"mymod": {"script": "A.q -> B.a"}}
+    snap = capture(ed)
+    loaded = decode(json.loads(dumps(encode(snap))), ed.circuit.registry)
+    assert loaded.snapshot.boxes[box.uid][6] == box.mod_data
+    with pytest.raises(TypeError):
+        ed.set_box_data(box, "mymod", object())  # (not JSON)
+    ed.set_box_data(box, "mymod", None)
+    ed._record()
+    assert box.mod_data == {}
+    undo(ed)
+    assert box.mod_data == {"mymod": {"script": "A.q -> B.a"}}
+    undo(ed)
+    assert box.mod_data == {}
