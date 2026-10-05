@@ -338,6 +338,31 @@ def test_bus_spine_and_taps():
     assert all(r.seed == rt.SPINE and r.path for r in res.routes)
 
 
+def test_bus_spine_crosses_wires_in_its_way():
+    # every free line through the taps is cut by another net's wires (a bus laid
+    # before it, its branches down every gap): the spine crosses them
+    board = rt.Board()
+    for x in (-2, 20):
+        board.add_wire(7, [(x, -10), (x, 30)])
+    pins = [rt.Pin((p, 0), -1) for p in (0, 6, 12, 18)] + [rt.Pin((p, 8), -1) for p in (0, 6, 12, 18)]
+    (res,) = rt.route(board, [rt.Net(pins, spine=True)])
+    assert res.spine is not None and res.rooted is None
+    assert all(r.path for r in res.routes)
+
+
+def test_inputs_with_nothing_to_join_fail_fast(monkeypatch):
+    # no spine and no output: the root is an input, which no input can join
+    board = rt.Board()
+    board.add_rect(-50, -50, 50, -1)  # (no other row for the spine...)
+    board.add_rect(-50, 1, 50, 50)
+    board.add_wire(7, [(-99, 0), (99, 0)])  # (...and a wire along the pins' own)
+    pins = [rt.Pin((x, 0), -1) for x in (0, 10, 20)]
+    monkeypatch.setattr(rt, "_search", lambda *a: pytest.fail("searched"))
+    (res,) = rt.route(board, [rt.Net(pins, spine=True)])
+    assert res.spine is None and res.rooted == 0
+    assert [r.path for r in res.routes] == [None, None]
+
+
 def test_net_without_a_root_starts_at_an_output():
     pins = [rt.Pin((10, 0), -1), rt.Pin((0, 5), 1), rt.Pin((10, 10), -1)]
     (res,) = rt.route(rt.Board(), [rt.Net(pins)])

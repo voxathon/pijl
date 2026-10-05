@@ -1,6 +1,6 @@
 {
     "name": "Netlists",
-    "version": "1.5",
+    "version": "1.6",
     "description": "Wire a box up by typing what connects to what: a box's right-click menu, Netlist.",
     "author": "pijl",
     "pijl": ">=0.3.7"

@@ -15,8 +15,8 @@ What a path may do:
 - Each bend costs extra, so paths come out as L's and Z's, not staircases. Passing
   right in front of another part's pin costs a little (it reads as wired to it).
 
-Seeds and spines go down first, then nets are routed shortest first, sinks nearest
-first. Nothing that's routed is ripped up again: a sink with no way through comes
+Seeds and spines go down first (a spine may cross wires too), then nets are routed
+shortest first, sinks nearest first. Nothing that's routed is ripped up again: a sink with no way through comes
 back as unrouted.
 """
 
@@ -169,8 +169,9 @@ def _span(net: Net) -> int:
 
 def _lay_spine(board: Board, net: Net, owner: int) -> tuple[Cell, Cell] | None:
     """A straight line for a bus's pins to tap: across them (or down, if they're
-    spread more up and down than across), on the free row (column) nearest their
-    middle. None if there's no such line nearby."""
+    spread more up and down than across), on the row (column) nearest their middle,
+    each wire it has to cross costing a little more distance. None if there's no
+    such line nearby."""
     pins = net.sinks + ([net.root] if net.root else [])
     taps = [(p.cell[0] + p.out, p.cell[1]) for p in pins]  # (where each wire leaves)
     own = {p.cell for p in pins} | set(taps)
@@ -180,20 +181,35 @@ def _lay_spine(board: Board, net: Net, owner: int) -> tuple[Cell, Cell] | None:
         lo, hi = (min(xs), max(xs)) if horizontal else (min(ys), max(ys))
         along = sorted(ys if horizontal else xs)
         mid = along[len(along) // 2]
-        for off in range(SPINE_REACH + 1):
-            for at in (mid - off, mid + off) if off else (mid,):
-                line = [(v, at) if horizontal else (at, v) for v in range(lo, hi + 1)]
-                if all(_free_for_spine(board, c, own) for c in line):
-                    ends = (line[0], line[-1])
-                    board.add_wire(owner, list(ends))
-                    return ends
+        best = None
+        for at in range(mid - SPINE_REACH, mid + SPINE_REACH + 1):
+            line = [(v, at) if horizontal else (at, v) for v in range(lo, hi + 1)]
+            crosses = _spine_crossings(board, line, own, V if horizontal else H)
+            if crosses is not None:
+                cost = abs(at - mid) + crosses * CROSS
+                if best is None or cost < best[0]:
+                    best = (cost, line)
+        if best is not None:
+            ends = (best[1][0], best[1][-1])
+            board.add_wire(owner, list(ends))
+            return ends
     return None
 
 
-def _free_for_spine(board: Board, c: Cell, own: set[Cell]) -> bool:
-    if c in board.used or c in board.blocked:
-        return False
-    return c in own or c not in board.stubs  # (not right in front of someone else's pin)
+def _spine_crossings(board: Board, line: list[Cell], own: set[Cell], across: int) -> int | None:
+    """How many wires a spine along `line` crosses (wires running `across` it, straight
+    through), or None if it can't go there: a part, someone else's pin stub, a wire
+    along it, a corner or an end, or any wire under the spine's own ends."""
+    n = 0
+    for i, c in enumerate(line):
+        if c in board.blocked or (c in board.stubs and c not in own):
+            return None
+        u = board.used.get(c)
+        if u is not None:
+            if u[1] != across or i in (0, len(line) - 1):
+                return None
+            n += 1
+    return n
 
 
 def _route_net(board: Board, net: Net, owner: int, result: NetResult) -> None:
@@ -229,6 +245,11 @@ def _route_net(board: Board, net: Net, owner: int, result: NetResult) -> None:
     sinks.sort(key=lambda k: (net.sinks[k].out == side, _to_box(net.sinks[k].cell, box)))
     for k in sinks:
         sink = net.sinks[k]
+        if len(tree) == len(arrive) and all(a[1] == sink.out for a in arrive.values()):
+            # only pins of its own kind to join (an input can't feed an input): no
+            # search will find a way, and a failing one is the slow kind
+            result.routes.append(Route(k, None))
+            continue
         for margin in (MARGIN, MARGIN * 4):  # (close by first: it's much cheaper)
             path = _search(board, sink, tree, arrive, own, owner, margin)
             if path is not None:
