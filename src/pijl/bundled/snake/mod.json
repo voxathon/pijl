@@ -1,0 +1,7 @@
+{
+    "name": "Snake",
+    "version": "1.0",
+    "description": "There is no editor. There is only snake.",
+    "author": "pijl",
+    "pijl": ">=0.3.7"
+}
