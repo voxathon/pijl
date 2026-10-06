@@ -79,6 +79,11 @@ files are copied over the old ones, and anything else in its folder stays.
   routed around parts and other wires; a pin feeding several inputs gets a trunk
   with branches. An input it can't reach gets a straight-ish orange wire instead. A run wires everything or nothing, as one undo step. The language is
   described at the top of `netlist/lang.py`.
+- **snake** ("Snake") replaces the editor with a game of snake: with it on, START
+  and `pijl gui` open snake instead. Arrows or WASD steer, space or P pauses, R
+  starts over, Esc goes back to the launcher. The best score is kept in
+  `snake/best.json`. It's one patch, `pijl.ui.editor.run`, which `cli` imports only
+  when it starts the editor, after the mods have loaded.
 
 ## Console commands
 
